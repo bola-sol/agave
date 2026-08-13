@@ -6,6 +6,7 @@ use {
         commands::{FromClapArgMatches, run::args::RunArgs},
         ledger_lockfile, lock_ledger,
     },
+    agave_dashboard::DashboardConfig,
     agave_snapshots::{
         ArchiveFormat, SnapshotInterval, SnapshotVersion,
         paths::BANK_SNAPSHOTS_DIR,
@@ -525,6 +526,21 @@ pub fn execute(
         bind_addresses.active()
     };
 
+    // The dashboard is unauthenticated and exposes validator internals, so it
+    // stays on loopback unless the operator names an address explicitly.
+    let dashboard_config = value_t!(matches, "dashboard_port", u16).ok().map(|port| {
+        let bind_address = matches
+            .value_of("dashboard_bind_address")
+            .map(|address| {
+                solana_net_utils::parse_host(address).expect("invalid dashboard_bind_address")
+            })
+            .unwrap_or_else(|| solana_net_utils::parse_host("127.0.0.1").unwrap());
+        DashboardConfig {
+            listen_addr: SocketAddr::new(bind_address, port),
+            ..DashboardConfig::default()
+        }
+    });
+
     let contact_debug_interval = value_t_or_exit!(matches, "contact_debug_interval", u64);
 
     let account_indexes = AccountSecondaryIndexes::from_clap_arg_match(matches)?;
@@ -788,6 +804,7 @@ pub fn execute(
             )
         }),
         pubsub_config: run_args.pub_sub_config,
+        dashboard_config,
         voting_disabled: matches.is_present("no_voting") || restricted_repair_only_mode,
         wait_for_supermajority: value_t!(matches, "wait_for_supermajority", Slot).ok(),
         known_validators: run_args.known_validators,
