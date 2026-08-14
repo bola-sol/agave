@@ -86,7 +86,6 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         voting_service_test_override: config.voting_service_test_override.clone(),
         repair_handler_type: config.repair_handler_type.clone(),
         snapshot_packager_niceness_adj: config.snapshot_packager_niceness_adj,
-        dashboard_config: config.dashboard_config.clone(),
     }
 }
 
