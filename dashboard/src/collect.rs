@@ -1204,11 +1204,16 @@ fn health_of(
 
 /// How the cluster's stake divides across client versions, ready to publish.
 ///
-/// Every identity counts once, staked or not: unstaked nodes are most of the
-/// cluster by number and say something about how far an upgrade has spread,
-/// even though they carry none of the vote. During an upgrade this answers the
-/// question operators actually ask — how much stake has moved, and is this
-/// validator in the minority.
+/// Counted over staked identities only, the same population the validator
+/// counts are drawn from, so the two cards on the page add up to each other.
+/// Counting every gossip peer instead described a wider cluster than the one
+/// the bars measure: the bars have always been stake-weighted, so an unstaked
+/// node moved the count beside a row without moving the row, and the counts
+/// summed past the validator total by however many unstaked peers gossip
+/// happened to know about.
+///
+/// A staked identity gossip is not currently hearing from has no version and
+/// falls in the `None` bucket, which is not the same as the folded tail below.
 ///
 /// Releases are borrowed from the gossip strings rather than copied. There are
 /// a few thousand peers and at most six rows, so only the rows that survive the
@@ -1218,19 +1223,9 @@ fn version_shares(
     versions: &HashMap<Pubkey, String>,
 ) -> Vec<VersionShare> {
     let mut totals: HashMap<Option<&str>, (usize, u64)> = HashMap::new();
-    for (identity, version) in versions {
-        let stake = staked.get(identity).copied().unwrap_or(0);
-        let entry = totals.entry(Some(release_of(version))).or_insert((0, 0));
-        entry.0 = entry.0.saturating_add(1);
-        entry.1 = entry.1.saturating_add(stake);
-    }
-    // Staked validators gossip is not currently hearing from. They report no
-    // version, which is not the same as the folded tail below.
     for (identity, stake) in staked {
-        if versions.contains_key(identity) {
-            continue;
-        }
-        let entry = totals.entry(None).or_insert((0, 0));
+        let release = versions.get(identity).map(|version| release_of(version));
+        let entry = totals.entry(release).or_insert((0, 0));
         entry.0 = entry.0.saturating_add(1);
         entry.1 = entry.1.saturating_add(*stake);
     }
@@ -1476,22 +1471,35 @@ mod tests {
 
     #[test]
     fn test_rows_are_ordered_by_stake_not_by_node_count() {
-        // The whole point of the panel: a version on a crowd of unstaked nodes
-        // matters less than one carrying a slice of the vote.
+        // The whole point of the panel: a version on a crowd of lightly staked
+        // nodes matters less than one carrying a slice of the vote.
         let shares = version_shares(
-            &staked(&[(1, 1_000)]),
+            &staked(&[(1, 1_000), (2, 1), (3, 1), (4, 1)]),
             &gossiped(&[(1, "4.2.0"), (2, "4.1.0"), (3, "4.1.0"), (4, "4.1.0")]),
         );
         assert_eq!(shares[0].version.as_deref(), Some("4.2.0"));
         assert_eq!(shares[0].stake, 1_000);
-        assert_eq!(shares[1].validators, 3, "more nodes, no stake, second");
+        assert_eq!(shares[1].validators, 3, "more nodes, less stake, second");
     }
 
     #[test]
-    fn test_an_unstaked_gossip_node_counts_without_moving_stake() {
+    fn test_an_unstaked_gossip_node_is_not_counted() {
+        // The counts are read beside the validator card, which counts staked
+        // identities. Counting gossip peers here summed past that total.
         let shares = version_shares(&staked(&[]), &gossiped(&[(1, "4.2.0")]));
-        assert_eq!(shares[0].validators, 1);
-        assert_eq!(shares[0].stake, 0);
+        assert!(shares.is_empty());
+    }
+
+    #[test]
+    fn test_the_counts_sum_to_the_staked_validator_total() {
+        let staked = staked(&[(1, 10), (2, 10), (3, 10)]);
+        // Two unstaked peers gossip a version alongside them.
+        let shares = version_shares(
+            &staked,
+            &gossiped(&[(1, "4.2.0"), (2, "4.3.0"), (7, "4.3.0"), (8, "4.3.0")]),
+        );
+        let counted: usize = shares.iter().map(|share| share.validators).sum();
+        assert_eq!(counted, staked.len());
     }
 
     #[test]
@@ -1517,7 +1525,10 @@ mod tests {
                 .map(|(seed, version)| (*seed, version.as_str()))
                 .collect::<Vec<_>>(),
         );
-        let shares = version_shares(&staked(&[]), &versions);
+        // Distinct stakes, so which rows survive the fold does not come down to
+        // the order a hash map happened to iterate in.
+        let stakes: Vec<(u8, u64)> = (1..=9).map(|seed| (seed, u64::from(seed))).collect();
+        let shares = version_shares(&staked(&stakes), &versions);
 
         assert_eq!(shares.len(), MAX_VERSIONS_REPORTED + 1);
         let last = shares.last().unwrap();
