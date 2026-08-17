@@ -31,6 +31,7 @@ use {
         tpu::{Tpu, TpuSockets},
         tvu::{AlpenglowInitializationState, Tvu, TvuConfig, TvuSockets},
     },
+    agave_dashboard::{DashboardContext, DashboardService},
     agave_snapshots::{
         SnapshotInterval, snapshot_archive_info::SnapshotArchiveInfoGetter as _,
         snapshot_config::SnapshotConfig, snapshot_hash::StartingSnapshotHashes,
@@ -166,7 +167,7 @@ use {
             atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread::{self, Builder, JoinHandle},
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime},
     },
     strum::VariantNames,
     strum_macros::{Display, EnumCount, EnumIter, EnumString, IntoStaticStr},
@@ -687,6 +688,7 @@ pub struct Validator {
     #[cfg_attr(not(unix), allow(dead_code))]
     log_config: Option<ValidatorLogConfig>,
     json_rpc_service: Option<JsonRpcService>,
+    dashboard_service: Option<DashboardService>,
     pubsub_service: Option<PubSubService>,
     rpc_completed_slots_service: Option<JoinHandle<()>>,
     optimistically_confirmed_bank_tracker: Option<OptimisticallyConfirmedBankTracker>,
@@ -755,6 +757,7 @@ impl Validator {
             admin_rpc_service_post_init,
             xdp_transmit_setup,
             exit,
+            None,
         )
     }
 
@@ -774,6 +777,10 @@ impl Validator {
         admin_rpc_service_post_init: Arc<RwLock<Option<AdminRpcRequestMetadataPostInit>>>,
         xdp_transmit_setup: Option<XdpTransmitSetup>,
         exit: Arc<AtomicBool>,
+        // Started by the caller before this point, so that the phases which run
+        // ahead of a validator existing are still reported. `None` disables the
+        // dashboard entirely.
+        mut dashboard_service: Option<DashboardService>,
     ) -> Result<Self> {
         #[cfg(debug_assertions)]
         const DEBUG_ASSERTION_STATUS: &str = "enabled";
@@ -1682,7 +1689,7 @@ impl Validator {
             config.vote_history_storage.clone(),
             &leader_schedule_cache,
             exit.clone(),
-            block_commitment_cache,
+            block_commitment_cache.clone(),
             config.turbine_mode.clone(),
             transaction_status_sender.clone(),
             entry_notification_sender.clone(),
@@ -1851,6 +1858,27 @@ impl Validator {
             votor_event_sender,
         });
 
+        // Attached last, so the collector reads a validator that is fully
+        // assembled. It only ever reads, and holds no handle the validator
+        // needs back.
+        if let Some(dashboard_service) = &mut dashboard_service {
+            let context = DashboardContext {
+                cluster_info: cluster_info.clone(),
+                bank_forks: bank_forks.clone(),
+                block_commitment_cache: block_commitment_cache.clone(),
+                blockstore: blockstore.clone(),
+                leader_schedule_cache: leader_schedule_cache.clone(),
+                vote_account: *vote_account,
+                cluster_type: genesis_config.cluster_type,
+                // `start_time` is an `Instant`; the dashboard reports an
+                // absolute uptime, so translate it to wall-clock.
+                start_time: SystemTime::now() - start_time.elapsed(),
+            };
+            dashboard_service
+                .attach(context, exit.clone())
+                .map_err(|err| anyhow!("Failed to start the dashboard collector: {err}"))?;
+        }
+
         Ok(Self {
             log_config: config.log_config.clone(),
             exit,
@@ -1858,6 +1886,7 @@ impl Validator {
             gossip_service,
             serve_repair_service,
             json_rpc_service,
+            dashboard_service,
             pubsub_service,
             rpc_completed_slots_service,
             optimistically_confirmed_bank_tracker,
@@ -1984,6 +2013,10 @@ impl Validator {
 
         if let Some(json_rpc_service) = self.json_rpc_service {
             json_rpc_service.join().expect("rpc_service");
+        }
+
+        if let Some(dashboard_service) = self.dashboard_service {
+            dashboard_service.join().expect("dashboard_service");
         }
 
         if let Some(pubsub_service) = self.pubsub_service {
