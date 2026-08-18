@@ -1622,10 +1622,19 @@ mod tests {
         );
     }
 
-    /// A window at 400ms per slot, `count` samples long, newest last.
-    fn steady_window(count: u64, slot_ms: u64) -> VecDeque<(Slot, u64)> {
+    /// `count` samples `slot_ms` apart, starting at `from`, newest last.
+    ///
+    /// Saturating throughout because the crate denies bare arithmetic, tests
+    /// included, and an index-driven `+` is exactly what that lint is for.
+    fn steady_window(from: (Slot, u64), count: u64, slot_ms: u64) -> VecDeque<(Slot, u64)> {
+        let (slot, arrival) = from;
         (0..count)
-            .map(|index| (100 + index, 1_000 + index * slot_ms))
+            .map(|index| {
+                (
+                    slot.saturating_add(index),
+                    arrival.saturating_add(index.saturating_mul(slot_ms)),
+                )
+            })
             .collect()
     }
 
@@ -1633,7 +1642,7 @@ mod tests {
     fn test_a_full_window_averages_the_whole_of_it() {
         // Five minutes of slots at 420ms, read whole, as the epoch countdown
         // will read them.
-        let samples = steady_window(SLOT_TIME_WINDOW_SLOTS as u64, 420);
+        let samples = steady_window((100, 1_000), SLOT_TIME_WINDOW_SLOTS as u64, 420);
         assert_eq!(windowed_mean_nanos(&samples, u64::MAX), Some(420_000_000));
     }
 
@@ -1641,7 +1650,7 @@ mod tests {
     fn test_a_full_window_of_replay_is_still_rejected() {
         // Widening the window made the catch-up guard less twitchy, which is
         // the point, but it must not have made it blind.
-        let samples = steady_window(SLOT_TIME_WINDOW_SLOTS as u64, 10);
+        let samples = steady_window((100, 1_000), SLOT_TIME_WINDOW_SLOTS as u64, 10);
         assert_eq!(windowed_mean_nanos(&samples, u64::MAX), None);
     }
 
@@ -1650,11 +1659,16 @@ mod tests {
         // Five minutes at 400ms, then the last minute at 500ms. Read whole,
         // the recent slowdown is diluted; read over the readout's span, it is
         // the whole answer. Both readings come off this one window.
-        let mut samples = steady_window(SLOT_TIME_WINDOW_SLOTS as u64, 400);
+        let mut samples = steady_window((100, 1_000), SLOT_TIME_WINDOW_SLOTS as u64, 400);
         let (last_slot, last_arrival) = *samples.back().unwrap();
-        for index in 1..=120 {
-            samples.push_back((last_slot + index, last_arrival + index * 500));
-        }
+        samples.extend(steady_window(
+            (
+                last_slot.saturating_add(1),
+                last_arrival.saturating_add(500),
+            ),
+            120,
+            500,
+        ));
         assert_eq!(
             windowed_mean_nanos(&samples, SLOT_READOUT_SPAN_MS),
             Some(500_000_000)
