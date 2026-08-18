@@ -77,6 +77,25 @@ const SLOT_TIME_WINDOW_SLOTS: usize = 750;
 /// cluster, long enough that a single slow slot does not move it.
 const SLOT_READOUT_SPAN_MS: u64 = 60_000;
 
+/// How near the highest slot held replay must come before this validator is
+/// following the cluster rather than replaying towards it. Firedancer uses the
+/// same few slots against its highest turbine slot.
+const CAUGHT_UP_SLOT_DISTANCE: u64 = 4;
+
+/// Samples the window must already hold before that distance is believed.
+///
+/// Distance alone says nothing on its own: a validator that has just loaded a
+/// snapshot and received nothing sits at zero distance, and would mark itself
+/// caught up immediately before replaying half a million slots. Requiring the
+/// window to have filled first means the distance is only read once slots have
+/// been arriving for a while, which is what Firedancer's full-turbine-history
+/// condition does for the same reason.
+const CAUGHT_UP_MIN_SAMPLES: usize = 64;
+
+/// Slots skipped past when the marker is set, so that the interval straddling
+/// the transition — part replay burst, part cluster — is not measured.
+const CAUGHT_UP_MARGIN_SLOTS: u64 = 4;
+
 /// Slots timed in one tick. Bounds the blockstore lookups after a stall, when
 /// the cursor could otherwise be thousands of slots behind.
 const MAX_SLOTS_TIMED_PER_TICK: u64 = 512;
@@ -222,6 +241,13 @@ pub struct Collector {
     /// `(slot, arrival)` pairs spanning the averaging window, oldest first.
     /// Bounded by [`SLOT_TIME_WINDOW_SLOTS`].
     slot_time_window: VecDeque<(Slot, u64)>,
+    /// First slot whose timing describes the cluster rather than a replay
+    /// burst. Set once, never cleared. See [`Collector::mark_caught_up`].
+    caught_up_at: Option<Slot>,
+    /// Whether replay was ever seen trailing the highest slot held, before the
+    /// marker above was set. Decides whether there is anything to throw away
+    /// when it is: a validator that started level never measured a burst.
+    replayed_behind: bool,
     last_vote_advance: Instant,
     last_slow_tick: Instant,
     /// Viewers attached as of the last tick, kept only so that pausing and
@@ -259,6 +285,8 @@ impl Collector {
             slot_timed_to: None,
             last_shred_time: None,
             slot_time_window: VecDeque::new(),
+            caught_up_at: None,
+            replayed_behind: false,
             last_vote_advance: now,
             last_slow_tick: now.checked_sub(SLOW_TICK).unwrap_or(now),
             subscribers: 0,
@@ -406,6 +434,7 @@ impl Collector {
             completed,
         );
         self.collect_slot_durations(completed);
+        self.mark_caught_up(highest_slot, completed);
         self.observe_slot_duration(root_bank, completed);
     }
 
@@ -494,6 +523,49 @@ impl Collector {
         for entry in &changed {
             self.publish_slot(entry);
         }
+    }
+
+    /// Records, once, the point from which slot timings describe the cluster.
+    ///
+    /// A validator replaying towards the tip runs through slots far faster than
+    /// they were produced. Those intervals are a record of the download, not of
+    /// the cluster, and averaged in they drag the epoch countdown down for as
+    /// long as they stay in the window.
+    ///
+    /// Firedancer solves this with a one-shot marker: `slot_caught_up` is set
+    /// when its highest turbine slot comes within a few slots of what it has
+    /// replayed, and the average is then truncated to slots after it. This is
+    /// the same shape, and deliberately so. An earlier attempt here tested the
+    /// replay rate continuously and cleared the window whenever it looked like
+    /// a burst, which fed back on itself: clearing the window shortened it,
+    /// a shorter window is more easily tripped, and the reading never settled.
+    ///
+    /// Set once and never cleared, so there is no loop to close. A validator
+    /// that later falls behind is a validator whose slot timings are genuinely
+    /// slow, which is a thing worth reporting rather than hiding.
+    fn mark_caught_up(&mut self, highest_slot: Slot, completed: Slot) {
+        if self.caught_up_at.is_some() {
+            return;
+        }
+        if highest_slot.saturating_sub(completed) > CAUGHT_UP_SLOT_DISTANCE {
+            self.replayed_behind = true;
+            return;
+        }
+        if self.slot_time_window.len() < CAUGHT_UP_MIN_SAMPLES {
+            return;
+        }
+
+        let from = completed.saturating_add(CAUGHT_UP_MARGIN_SLOTS);
+        self.caught_up_at = Some(from);
+        if self.replayed_behind {
+            // Everything held was measured while trailing the tip, so all of it
+            // goes and the readout is blank until the window refills. That is
+            // the honest answer: none of it describes the cluster. A validator
+            // that started level has nothing to throw away and keeps its
+            // samples, rather than blanking a working readout for a minute.
+            self.slot_time_window.retain(|(slot, _)| *slot >= from);
+        }
+        log::info!("dashboard: caught up with the cluster, timing slots from {from}");
     }
 
     fn first_shred_time(&self, slot: Slot) -> Option<u64> {
@@ -1342,7 +1414,7 @@ pub(crate) fn system_time_nanos(time: SystemTime) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, crate::fixture::fixture};
 
     /// The arrival window as the collector holds it.
     fn window(samples: &[(Slot, u64)]) -> VecDeque<(Slot, u64)> {
@@ -1674,6 +1746,88 @@ mod tests {
             Some(500_000_000)
         );
         assert!(windowed_mean_nanos(&samples, u64::MAX).unwrap() < 420_000_000);
+    }
+
+    // ---- catching up ----------------------------------------------------
+
+    /// A collector holding `count` samples ending at `last`, 400ms apart.
+    fn collector_following(last: Slot, count: u64) -> Collector {
+        let mut collector = fixture().collector();
+        let first = last.saturating_sub(count.saturating_sub(1));
+        collector.slot_time_window = steady_window((first, 1_000), count, 400);
+        collector
+    }
+
+    #[test]
+    fn test_the_marker_waits_for_the_window_to_fill() {
+        // A validator that has loaded a snapshot and received nothing sits at
+        // zero distance without having caught up with anything. Marking here
+        // would bless the half-million slot replay that follows.
+        let mut collector = collector_following(300_000_000, 4);
+        collector.mark_caught_up(300_000_000, 300_000_000);
+        assert_eq!(collector.caught_up_at, None);
+        assert_eq!(collector.slot_time_window.len(), 4, "nothing discarded");
+    }
+
+    #[test]
+    fn test_the_marker_waits_for_replay_to_reach_the_tip() {
+        let mut collector = collector_following(300_000_000, CAUGHT_UP_MIN_SAMPLES as u64);
+        // Replaying, and still a thousand slots behind what it holds.
+        collector.mark_caught_up(300_001_000, 300_000_000);
+        assert_eq!(collector.caught_up_at, None);
+    }
+
+    #[test]
+    fn test_catching_up_discards_everything_measured_while_behind() {
+        let mut collector = collector_following(300_000_000, CAUGHT_UP_MIN_SAMPLES as u64);
+        // Trailing the tip by a thousand slots, then level.
+        collector.mark_caught_up(300_001_000, 300_000_000);
+        collector.mark_caught_up(300_000_002, 300_000_000);
+
+        assert_eq!(
+            collector.caught_up_at,
+            Some(300_000_000_u64.saturating_add(CAUGHT_UP_MARGIN_SLOTS))
+        );
+        assert!(
+            collector.slot_time_window.is_empty(),
+            "every sample was taken while behind, so none of it describes the cluster"
+        );
+    }
+
+    #[test]
+    fn test_starting_level_keeps_the_samples_it_already_has() {
+        // A restart that never trails the tip has measured nothing but the
+        // cluster. Discarding here would blank a working readout for a minute
+        // to protect against a burst that never happened.
+        let mut collector = collector_following(300_000_000, CAUGHT_UP_MIN_SAMPLES as u64);
+        collector.mark_caught_up(300_000_000, 300_000_000);
+
+        assert!(collector.caught_up_at.is_some());
+        assert_eq!(
+            collector.slot_time_window.len(),
+            CAUGHT_UP_MIN_SAMPLES,
+            "nothing was measured while behind, so nothing is thrown away"
+        );
+    }
+
+    #[test]
+    fn test_the_marker_is_set_once_and_falling_behind_does_not_move_it() {
+        // The failure this replaces re-tested the rate continuously and cleared
+        // the window whenever it looked like a burst. Clearing shortened the
+        // window, a shorter window trips more easily, and it never settled.
+        let mut collector = collector_following(300_000_000, CAUGHT_UP_MIN_SAMPLES as u64);
+        collector.mark_caught_up(300_000_000, 300_000_000);
+        let marked = collector.caught_up_at;
+
+        collector.slot_time_window = steady_window((300_001_000, 1_000), 200, 400);
+        collector.mark_caught_up(300_099_000, 300_001_000);
+
+        assert_eq!(collector.caught_up_at, marked, "the marker never moves");
+        assert_eq!(
+            collector.slot_time_window.len(),
+            200,
+            "and nothing is discarded a second time"
+        );
     }
 
     #[test]
