@@ -59,9 +59,23 @@ const NEXT_LEADER_LOOKAHEAD: u64 = 20_000;
 /// four slots in every eight hundred, so this is hours of them.
 const PRODUCED_BLOCKS: usize = 64;
 
-/// Window the reported slot time averages over. Short enough to follow the
-/// cluster, long enough that a single slow slot does not move the reading.
-const SLOT_TIME_WINDOW_MS: u64 = 60_000;
+/// Slots of arrival times kept, about five minutes of them. Matches
+/// Firedancer, whose dashboard averages over the same 750.
+///
+/// This is what is retained, not what is reported. Readings are taken over
+/// spans of it: the strip's readout wants a figure that follows the cluster
+/// now, and the epoch countdown wants one that sits still, because it is
+/// multiplied by an epoch's worth of remaining slots where a millisecond of
+/// wobble is seven minutes on the clock. Both come off these samples rather
+/// than from two windows kept in step.
+///
+/// Counted in slots rather than in wall-clock time so that it does not thin out
+/// during a stall, which is exactly when it gets read.
+const SLOT_TIME_WINDOW_SLOTS: usize = 750;
+
+/// Span the slot strip's readout averages over. Short enough to follow the
+/// cluster, long enough that a single slow slot does not move it.
+const SLOT_READOUT_SPAN_MS: u64 = 60_000;
 
 /// Slots timed in one tick. Bounds the blockstore lookups after a stall, when
 /// the cursor could otherwise be thousands of slots behind.
@@ -206,6 +220,7 @@ pub struct Collector {
     /// milliseconds. The next slot's duration is measured from here.
     last_shred_time: Option<(Slot, u64)>,
     /// `(slot, arrival)` pairs spanning the averaging window, oldest first.
+    /// Bounded by [`SLOT_TIME_WINDOW_SLOTS`].
     slot_time_window: VecDeque<(Slot, u64)>,
     last_vote_advance: Instant,
     last_slow_tick: Instant,
@@ -467,12 +482,12 @@ impl Collector {
 
             self.last_shred_time = Some((slot, arrived));
             self.slot_time_window.push_back((slot, arrived));
-            while let Some((_, oldest)) = self.slot_time_window.front() {
-                if arrived.saturating_sub(*oldest) > SLOT_TIME_WINDOW_MS {
-                    self.slot_time_window.pop_front();
-                } else {
-                    break;
-                }
+            // Skipped slots carry no timestamp and so never enter the window.
+            // The mean divides by the slot span rather than by the sample
+            // count, so they are still accounted for; the window just reaches
+            // back a little further than its length in slot numbers.
+            while self.slot_time_window.len() > SLOT_TIME_WINDOW_SLOTS {
+                self.slot_time_window.pop_front();
             }
         }
 
@@ -488,12 +503,12 @@ impl Collector {
         }
     }
 
-    /// Mean milliseconds per slot across the window, in nanoseconds.
+    /// Mean milliseconds per slot over the last minute, in nanoseconds.
     ///
-    /// A true mean between the ends of the window rather than a decaying
+    /// A true mean between the ends of the span rather than a decaying
     /// average, so it does not drift and does not need to be seeded.
     fn windowed_slot_nanos(&self) -> Option<u64> {
-        windowed_mean_nanos(&self.slot_time_window)
+        windowed_mean_nanos(&self.slot_time_window, SLOT_READOUT_SPAN_MS)
     }
 
     fn collect_leaders(&mut self, root_bank: &Bank, highest_slot: Slot) {
@@ -1264,17 +1279,30 @@ fn version_shares(
 
 /// Mean milliseconds per slot across a window of arrival times, in nanoseconds.
 ///
-/// A true mean between the ends of the window rather than a decaying average,
-/// so it does not drift and does not need to be seeded. Only the two ends are
+/// A true mean between the ends of the span rather than a decaying average, so
+/// it does not drift and does not need to be seeded. Only the two ends are
 /// read; what the samples between them did does not change the answer.
+///
+/// `span_ms` bounds how far back from the newest sample to reach, so that one
+/// window can answer both of the questions asked of it. `u64::MAX` reads the
+/// whole of it.
 ///
 /// A free function rather than a method so that the tests exercise this rather
 /// than a copy of it. As a method reading `self.slot_time_window` it needed a
 /// whole collector to call, so the tests had grown their own reimplementation
 /// and would have kept passing while this drifted.
-fn windowed_mean_nanos(window: &VecDeque<(Slot, u64)>) -> Option<u64> {
-    let (first_slot, first_arrival) = window.front().copied()?;
+fn windowed_mean_nanos(window: &VecDeque<(Slot, u64)>, span_ms: u64) -> Option<u64> {
     let (last_slot, last_arrival) = window.back().copied()?;
+    // The oldest sample still inside the span. The newest is always inside it,
+    // so this yields something whenever the window holds anything; a span
+    // holding only that one sample is then rejected below for spanning no
+    // slots, which is the same answer a window of one gives.
+    let (first_slot, first_arrival) = window
+        .iter()
+        .rev()
+        .take_while(|(_, arrival)| last_arrival.saturating_sub(*arrival) <= span_ms)
+        .last()
+        .copied()?;
     let slots = last_slot
         .checked_sub(first_slot)
         .filter(|slots| *slots > 0)?;
@@ -1594,11 +1622,51 @@ mod tests {
         );
     }
 
+    /// A window at 400ms per slot, `count` samples long, newest last.
+    fn steady_window(count: u64, slot_ms: u64) -> VecDeque<(Slot, u64)> {
+        (0..count)
+            .map(|index| (100 + index, 1_000 + index * slot_ms))
+            .collect()
+    }
+
+    #[test]
+    fn test_a_full_window_averages_the_whole_of_it() {
+        // Five minutes of slots at 420ms, read whole, as the epoch countdown
+        // will read them.
+        let samples = steady_window(SLOT_TIME_WINDOW_SLOTS as u64, 420);
+        assert_eq!(windowed_mean_nanos(&samples, u64::MAX), Some(420_000_000));
+    }
+
+    #[test]
+    fn test_a_full_window_of_replay_is_still_rejected() {
+        // Widening the window made the catch-up guard less twitchy, which is
+        // the point, but it must not have made it blind.
+        let samples = steady_window(SLOT_TIME_WINDOW_SLOTS as u64, 10);
+        assert_eq!(windowed_mean_nanos(&samples, u64::MAX), None);
+    }
+
+    #[test]
+    fn test_the_readout_span_ignores_samples_older_than_itself() {
+        // Five minutes at 400ms, then the last minute at 500ms. Read whole,
+        // the recent slowdown is diluted; read over the readout's span, it is
+        // the whole answer. Both readings come off this one window.
+        let mut samples = steady_window(SLOT_TIME_WINDOW_SLOTS as u64, 400);
+        let (last_slot, last_arrival) = *samples.back().unwrap();
+        for index in 1..=120 {
+            samples.push_back((last_slot + index, last_arrival + index * 500));
+        }
+        assert_eq!(
+            windowed_mean_nanos(&samples, SLOT_READOUT_SPAN_MS),
+            Some(500_000_000)
+        );
+        assert!(windowed_mean_nanos(&samples, u64::MAX).unwrap() < 420_000_000);
+    }
+
     #[test]
     fn test_mean_spans_the_ends_of_the_window() {
         // Ten slots over four seconds is 400ms each, however the middle fell.
         let samples = window(&[(100, 1_000), (105, 3_100), (110, 5_000)]);
-        assert_eq!(windowed_mean_nanos(&samples), Some(400_000_000));
+        assert_eq!(windowed_mean_nanos(&samples, u64::MAX), Some(400_000_000));
     }
 
     #[test]
@@ -1606,7 +1674,7 @@ mod tests {
         // 150 slots at 400ms with a single two-second slot among them.
         let steady = 150_u64 * 400;
         assert_eq!(
-            windowed_mean_nanos(&window(&[(0, 0), (150, steady + 1_600)])),
+            windowed_mean_nanos(&window(&[(0, 0), (150, steady + 1_600)]), u64::MAX),
             Some(410_666_666)
         );
     }
@@ -1615,15 +1683,18 @@ mod tests {
     fn test_repair_burst_is_not_reported_as_the_cluster_rate() {
         // A thousand slots arriving in two seconds is a download, not a cluster.
         assert_eq!(
-            windowed_mean_nanos(&window(&[(0, 0), (1_000, 2_000)])),
+            windowed_mean_nanos(&window(&[(0, 0), (1_000, 2_000)]), u64::MAX),
             None
         );
     }
 
     #[test]
     fn test_window_that_cannot_span_two_slots_reports_nothing() {
-        assert_eq!(windowed_mean_nanos(&window(&[])), None);
-        assert_eq!(windowed_mean_nanos(&window(&[(100, 1_000)])), None);
+        assert_eq!(windowed_mean_nanos(&window(&[]), u64::MAX), None);
+        assert_eq!(
+            windowed_mean_nanos(&window(&[(100, 1_000)]), u64::MAX),
+            None
+        );
     }
 
     #[test]
