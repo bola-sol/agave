@@ -96,6 +96,16 @@ const CAUGHT_UP_MIN_SAMPLES: usize = 64;
 /// the transition — part replay burst, part cluster — is not measured.
 const CAUGHT_UP_MARGIN_SLOTS: u64 = 4;
 
+/// How far the epoch's estimated end may drift before the countdown follows it.
+///
+/// The estimate is a slot duration multiplied by an epoch's worth of remaining
+/// slots, so at the start of an epoch a tenth of a millisecond of movement is
+/// forty seconds on the clock. Following that faithfully is what made the
+/// readout restless: the number moved constantly and none of the movement told
+/// anyone anything. Within this, the end time stands and the countdown simply
+/// runs down towards it.
+const EPOCH_END_DRIFT_ALLOWANCE: Duration = Duration::from_secs(60);
+
 /// Slots timed in one tick. Bounds the blockstore lookups after a stall, when
 /// the cursor could otherwise be thousands of slots behind.
 const MAX_SLOTS_TIMED_PER_TICK: u64 = 512;
@@ -193,6 +203,7 @@ struct Debounces {
     skip_rate: Debounced<SkipRate>,
     health: Debounced<Health>,
     epoch: Debounced<EpochInfo>,
+    epoch_remaining_nanos: Debounced<u64>,
 }
 
 pub struct Collector {
@@ -248,6 +259,10 @@ pub struct Collector {
     /// marker above was set. Decides whether there is anything to throw away
     /// when it is: a validator that started level never measured a burst.
     replayed_behind: bool,
+    /// The epoch end currently being counted down to, and the epoch it belongs
+    /// to. Held rather than recomputed so the readout does not chase its own
+    /// estimate. See [`EPOCH_END_DRIFT_ALLOWANCE`].
+    epoch_end: Option<(Epoch, SystemTime)>,
     last_vote_advance: Instant,
     last_slow_tick: Instant,
     /// Viewers attached as of the last tick, kept only so that pausing and
@@ -287,6 +302,7 @@ impl Collector {
             slot_time_window: VecDeque::new(),
             caught_up_at: None,
             replayed_behind: false,
+            epoch_end: None,
             last_vote_advance: now,
             last_slow_tick: now.checked_sub(SLOW_TICK).unwrap_or(now),
             subscribers: 0,
@@ -438,25 +454,22 @@ impl Collector {
         self.observe_slot_duration(root_bank, completed);
     }
 
-    /// Maintains a smoothed estimate of how long a slot is taking, which the
-    /// epoch countdown is derived from.
-    /// Records replay progress and publishes the cluster's slot duration.
+    /// Records replay progress and publishes both slot durations: what the
+    /// cluster is configured for, and what it is doing.
     ///
-    /// The duration is the bank's configured `ns_per_slot`, not a measurement.
-    /// Measuring it was unstable: the sample window gets anchored during a
-    /// catch-up burst, when slots arrive far faster than the cluster produces
-    /// them, and then drifts for minutes as real time accumulates. That moved
-    /// the epoch countdown by ten minutes between refreshes. The configured
-    /// value only changes at an epoch boundary, so the countdown is steady.
+    /// The configured one is what the slot strip draws its bars against, where
+    /// a fixed reference is the point — bars that rescale themselves show no
+    /// change when everything slows down together. The measured one is the
+    /// strip's readout. Neither feeds the epoch countdown any more; that reads
+    /// the wider window directly, in `collect_epoch_countdown`.
     fn observe_slot_duration(&mut self, root_bank: &Bank, completed: Slot) {
         if completed > self.last_completed_slot {
             self.last_completed_slot = completed;
             self.last_completed_at = Instant::now();
         }
 
-        // What the cluster is configured for. Constant, and what the client's
-        // countdowns run on: multiplied by an epoch's worth of slots, a moving
-        // average never lets them settle.
+        // Constant between epoch boundaries, which is what makes it usable as
+        // the scale the bars are drawn against.
         let ns_per_slot = root_bank.ns_per_slot_at_slot(completed) as u64;
         self.debounces.slot_duration_nanos.publish(
             &self.publisher,
@@ -891,10 +904,9 @@ impl Collector {
         let slots_in_epoch = epoch_schedule.get_slots_in_epoch(epoch);
         let end_slot = start_slot.saturating_add(slots_in_epoch.saturating_sub(1));
 
-        // No wall-clock estimate here. It would change on every tick, so the
-        // debounce could never suppress it and this message, which carries every
-        // leader slot in the epoch, would go out five times a second. The client
-        // derives the countdown from the current slot and the slot duration.
+        // The countdown is published separately, below. It changes constantly,
+        // and this message carries every leader slot in the epoch, so folding
+        // the two together would send the whole schedule out once a second.
 
         // An unknown schedule is published as no leader slots. The panel counts
         // them, and a count is better absent-as-zero than withheld.
@@ -912,6 +924,67 @@ impl Collector {
                 my_leader_slots,
             },
         );
+
+        self.collect_epoch_countdown(bank, epoch, end_slot);
+    }
+
+    /// Publishes how much of the epoch is left, as a duration rather than as an
+    /// end time.
+    ///
+    /// A duration needs no agreement about the clock. An absolute end time
+    /// would be read against the viewer's own, which is not this validator's,
+    /// and the countdown would be wrong by the difference. `uptime_nanos` is
+    /// reported the same way for the same reason.
+    ///
+    /// Rounded to the second so that the debounce has something to suppress:
+    /// the collector ticks five times a second and the value would otherwise
+    /// differ every time.
+    fn collect_epoch_countdown(&mut self, bank: &Bank, epoch: Epoch, end_slot: Slot) {
+        // The slot the panel's own progress bar is drawn from, so the two
+        // halves of the card cannot disagree about where the epoch has got to.
+        // Taken with the working bank's slot because nothing has frozen yet in
+        // the first moments after startup, and a completed slot of zero would
+        // put the end of the epoch several years out.
+        let completed = self.last_completed_slot.max(bank.slot());
+        let remaining_slots = end_slot.saturating_sub(completed);
+        let ahead = Duration::from_nanos(
+            remaining_slots.saturating_mul(self.cluster_slot_nanos(bank, completed)),
+        );
+
+        let now = SystemTime::now();
+        let Some(estimate) = now.checked_add(ahead) else {
+            return;
+        };
+        let held = self
+            .epoch_end
+            .filter(|(held_epoch, _)| *held_epoch == epoch)
+            .map(|(_, end)| end);
+        let end = steady_epoch_end(held, estimate, EPOCH_END_DRIFT_ALLOWANCE);
+        self.epoch_end = Some((epoch, end));
+
+        let remaining = end.duration_since(now).unwrap_or_default();
+        self.debounces.epoch_remaining_nanos.publish(
+            &self.publisher,
+            TOPIC_SUMMARY,
+            "epoch_remaining_nanos",
+            remaining.as_secs().saturating_mul(1_000_000_000),
+        );
+    }
+
+    /// How long a slot is taking, measured if that can be trusted yet.
+    ///
+    /// The measurement is the whole 750-slot window rather than the minute the
+    /// strip reports, because this is multiplied by an epoch's worth of slots
+    /// and wants the steadier of the two.
+    ///
+    /// Before this validator has caught up there is nothing honest to measure —
+    /// replayed slots record the download — so the configured duration stands
+    /// in. That is what the countdown used to run on all the time, and being
+    /// wrong by an hour at the start of an epoch is what this replaces.
+    fn cluster_slot_nanos(&self, bank: &Bank, completed: Slot) -> u64 {
+        self.caught_up_at
+            .and_then(|_| windowed_mean_nanos(&self.slot_time_window, u64::MAX))
+            .unwrap_or_else(|| bank.ns_per_slot_at_slot(completed) as u64)
     }
 
     /// This validator's leader slots in `epoch`, ascending.
@@ -1392,6 +1465,32 @@ fn windowed_mean_nanos(window: &VecDeque<(Slot, u64)>, span_ms: u64) -> Option<u
     Some(nanos as u64)
 }
 
+/// The epoch end to count down to, given the one already being counted down to.
+///
+/// Holding the previous answer unless the new one has moved further than
+/// `allowance` is what keeps the readout still. The estimate underneath it
+/// moves constantly, by amounts that say nothing: it is a slot duration
+/// multiplied by hundreds of thousands of slots, so it swings by minutes on
+/// changes far too small to mean anything.
+///
+/// Drift beyond the allowance is real and is followed in one step. The step is
+/// visible, which is the point — the estimate genuinely changed.
+fn steady_epoch_end(
+    held: Option<SystemTime>,
+    estimate: SystemTime,
+    allowance: Duration,
+) -> SystemTime {
+    let Some(held) = held else {
+        return estimate;
+    };
+    // Either order, whichever way the estimate moved.
+    let drift = held
+        .duration_since(estimate)
+        .or_else(|_| estimate.duration_since(held))
+        .unwrap_or_default();
+    if drift > allowance { estimate } else { held }
+}
+
 /// Folds a gossip version string to its release, dropping any pre-release or
 /// build metadata.
 ///
@@ -1746,6 +1845,56 @@ mod tests {
             Some(500_000_000)
         );
         assert!(windowed_mean_nanos(&samples, u64::MAX).unwrap() < 420_000_000);
+    }
+
+    // ---- epoch countdown ------------------------------------------------
+
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(seconds))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_the_first_estimate_is_adopted_as_it_stands() {
+        assert_eq!(
+            steady_epoch_end(None, at(10_000), EPOCH_END_DRIFT_ALLOWANCE),
+            at(10_000)
+        );
+    }
+
+    #[test]
+    fn test_an_estimate_that_barely_moved_does_not_move_the_countdown() {
+        // Half a minute either way, on a figure hours out. Following this is
+        // what made the readout restless while telling nobody anything.
+        let held = at(10_000);
+        for estimate in [at(10_030), at(9_970)] {
+            assert_eq!(
+                steady_epoch_end(Some(held), estimate, EPOCH_END_DRIFT_ALLOWANCE),
+                held
+            );
+        }
+    }
+
+    #[test]
+    fn test_real_drift_is_followed_in_one_step() {
+        let held = at(10_000);
+        assert_eq!(
+            steady_epoch_end(Some(held), at(10_600), EPOCH_END_DRIFT_ALLOWANCE),
+            at(10_600),
+            "ten minutes is the estimate genuinely changing, not noise"
+        );
+    }
+
+    #[test]
+    fn test_drift_exactly_at_the_allowance_is_still_held() {
+        // The boundary belongs to the quiet side: a countdown that steps for a
+        // difference this small is a countdown that steps constantly.
+        let held = at(10_000);
+        assert_eq!(
+            steady_epoch_end(Some(held), at(10_060), EPOCH_END_DRIFT_ALLOWANCE),
+            held
+        );
     }
 
     // ---- catching up ----------------------------------------------------
