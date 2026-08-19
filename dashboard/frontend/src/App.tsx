@@ -37,16 +37,26 @@ export function App() {
     document.title = label ? `${TITLE} | ${label}` : TITLE;
   }, [name, identity]);
 
+  // The schedule lists the same slots in more detail, so the rail beside it
+  // would be the same thing twice. Its collapsed state is remembered rather
+  // than reset, so returning to the overview finds it as it was left.
+  const rail = page === "overview";
+  const classes = ["app"];
+  if (rail && collapsed) classes.push("is-collapsed");
+  if (!rail) classes.push("is-full");
+
   return (
-    <div className={`app${collapsed ? " is-collapsed" : ""}`}>
-      <Sidebar
-        collapsed={collapsed}
-        onToggle={() => {
-          const next = !collapsed;
-          setCollapsed(next);
-          writeSidebarCollapsed(next);
-        }}
-      />
+    <div className={classes.join(" ")}>
+      {rail && (
+        <Sidebar
+          collapsed={collapsed}
+          onToggle={() => {
+            const next = !collapsed;
+            setCollapsed(next);
+            writeSidebarCollapsed(next);
+          }}
+        />
+      )}
       <main className="main">
         <Header />
         {connection === "closed" && (

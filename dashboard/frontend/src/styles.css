@@ -91,6 +91,12 @@ body {
   grid-template-columns: 34px minmax(0, 1fr);
 }
 
+/* No rail at all where there is nothing to bring back. Declared after the
+   collapsed rule so it wins when both would apply. */
+.app.is-full {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .main {
   display: flex;
   flex-direction: column;
