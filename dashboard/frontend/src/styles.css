@@ -1037,12 +1037,6 @@ body {
   justify-content: center;
 }
 
-/* A flex stack with a gap gives even a zero-height item one. Pulled back so
-   the pill costs no space in the lists that are flex stacks. */
-.schedule-list > .scroll-top-anchor {
-  margin-bottom: calc(-1 * var(--gap));
-}
-
 .scroll-top {
   position: relative;
   top: 8px;
@@ -1502,20 +1496,37 @@ body {
   min-height: 0;
 }
 
+/* The virtualised list scrolls itself inside this; the box only gives it a
+   height to fill and a corner for the button to sit in. */
 .schedule-list {
-  display: flex;
-  flex-direction: column;
+  position: relative;
   flex: 1;
-  gap: var(--gap);
   min-height: 0;
-  overflow-y: auto;
-  /* As in the slot list: on a long list the bar is a sliver, and the way back
-     is the button that appears when it is needed. */
+}
+
+.schedule-list [data-virtuoso-scroller] {
   scrollbar-width: none;
 }
 
-.schedule-list::-webkit-scrollbar {
+.schedule-list [data-virtuoso-scroller]::-webkit-scrollbar {
   display: none;
+}
+
+/* Rows are positioned by the list, so their spacing is a margin rather than a
+   gap on a flex parent that no longer exists. */
+.schedule-list .schedule-group,
+.schedule-list .schedule-heading {
+  margin-bottom: var(--gap);
+}
+
+/* Over the list rather than in it, so it neither scrolls away nor takes a row
+   of its own. */
+.schedule-live {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
 }
 
 .schedule-controls {

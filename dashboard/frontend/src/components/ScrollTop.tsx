@@ -10,89 +10,38 @@ import { heldScrollTop } from "../scroll";
 const LIVE_EDGE_PX = 120;
 
 /**
- * Whether a deliberate jump should be animated.
+ * A pill that returns the slot list to the top, where the newest slot is.
  *
- * Read here rather than set as `scroll-behavior` on the list, which was the
- * mistake it replaces: that applies to every programmatic scroll, so the
- * corrections below animated too. Each one then took a third of a second to
- * arrive, during which the list was moving a pixel or two a frame and every
- * render saw a scroll position it had not set — so it stood aside, while its
- * own animation carried on. A recording of fifteen seconds had two hundred and
- * thirty-seven scroll changes with nothing on the page having changed.
- */
-function jumpBehaviour(): ScrollBehavior {
-  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
-}
-
-/**
- * Where `target` sits in `scroller`'s content, in pixels from its top.
- *
- * Measured through the viewport rather than by `offsetTop`, which is relative
- * to the nearest positioned ancestor and so only agrees between the two when
- * they happen to share one. They do today; a `position` on anything between
- * them would have broken it silently.
- */
-function contentTop(scroller: HTMLElement, target: HTMLElement): number {
-  const delta = target.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
-  return scroller.scrollTop + delta;
-}
-
-/**
- * A pill that returns a scrolled list to its live edge.
- *
- * `live` names the element the list is read against — for the schedule, the
- * boundary between what has been produced and what is still to come — and
- * `liveOffset` how far above it to sit, so that a little of what is coming
- * shows. Without one, the live edge is the top of the scroller.
- *
- * That element is also what the list is held against as it changes. Holding a
- * height catches only growth; holding an element catches anything that moves
- * it, and above the boundary that is a great deal — turns crossing from one
- * side to the other, the far end of the schedule trimmed, leader details
- * arriving late and changing a row's height.
- *
- * Both lists are newest-first and hundreds of rows long, so scrolling back by
- * hand is a long way. Takes the scroller rather than finding one, because the
- * two live in different parts of the tree.
+ * The schedule wants the same two things — a way back, and rows that stay put
+ * while others arrive above them — but gets both from the virtualised list it
+ * is built on. This is the plain version, for the one list short enough not to
+ * need virtualising: five hundred rows of one line each.
  *
  * The wrapper carries no height, so the button hangs over the rows instead of
- * moving them, and is sticky rather than absolute so it tracks the list it
- * belongs to and not the page.
+ * moving them, and is sticky rather than absolute so it tracks the list rather
+ * than the page.
  */
-export function ScrollTop({
-  scroller,
-  live,
-  liveOffset = 0,
-}: {
-  scroller: RefObject<HTMLElement | null>;
-  live?: RefObject<HTMLElement | null>;
-  liveOffset?: number;
-}) {
+export function ScrollTop({ scroller }: { scroller: RefObject<HTMLElement | null> }) {
   const [away, setAway] = useState(false);
   // Shared with the hook below: it needs to know where the list was left, to
   // tell its own correction apart from one the browser already made.
   const top = useRef(0);
-  useHeldScroll(scroller, top, live);
+  useHeldScroll(scroller, top);
 
   useEffect(() => {
     const element = scroller.current;
     if (!element) return;
 
-    const liveTop = () => {
-      const target = live?.current;
-      if (!target) return 0;
-      return Math.max(0, contentTop(element, target) - liveOffset);
-    };
     const follow = () => {
       top.current = element.scrollTop;
-      setAway(Math.abs(element.scrollTop - liveTop()) > LIVE_EDGE_PX);
+      setAway(element.scrollTop > LIVE_EDGE_PX);
     };
     element.addEventListener("scroll", follow, { passive: true });
-    // The scroller may already be away from the live edge when this mounts,
-    // which is what happens when the page is switched while scrolled.
+    // The list may already be scrolled when this mounts, which is what happens
+    // when the page is switched away from and back.
     follow();
     return () => element.removeEventListener("scroll", follow);
-  }, [scroller, live, liveOffset]);
+  }, [scroller]);
 
   return (
     <div className="scroll-top-anchor">
@@ -100,20 +49,20 @@ export function ScrollTop({
         <button
           type="button"
           className="scroll-top"
-          onClick={() => {
-            const element = scroller.current;
-            if (!element) return;
-            const target = live?.current;
-            element.scrollTo({
-              top: target ? Math.max(0, contentTop(element, target) - liveOffset) : 0,
-              behavior: jumpBehaviour(),
-            });
-          }}
+          onClick={() =>
+            scroller.current?.scrollTo({
+              top: 0,
+              // Read here rather than set as `scroll-behavior` on the list,
+              // which applies to every programmatic scroll and so animated the
+              // corrections below as well. Each then took a third of a second,
+              // during which every render saw a scroll position it had not set.
+              behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+                ? "auto"
+                : "smooth",
+            })
+          }
         >
-          {/* The slot list is only ever scrolled away downwards, so its way
-              back is up. The schedule has a list either side of its live edge
-              and can be on either side of it. */}
-          {live ? "Live" : "Top"} <span aria-hidden="true">{live ? "↕" : "↑"}</span>
+          Top <span aria-hidden="true">↑</span>
         </button>
       )}
     </div>
@@ -121,57 +70,45 @@ export function ScrollTop({
 }
 
 /**
- * Keeps what is on screen still while the list changes around it.
+ * Keeps what is on screen still while rows arrive above it.
  *
- * These lists are newest first, so every new slot is inserted above what is
- * being read and pushes it down the screen — two and a half times a second,
- * which makes a scrolled list unusable.
+ * The list is newest first, so every new slot is inserted at the top and pushes
+ * everything being read down the screen — two and a half times a second, which
+ * makes a scrolled list unusable.
  *
  * Browsers have scroll anchoring for exactly this and it cannot be relied on:
- * it holds the slot list but not the schedule, for reasons apparent from
- * neither, and Safari does not implement it at all.
+ * Safari does not implement it at all, and Chrome applies it here but not to a
+ * virtualised list, for reasons apparent from neither.
  *
- * With an anchor, what is held is that element's distance from the top of the
- * scroller, so anything that moves it is followed rather than only growth.
- * Without one the measure is the list's height, and a viewer sitting at the top
- * is left alone: being there is a request to see what arrives.
- *
- * Corrections are instant, always. They are not a movement anyone asked for —
- * they exist so that nothing appears to move — and animating them is what made
- * the page restless rather than still.
+ * Corrections are instant. They are not a movement anyone asked for — they
+ * exist so that nothing appears to move — and animating them made the page
+ * restless rather than still.
  */
 function useHeldScroll(
   scroller: RefObject<HTMLElement | null>,
   // A plain box rather than `RefObject`, whose `current` React types as
   // read-only; this one is written on both sides.
   top: { current: number },
-  anchor?: RefObject<HTMLElement | null>,
 ): void {
-  // Undefined until the first measurement rather than zero. Seeded at zero, the
-  // first render reads the anchor as having moved the whole way down the list
-  // and scrolls there, which is a page-length jump on arrival and again on
-  // every remount.
-  const measured = useRef<number | undefined>(undefined);
+  // Undefined until the first measurement rather than zero, which would read as
+  // the list having grown its whole length on the first render.
+  const height = useRef<number | undefined>(undefined);
 
   useLayoutEffect(() => {
     const element = scroller.current;
     if (!element) return;
 
-    const held = anchor?.current;
-    const measure = held ? contentTop(element, held) : element.scrollHeight;
-    const previous = measured.current;
-    measured.current = measure;
+    const previous = height.current;
+    height.current = element.scrollHeight;
 
-    // Nothing to compare against yet, and nothing to hold: a list that does not
-    // scroll cannot have been pushed.
-    if (previous === undefined || element.scrollHeight <= element.clientHeight) {
+    if (previous === undefined) {
       top.current = element.scrollTop;
       return;
     }
 
     // Compared before `top` is refreshed, or the check for a position something
     // else has already moved could never fire.
-    const next = heldScrollTop(element.scrollTop, top.current, previous, measure, held != null);
+    const next = heldScrollTop(element.scrollTop, top.current, previous, element.scrollHeight);
     if (next !== element.scrollTop) {
       element.scrollTop = next;
     }

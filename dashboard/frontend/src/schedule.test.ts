@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { groupByLeader, hasBegun, matchesQuery, timeline, type Led } from "./schedule";
+import {
+  groupByLeader,
+  hasBegun,
+  matchesQuery,
+  prependedCount,
+  rowKey,
+  scheduleRows,
+  timeline,
+  type Led,
+} from "./schedule";
 import type { SlotEntry, UpcomingSlot } from "./types";
 
 function slot(number: number, leader: string, name: string | null = null): Led {
@@ -128,5 +137,61 @@ describe("hasBegun", () => {
       timeline([], [scheduled(101, "alice"), scheduled(102, "alice")]),
     );
     expect(hasBegun(groups[0])).toBe(false);
+  });
+});
+
+describe("scheduleRows", () => {
+  const rows = (heldSlots: number[], scheduledSlots: number[]) =>
+    scheduleRows(
+      groupByLeader(
+        timeline(
+          heldSlots.map((slot) => held(slot, `L${Math.floor(slot / 4)}`)),
+          scheduledSlots.map((slot) => scheduled(slot, `L${Math.floor(slot / 4)}`)),
+        ),
+      ),
+    );
+
+  it("puts the turns to come above the boundary and the rest below", () => {
+    const list = rows([100, 101, 102, 103], [104, 105, 106, 107]);
+    expect(list.map((row) => (row.kind === "heading" ? row.label : "turn"))).toEqual([
+      "Upcoming",
+      "turn",
+      "Produced",
+      "turn",
+    ]);
+  });
+
+  it("keeps the boundary even with nothing scheduled yet", () => {
+    // The heading is what the page measures itself against, so it cannot come
+    // and go with the data.
+    const list = rows([100, 101], []);
+    expect(list[0]).toEqual({ kind: "heading", label: "Produced" });
+  });
+});
+
+describe("rowKey", () => {
+  it("names a turn by its own first slot, not its position", () => {
+    // Turns arrive above and fall off below constantly; a name that moved with
+    // them would identify nothing.
+    const [group] = groupByLeader(timeline([held(100, "a"), held(101, "a")], []));
+    expect(rowKey({ kind: "group", group })).toBe("turn:100");
+  });
+});
+
+describe("prependedCount", () => {
+  it("counts what appeared above the row that used to be first", () => {
+    expect(prependedCount(["b", "c"], ["a", "b", "c"])).toBe(1);
+    expect(prependedCount(["c"], ["a", "b", "c"])).toBe(2);
+  });
+
+  it("counts nothing when the front has not moved", () => {
+    expect(prependedCount(["a", "b"], ["a", "b", "c"])).toBe(0);
+  });
+
+  it("counts nothing across a list with nothing in common", () => {
+    // A search was typed, or the connection dropped: there is no position to
+    // hold, and guessing one would throw the list somewhere arbitrary.
+    expect(prependedCount(["a"], ["x", "y"])).toBe(0);
+    expect(prependedCount([], ["a", "b"])).toBe(0);
   });
 });

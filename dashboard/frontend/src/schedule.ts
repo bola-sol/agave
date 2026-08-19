@@ -125,3 +125,60 @@ export function timeline(held: SlotEntry[], scheduled: UpcomingSlot[]): Timeline
 export function hasBegun(group: LeaderGroup<TimelineSlot>): boolean {
   return group.slots.at(-1)?.entry != null;
 }
+
+/** A heading, or one leader's turn. What the list renders, one per row. */
+export type ScheduleRow =
+  | { kind: "heading"; label: string }
+  | { kind: "group"; group: LeaderGroup<TimelineSlot> };
+
+/**
+ * The page as a flat list of rows, newest first, with its two headings in place.
+ *
+ * Flat because the list is virtualised, and a virtualised list is addressed by
+ * index: the headings have to be items of their own rather than markup wrapped
+ * around slices of the data, or their positions could not be measured or
+ * scrolled to.
+ */
+export function scheduleRows(groups: LeaderGroup<TimelineSlot>[]): ScheduleRow[] {
+  const scheduled = groups.filter((group) => !hasBegun(group));
+  const produced = groups.filter(hasBegun);
+  const rows: ScheduleRow[] = [];
+
+  if (scheduled.length > 0) rows.push({ kind: "heading", label: "Upcoming" });
+  for (const group of scheduled) rows.push({ kind: "group", group });
+  rows.push({ kind: "heading", label: "Produced" });
+  for (const group of produced) rows.push({ kind: "group", group });
+
+  return rows;
+}
+
+/**
+ * A stable name for a row, which is what lets a changed list be compared with
+ * the one before it.
+ *
+ * A turn is named by its own first slot rather than by its position: turns
+ * arrive above it and fall off below it constantly, and a name that moved with
+ * them would identify nothing.
+ */
+export function rowKey(row: ScheduleRow): string {
+  return row.kind === "heading" ? `heading:${row.label}` : `turn:${row.group.slots.at(-1)?.slot}`;
+}
+
+/**
+ * How many rows were added above `previous` to make `keys`.
+ *
+ * The virtualised list is told this rather than left to work it out, and it
+ * shifts its own record of where everything sits by that much — which is how
+ * the view stays put while turns arrive above it. Measuring pixels after the
+ * fact, which is what this replaces, can only ever guess at it.
+ *
+ * A first row that is no longer in the list at all means the two have nothing
+ * in common — a search was typed, or the connection dropped and came back — and
+ * nothing can be held across that.
+ */
+export function prependedCount(previous: string[], keys: string[]): number {
+  const first = previous[0];
+  if (first === undefined) return 0;
+  const at = keys.indexOf(first);
+  return at > 0 ? at : 0;
+}

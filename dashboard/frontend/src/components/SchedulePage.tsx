@@ -1,9 +1,13 @@
-import { memo, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import { memo, useMemo, useRef, useState } from "react";
+import { Virtuoso, type ListRange, type VirtuosoHandle } from "react-virtuoso";
 import { count, percent, shortKey, sol, solCompact } from "../format";
 import {
   groupByLeader,
   hasBegun,
   matchesQuery,
+  prependedCount,
+  rowKey,
+  scheduleRows,
   timeline,
   type Led,
   type LeaderGroup,
@@ -13,18 +17,23 @@ import type { Peer, StakeSummary, UpcomingSlot } from "../types";
 import { useStore } from "../useStore";
 import { Copyable } from "./Copyable";
 import { Logo } from "./Logo";
-import { ScrollTop } from "./ScrollTop";
 
 /**
- * How far above the boundary the page settles, in pixels.
+ * Leader turns kept above the boundary when the page settles on it.
  *
- * Measured rather than counted in turns. A turn is not a fixed height — the
- * nearest one is a partial run, and a leader whose details have not arrived is
- * shorter than one whose have — so counting them made the resting place move
- * about, and with it the position the page kept returning to. Roughly two
- * turns, and the exact figure does not matter: it is only where the list opens.
+ * Enough to see who is next without opening on a stretch of schedule that has
+ * not happened. Everything further ahead is still there, above them.
  */
-const AHEAD_PINNED_PX = 260;
+const AHEAD_PINNED = 2;
+
+/**
+ * Where the row indices start.
+ *
+ * The virtualised list identifies rows by an index that only ever decreases as
+ * turns arrive above them, so it has to begin high enough to keep counting down
+ * for as long as the page is open. At a turn every second or so this is years.
+ */
+const FIRST_ROW = 1_000_000;
 
 /**
  * The leader schedule, with what each block turned out to contain.
@@ -36,34 +45,61 @@ const AHEAD_PINNED_PX = 260;
  * Slots that have begun and slots the schedule promises are merged into one run
  * before being grouped, so a leader's turn is drawn once and whole. Split at the
  * slot being produced it appeared on both sides of the boundary, losing a row
- * above and gaining one below several times a turn, and everything after it
- * moved each time.
+ * above and gaining one below several times a turn.
+ *
+ * The list is virtualised, and that is what keeps it still. Turns arrive above
+ * whatever is being read two and a half times a second, and the list is *told*
+ * how many rather than left to infer it from the page afterwards:
+ * `firstItemIndex` drops by the number prepended and the view does not move.
+ * Every attempt here to work that out from pixels found a new way to be wrong —
+ * a seed that read as a page-length jump, two corrections in different render
+ * phases, a smooth-scroll animation racing its own correction. Firedancer's
+ * schedule is built on the same library for the same reason.
  */
 export function SchedulePage() {
   const store = useStore();
   const [query, setQuery] = useState("");
   const [oursOnly, setOursOnly] = useState(false);
-  const list = useRef<HTMLDivElement>(null);
-  const live = useRef<HTMLHeadingElement>(null);
+  const list = useRef<VirtuosoHandle>(null);
+  const seen = useRef<string[]>([]);
+  const [firstRow, setFirstRow] = useState(FIRST_ROW);
+  const [range, setRange] = useState<ListRange | null>(null);
 
   const completed = store.get<number>("summary", "completed_slot");
   const stake = store.get<StakeSummary>("summary", "stake");
   const peers = store.get<Peer[]>("peers", "all");
   const upcoming = store.get<UpcomingSlot[]>("slot", "upcoming") ?? [];
-  const byIdentity = new Map((peers ?? []).map((peer) => [peer.identity, peer]));
+  const slots = store.getSlots();
 
-  // Published on the slow tier, so the front of it has usually happened.
-  const ahead =
-    completed === undefined ? upcoming : upcoming.filter((slot) => slot.slot > completed);
+  const byIdentity = useMemo(
+    () => new Map((peers ?? []).map((peer) => [peer.identity, peer])),
+    [peers],
+  );
 
-  const wanted = <T extends Led>(group: LeaderGroup<T>) =>
-    matchesQuery(group, query) && (!oursOnly || group.mine);
+  const rows = useMemo(() => {
+    // Published on the slow tier, so the front of it has usually happened.
+    const ahead =
+      completed === undefined ? upcoming : upcoming.filter((slot) => slot.slot > completed);
+    const groups = groupByLeader(timeline(slots, ahead)).filter(
+      (group) => matchesQuery(group, query) && (!oursOnly || group.mine),
+    );
+    return scheduleRows(groups);
+  }, [slots, upcoming, completed, query, oursOnly]);
 
-  const groups = groupByLeader(timeline(store.getSlots(), ahead)).filter(wanted);
-  const scheduled = groups.filter((group) => !hasBegun(group));
-  const produced = groups.filter(hasBegun);
+  // Counted during the render that introduces the rows, so the list is handed
+  // them and the shift that goes with them together. Told afterwards, it would
+  // draw them in the wrong place for a frame first.
+  const keys = rows.map(rowKey);
+  const prepended = prependedCount(seen.current, keys);
+  if (prepended > 0) setFirstRow((first) => first - prepended);
+  seen.current = keys;
 
-  usePinToBoundary(list, live, produced.length > 0);
+  const boundary = rows.findIndex((row) => row.kind === "heading" && row.label === "Produced");
+  const settleOn = Math.max(0, boundary - AHEAD_PINNED);
+  // Away once the boundary is off screen entirely: what is being read is then
+  // either history or schedule rather than what is happening now.
+  const away =
+    range !== null && boundary >= 0 && (boundary < range.startIndex || boundary > range.endIndex);
 
   return (
     <section className="schedule">
@@ -86,76 +122,47 @@ export function SchedulePage() {
         </div>
       </div>
 
-      <div className="schedule-list" ref={list}>
-        <ScrollTop scroller={list} live={live} liveOffset={AHEAD_PINNED_PX} />
-        {scheduled.length > 0 && <h2 className="schedule-heading">Upcoming</h2>}
-        {scheduled.map((group) => (
-          <Group
-            key={group.slots[0].slot}
-            group={group}
-            peer={group.leader ? byIdentity.get(group.leader) : undefined}
-            totalStake={stake?.total_stake}
-          />
-        ))}
-
-        {/* The boundary, and the one element on the page that neither moves
-            between renders nor changes what it is. Everything about where the
-            list sits is measured from here. */}
-        <h2 className="schedule-heading" ref={live}>
-          Produced
-        </h2>
-        {produced.length === 0 && (
-          <div className="sidebar-empty">
-            {groups.length === 0 ? "waiting for slots…" : "nothing matches that"}
-          </div>
+      <div className="schedule-list">
+        {away && (
+          <button
+            type="button"
+            className="scroll-top schedule-live"
+            onClick={() => list.current?.scrollToIndex({ index: settleOn, align: "start" })}
+          >
+            Live <span aria-hidden="true">↕</span>
+          </button>
         )}
-        {produced.map((group) => (
-          <Group
-            key={group.slots[0].slot}
-            group={group}
-            peer={group.leader ? byIdentity.get(group.leader) : undefined}
-            totalStake={stake?.total_stake}
+        {rows.length <= 1 ? (
+          <div className="sidebar-empty">
+            {slots.length === 0 ? "waiting for slots…" : "nothing matches that"}
+          </div>
+        ) : (
+          <Virtuoso
+            ref={list}
+            data={rows}
+            firstItemIndex={firstRow}
+            initialTopMostItemIndex={settleOn}
+            computeItemKey={(_index, row) => rowKey(row)}
+            rangeChanged={setRange}
+            // A screen either side, so a turn is measured before it is scrolled
+            // into rather than resizing the list underneath the scroll.
+            increaseViewportBy={600}
+            itemContent={(_index, row) =>
+              row.kind === "heading" ? (
+                <h2 className="schedule-heading">{row.label}</h2>
+              ) : (
+                <Group
+                  group={row.group}
+                  peer={row.group.leader ? byIdentity.get(row.group.leader) : undefined}
+                  totalStake={stake?.total_stake}
+                />
+              )
+            }
           />
-        ))}
+        )}
       </div>
     </section>
   );
-}
-
-/**
- * Settles the list on the boundary once, when the first slots arrive.
- *
- * Once, because after that the position is the viewer's. The list is scrolled
- * rather than trimmed, so everything further ahead stays reachable by scrolling
- * up: the difference between a starting position and a limit.
- *
- * Before the paint rather than after it, so that arriving on the page does not
- * show the top of the schedule for a frame and then jump. It shares the phase
- * with the held position, which sees the move as one it did not make and stands
- * aside — the same way it treats the browser's own anchoring.
- */
-function usePinToBoundary(
-  list: RefObject<HTMLDivElement | null>,
-  live: RefObject<HTMLHeadingElement | null>,
-  ready: boolean,
-): void {
-  const settled = useRef(false);
-
-  useLayoutEffect(() => {
-    if (settled.current || !ready) return;
-    const scroller = list.current;
-    const target = live.current;
-    if (!scroller || !target) return;
-    // Nothing to scroll yet: the boundary is already on screen, and settling
-    // now would spend the one chance on a list that has not filled.
-    if (scroller.scrollHeight <= scroller.clientHeight) return;
-
-    settled.current = true;
-    const boundary =
-      scroller.scrollTop +
-      (target.getBoundingClientRect().top - scroller.getBoundingClientRect().top);
-    scroller.scrollTop = Math.max(0, boundary - AHEAD_PINNED_PX);
-  });
 }
 
 /**
@@ -163,8 +170,7 @@ function usePinToBoundary(
  *
  * Memoised on the slots themselves. The store replaces only the entries that
  * changed, so a turn whose slots have all settled is skipped rather than
- * rebuilt — which is most of them, on a page of a hundred and fifty turns that
- * was otherwise re-rendering whole several times a second.
+ * rebuilt as the page updates around it.
  */
 const Group = memo(
   function Group({
@@ -231,8 +237,7 @@ function GroupLeader<T extends Led>({
         />
       )}
       {/* Always drawn, empty or not. The peer table arrives on the slow tier
-          and a turn that grew a line when it did would move every turn after
-          it, several times a minute. */}
+          and a turn that grew a line when it did would be measured twice. */}
       <div className="schedule-leader-meta">
         {peer?.version && <span className="schedule-version">{peer.version}</span>}
         {peer && peer.stake > 0 && (
