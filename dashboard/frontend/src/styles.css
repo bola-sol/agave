@@ -1603,10 +1603,16 @@ body {
   letter-spacing: 0.06em;
 }
 
+/* One line, always, whether or not the peer table has reached this leader yet.
+   Wrapping or collapsing would change the height of a turn after it was drawn,
+   which moves every turn below it. */
 .schedule-leader-meta {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 4px 10px;
+  min-height: 14px;
+  overflow: hidden;
+  white-space: nowrap;
   font-size: 11px;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;

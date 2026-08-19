@@ -26,6 +26,17 @@ describe("heldScrollTop", () => {
     expect(heldScrollTop(0, 0, 5000, 5116, true)).toBe(116);
   });
 
+  it("follows an anchor upwards as well as down", () => {
+    // Anchored, the measure moves both ways: turns cross the boundary from
+    // above it and the schedule is trimmed behind them. A height only grows.
+    expect(heldScrollTop(900, 900, 5000, 4880, true)).toBe(780);
+    expect(heldScrollTop(900, 900, 5000, 4880, false)).toBe(900);
+  });
+
+  it("never asks for a position above the top", () => {
+    expect(heldScrollTop(40, 40, 5000, 4800, true)).toBe(0);
+  });
+
   it("stands aside when the browser already anchored", () => {
     // Where scroll anchoring fires it has already added the growth. Adding it
     // again would send the list twice as far as it should go.

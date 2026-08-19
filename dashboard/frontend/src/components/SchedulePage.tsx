@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState, type Ref, type RefObject } from "react";
+import { memo, useEffect, useRef, useState, type RefObject } from "react";
 import { count, percent, shortKey, sol, solCompact } from "../format";
 import {
   groupByLeader,
@@ -16,12 +16,15 @@ import { Logo } from "./Logo";
 import { ScrollTop } from "./ScrollTop";
 
 /**
- * Leader turns kept above the boundary when the page settles on it.
+ * How far above the boundary the page settles, in pixels.
  *
- * Enough to see who is next without opening on a stretch of schedule that has
- * not happened. Everything further ahead is still there, above them.
+ * Measured rather than counted in turns. A turn is not a fixed height — the
+ * nearest one is a partial run, and a leader whose details have not arrived is
+ * shorter than one whose have — so counting them made the resting place move
+ * about, and with it the position the page kept returning to. Roughly two
+ * turns, and the exact figure does not matter: it is only where the list opens.
  */
-const AHEAD_PINNED = 2;
+const AHEAD_PINNED_PX = 260;
 
 /**
  * The leader schedule, with what each block turned out to contain.
@@ -41,7 +44,7 @@ export function SchedulePage() {
   const [query, setQuery] = useState("");
   const [oursOnly, setOursOnly] = useState(false);
   const list = useRef<HTMLDivElement>(null);
-  const live = useRef<HTMLDivElement>(null);
+  const live = useRef<HTMLHeadingElement>(null);
 
   const completed = store.get<number>("summary", "completed_slot");
   const stake = store.get<StakeSummary>("summary", "stake");
@@ -59,8 +62,6 @@ export function SchedulePage() {
   const groups = groupByLeader(timeline(store.getSlots(), ahead)).filter(wanted);
   const scheduled = groups.filter((group) => !hasBegun(group));
   const produced = groups.filter(hasBegun);
-  // The turn the page settles on, counted back from the boundary.
-  const pinned = Math.max(0, scheduled.length - AHEAD_PINNED);
 
   usePinToBoundary(list, live, produced.length > 0);
 
@@ -86,19 +87,23 @@ export function SchedulePage() {
       </div>
 
       <div className="schedule-list" ref={list}>
-        <ScrollTop scroller={list} live={live} />
+        <ScrollTop scroller={list} live={live} liveOffset={AHEAD_PINNED_PX} />
         {scheduled.length > 0 && <h2 className="schedule-heading">Upcoming</h2>}
-        {scheduled.map((group, index) => (
+        {scheduled.map((group) => (
           <Group
             key={group.slots[0].slot}
             group={group}
             peer={group.leader ? byIdentity.get(group.leader) : undefined}
             totalStake={stake?.total_stake}
-            anchor={index === pinned ? live : undefined}
           />
         ))}
 
-        <h2 className="schedule-heading">Produced</h2>
+        {/* The boundary, and the one element on the page that neither moves
+            between renders nor changes what it is. Everything about where the
+            list sits is measured from here. */}
+        <h2 className="schedule-heading" ref={live}>
+          Produced
+        </h2>
         {produced.length === 0 && (
           <div className="sidebar-empty">
             {groups.length === 0 ? "waiting for slots…" : "nothing matches that"}
@@ -126,7 +131,7 @@ export function SchedulePage() {
  */
 function usePinToBoundary(
   list: RefObject<HTMLDivElement | null>,
-  live: RefObject<HTMLDivElement | null>,
+  live: RefObject<HTMLHeadingElement | null>,
   ready: boolean,
 ): void {
   const settled = useRef(false);
@@ -137,7 +142,7 @@ function usePinToBoundary(
     const target = live.current;
     if (!scroller || !target) return;
     settled.current = true;
-    scroller.scrollTop = target.offsetTop - scroller.offsetTop;
+    scroller.scrollTop = Math.max(0, target.offsetTop - scroller.offsetTop - AHEAD_PINNED_PX);
   }, [list, live, ready]);
 }
 
@@ -154,18 +159,13 @@ const Group = memo(
     group,
     peer,
     totalStake,
-    anchor,
   }: {
     group: LeaderGroup<TimelineSlot>;
     peer: Peer | undefined;
     totalStake: number | undefined;
-    anchor?: Ref<HTMLDivElement>;
   }) {
     return (
-      <div
-        className={`schedule-group${hasBegun(group) ? "" : " is-upcoming"}`}
-        ref={anchor}
-      >
+      <div className={`schedule-group${hasBegun(group) ? "" : " is-upcoming"}`}>
         <GroupLeader group={group} peer={peer} totalStake={totalStake} />
         <div className="schedule-slots">
           <div className="schedule-row schedule-head">
@@ -186,7 +186,6 @@ const Group = memo(
   (before, after) =>
     before.peer === after.peer &&
     before.totalStake === after.totalStake &&
-    before.anchor === after.anchor &&
     before.group.slots.length === after.group.slots.length &&
     before.group.slots.every((slot, index) => slot.entry === after.group.slots[index]?.entry),
 );
@@ -219,18 +218,19 @@ function GroupLeader<T extends Led>({
           className="schedule-leader-key"
         />
       )}
-      {peer && (
-        <div className="schedule-leader-meta">
-          {peer.version && <span className="schedule-version">{peer.version}</span>}
-          {peer.stake > 0 && (
-            <span>
-              {solCompact(peer.stake)} SOL
-              {share !== null && <span className="schedule-share">{percent(share, 3)}</span>}
-            </span>
-          )}
-          {peer.ip && <span className="schedule-ip">{peer.ip}</span>}
-        </div>
-      )}
+      {/* Always drawn, empty or not. The peer table arrives on the slow tier
+          and a turn that grew a line when it did would move every turn after
+          it, several times a minute. */}
+      <div className="schedule-leader-meta">
+        {peer?.version && <span className="schedule-version">{peer.version}</span>}
+        {peer && peer.stake > 0 && (
+          <span>
+            {solCompact(peer.stake)} SOL
+            {share !== null && <span className="schedule-share">{percent(share, 3)}</span>}
+          </span>
+        )}
+        {peer?.ip && <span className="schedule-ip">{peer.ip}</span>}
+      </div>
     </div>
   );
 }
