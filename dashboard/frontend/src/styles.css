@@ -1569,6 +1569,27 @@ body {
   letter-spacing: 0.06em;
 }
 
+.schedule-leader-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.schedule-version {
+  color: var(--text-dim);
+}
+
+.schedule-share {
+  margin-left: 5px;
+}
+
+.schedule-ip {
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
 .schedule-slots {
   display: flex;
   flex-direction: column;

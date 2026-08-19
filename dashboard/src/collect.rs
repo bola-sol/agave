@@ -17,7 +17,7 @@ use {
     crate::{
         context::{DashboardContext, StartupProgressFn},
         produced::{ProducedBlock, ProducedRing},
-        proto::{Debounced, Publisher, TOPIC_EPOCH, TOPIC_SLOT, TOPIC_SUMMARY},
+        proto::{Debounced, Publisher, TOPIC_EPOCH, TOPIC_PEERS, TOPIC_SLOT, TOPIC_SUMMARY},
         slots::{BlockDetail, SlotEntry, SlotLevel, SlotRing},
         startup::StartupPublisher,
         validator_info::{self, ValidatorInfoCache},
@@ -171,6 +171,28 @@ pub struct VersionShare {
     pub other: bool,
 }
 
+/// What is known about a validator beyond the name the slot rows carry.
+///
+/// Published only for the leaders on screen, so this table is bounded by what
+/// the page shows rather than by the size of the validator set. The name and
+/// icon are deliberately absent: every slot row already carries them, and
+/// repeating them here would be the largest thing in the message.
+///
+/// The gossip address is on this list because a schedule is read to work out
+/// who is producing badly and from where. It is already public — every node in
+/// the cluster has it — but this publishes it to anyone who can reach the page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Peer {
+    pub identity: String,
+    /// Client version as gossip reports it, absent for a node not being heard
+    /// from.
+    pub version: Option<String>,
+    /// Active stake this epoch, in lamports. Zero for an unstaked node.
+    pub stake: u64,
+    /// Host of the gossip address, without the port.
+    pub ip: Option<String>,
+}
+
 /// A slot the leader schedule has assigned that has not happened yet.
 ///
 /// Leaner than [`SlotEntry`]: an unstarted slot has no level, no block and no
@@ -238,6 +260,7 @@ struct Debounces {
     epoch: Debounced<EpochInfo>,
     epoch_remaining_nanos: Debounced<u64>,
     upcoming: Debounced<Vec<UpcomingSlot>>,
+    peers: Debounced<Vec<Peer>>,
 }
 
 pub struct Collector {
@@ -437,7 +460,10 @@ impl Collector {
             self.collect_peers(&working_bank);
             self.collect_health();
             self.collect_skip_rate(&root_bank);
-            self.collect_upcoming(&root_bank, highest_slot);
+            // Ahead of the peer table, which covers the leaders of both the
+            // slots already sent and the ones about to be.
+            let ahead = self.collect_upcoming(&root_bank, highest_slot);
+            self.collect_peer_table(&working_bank, ahead);
         }
     }
 
@@ -695,7 +721,8 @@ impl Collector {
     /// Anchored on the highest slot bank forks holds rather than on the last
     /// one replayed, so that the list starts past the slot being worked on
     /// instead of repeating it.
-    fn collect_upcoming(&mut self, root_bank: &Bank, highest_slot: Slot) {
+    /// Returns the leaders it published, for the peer table to describe.
+    fn collect_upcoming(&mut self, root_bank: &Bank, highest_slot: Slot) -> HashSet<String> {
         let me = self.ctx.identity();
         let first = highest_slot.saturating_add(1);
         let last = highest_slot.saturating_add(UPCOMING_SLOTS);
@@ -719,9 +746,74 @@ impl Collector {
             });
         }
 
+        let leaders = upcoming
+            .iter()
+            .map(|slot| slot.leader.clone())
+            .collect::<HashSet<_>>();
         self.debounces
             .upcoming
             .publish(&self.publisher, TOPIC_SLOT, "upcoming", upcoming);
+        leaders
+    }
+
+    /// Publishes stake, client version and address for the leaders on screen.
+    ///
+    /// Restricted to those leaders rather than the whole validator set: the
+    /// schedule only ever shows the slots a client is holding, and a table of
+    /// every node in the cluster would be the largest message the dashboard
+    /// sends, on a page that has no authentication in front of it.
+    ///
+    /// Sorted by identity so that the debounce has a stable value to compare.
+    /// Collected through a set, whose iteration order is not stable, and an
+    /// unsorted list would look different on every tick and republish itself
+    /// for no reason.
+    fn collect_peer_table(&mut self, bank: &Bank, mut leaders: HashSet<String>) {
+        leaders.extend(self.slots.recent_leaders(SLOT_OVERVIEW_LEN));
+
+        let mut stakes: HashMap<String, u64> = HashMap::new();
+        for (_vote_pubkey, (stake, account)) in bank.vote_accounts().iter() {
+            if *stake == 0 {
+                continue;
+            }
+            let identity = account.node_pubkey().to_string();
+            if leaders.contains(&identity) {
+                let total = stakes.entry(identity).or_insert(0);
+                *total = total.saturating_add(*stake);
+            }
+        }
+
+        let mut gossip: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        for (contact_info, _) in self.ctx.cluster_info.all_peers() {
+            let identity = contact_info.pubkey().to_string();
+            if !leaders.contains(&identity) {
+                continue;
+            }
+            gossip.insert(
+                identity,
+                (
+                    Some(contact_info.version().to_string()),
+                    contact_info.gossip().map(|addr| addr.ip().to_string()),
+                ),
+            );
+        }
+
+        let mut peers: Vec<Peer> = leaders
+            .into_iter()
+            .map(|identity| {
+                let (version, ip) = gossip.get(&identity).cloned().unwrap_or_default();
+                Peer {
+                    stake: stakes.get(&identity).copied().unwrap_or(0),
+                    version,
+                    ip,
+                    identity,
+                }
+            })
+            .collect();
+        peers.sort_by(|a, b| a.identity.cmp(&b.identity));
+
+        self.debounces
+            .peers
+            .publish(&self.publisher, TOPIC_PEERS, "all", peers);
     }
 
     fn collect_slot_levels(&mut self, root_bank: &Bank, frozen: &[(Slot, Arc<Bank>)]) {

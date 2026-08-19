@@ -4,7 +4,7 @@ use {
     serde::Serialize,
     solana_clock::Slot,
     solana_pubkey::Pubkey,
-    std::collections::{BTreeMap, btree_map::Entry},
+    std::collections::{BTreeMap, HashSet, btree_map::Entry},
 };
 
 /// How far a slot has progressed through consensus, ordered from least to most
@@ -139,6 +139,21 @@ impl SlotRing {
     pub fn recent(&self, count: usize) -> Vec<SlotEntry> {
         let skip = self.entries.len().saturating_sub(count);
         self.entries.values().skip(skip).cloned().collect()
+    }
+
+    /// The distinct leaders of the most recent `count` slots.
+    ///
+    /// What the schedule page needs metadata for, and no more. Bounded by the
+    /// slots a client is actually holding rather than by the size of the
+    /// cluster, so the table that goes with it does not grow with a validator
+    /// set the page never shows.
+    pub fn recent_leaders(&self, count: usize) -> HashSet<String> {
+        let skip = self.entries.len().saturating_sub(count);
+        self.entries
+            .values()
+            .skip(skip)
+            .filter_map(|entry| entry.leader.clone())
+            .collect()
     }
 
     /// What a newly connected client is sent: the most recent `count` slots,

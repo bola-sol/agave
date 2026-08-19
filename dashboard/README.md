@@ -67,6 +67,10 @@ the domain in the site block is the name to allow, and nothing else is needed.
 - The identity and vote pubkeys, stake, version and skip rate of your validator
   are all on screen. All of it is already public on chain; none of it is secret,
   but it does identify which validator this is.
+- The schedule page shows the stake, client version and gossip address of the
+  other validators leading the slots on screen. All of that is already public —
+  every node in the cluster holds it — but serving the page publishes it to
+  anyone who can reach it.
 
 ### What it costs the validator
 
@@ -114,6 +118,7 @@ Topics currently published:
 |-----------|------|
 | `summary` | `version`, `commit_hash`, `cluster`, `shred_version`, `identity_key`, `identity_name`, `identity_icon`, `vote_key`, `startup_time_nanos`, `server_time_nanos`, `uptime_nanos`, `startup_progress`, `root_slot`, `optimistically_confirmed_slot`, `finalized_slot`, `completed_slot`, `estimated_slot`, `block_height`, `next_leader_slot`, `vote_slot`, `vote_distance`, `identity_balance`, `vote_balance`, `vote_commission`, `stake`, `validator_counts`, `versions`, `estimated_slot_duration_nanos`, `observed_slot_duration_nanos`, `epoch_remaining_nanos`, `produced_blocks`, `skip_rate`, `health`, `estimated_tps`, `tps_history`, `tps_sample`, `network`, `network_history`, `network_sample` |
 | `epoch`   | `new` |
+| `peers`   | `all` |
 | `slot`    | `overview`, `update`, `upcoming` |
 
 The only request a client can make today is `summary.ping`.

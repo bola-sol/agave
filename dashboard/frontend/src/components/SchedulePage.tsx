@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { count, percent, shortKey, sol } from "../format";
+import { count, percent, shortKey, sol, solCompact } from "../format";
 import { groupByLeader, matchesQuery, type Led, type LeaderGroup } from "../schedule";
-import type { SlotEntry, UpcomingSlot } from "../types";
+import type { Peer, SlotEntry, StakeSummary, UpcomingSlot } from "../types";
 import { useStore } from "../useStore";
 import { Copyable } from "./Copyable";
 import { Logo } from "./Logo";
@@ -20,6 +20,10 @@ export function SchedulePage() {
   const [oursOnly, setOursOnly] = useState(false);
 
   const completed = store.get<number>("summary", "completed_slot");
+  const stake = store.get<StakeSummary>("summary", "stake");
+  const peers = store.get<Peer[]>("peers", "all");
+  // Keyed for lookup by the leader column, which asks once per group.
+  const byIdentity = new Map((peers ?? []).map((peer) => [peer.identity, peer]));
   const upcoming = store.get<UpcomingSlot[]>("slot", "upcoming") ?? [];
   // Newest first, matching the sidebar: a viewer wants the last block, not the
   // oldest one still held.
@@ -60,7 +64,12 @@ export function SchedulePage() {
         <>
           <h2 className="schedule-heading">Upcoming</h2>
           {aheadGroups.map((group) => (
-            <UpcomingGroup key={group.slots[0].slot} group={group} />
+            <UpcomingGroup
+              key={group.slots[0].slot}
+              group={group}
+              peer={group.leader ? byIdentity.get(group.leader) : undefined}
+              totalStake={stake?.total_stake}
+            />
           ))}
         </>
       )}
@@ -72,14 +81,31 @@ export function SchedulePage() {
         </div>
       )}
       {pastGroups.map((group) => (
-        <PastGroup key={group.slots[0].slot} group={group} />
+        <PastGroup
+          key={group.slots[0].slot}
+          group={group}
+          peer={group.leader ? byIdentity.get(group.leader) : undefined}
+          totalStake={stake?.total_stake}
+        />
       ))}
     </section>
   );
 }
 
 /** Leader, name and key, shared by both kinds of group. */
-function GroupLeader<T extends Led>({ group }: { group: LeaderGroup<T> }) {
+function GroupLeader<T extends Led>({
+  group,
+  peer,
+  totalStake,
+}: {
+  group: LeaderGroup<T>;
+  peer: Peer | undefined;
+  totalStake: number | undefined;
+}) {
+  // Missing rather than zero when the table has not caught up with a leader
+  // that has only just come into view.
+  const share = peer && totalStake ? peer.stake / totalStake : null;
+
   return (
     <div className="schedule-leader">
       <div className="schedule-leader-name">
@@ -94,15 +120,35 @@ function GroupLeader<T extends Led>({ group }: { group: LeaderGroup<T> }) {
           className="schedule-leader-key"
         />
       )}
+      {peer && (
+        <div className="schedule-leader-meta">
+          {peer.version && <span className="schedule-version">{peer.version}</span>}
+          {peer.stake > 0 && (
+            <span>
+              {solCompact(peer.stake)} SOL
+              {share !== null && <span className="schedule-share">{percent(share, 3)}</span>}
+            </span>
+          )}
+          {peer.ip && <span className="schedule-ip">{peer.ip}</span>}
+        </div>
+      )}
     </div>
   );
 }
 
 /** A turn that has not come round yet: who, and which slots. */
-function UpcomingGroup({ group }: { group: LeaderGroup<UpcomingSlot> }) {
+function UpcomingGroup({
+  group,
+  peer,
+  totalStake,
+}: {
+  group: LeaderGroup<UpcomingSlot>;
+  peer: Peer | undefined;
+  totalStake: number | undefined;
+}) {
   return (
     <div className="schedule-group is-upcoming">
-      <GroupLeader group={group} />
+      <GroupLeader group={group} peer={peer} totalStake={totalStake} />
       <div className="schedule-slots">
         {group.slots.map((slot) => (
           <div className="schedule-row" key={slot.slot}>
@@ -116,10 +162,18 @@ function UpcomingGroup({ group }: { group: LeaderGroup<UpcomingSlot> }) {
 }
 
 /** A turn that has been and gone, with what each of its blocks held. */
-function PastGroup({ group }: { group: LeaderGroup<SlotEntry> }) {
+function PastGroup({
+  group,
+  peer,
+  totalStake,
+}: {
+  group: LeaderGroup<SlotEntry>;
+  peer: Peer | undefined;
+  totalStake: number | undefined;
+}) {
   return (
     <div className="schedule-group">
-      <GroupLeader group={group} />
+      <GroupLeader group={group} peer={peer} totalStake={totalStake} />
       <div className="schedule-slots">
         <div className="schedule-row schedule-head">
           <span className="schedule-slot">Slot</span>

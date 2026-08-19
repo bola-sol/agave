@@ -21,6 +21,19 @@ export interface SlotEntry {
 }
 
 /**
+ * What is known about a leader beyond the name its slot rows carry.
+ *
+ * Published only for the leaders on screen, so a leader may be missing from
+ * this table briefly after a reconnection, before the next slow tick.
+ */
+export interface Peer {
+  identity: string;
+  version: string | null;
+  stake: number;
+  ip: string | null;
+}
+
+/**
  * A slot the leader schedule has assigned that has not happened yet.
  *
  * Published on the slow tier, so the front of the list has usually happened by
