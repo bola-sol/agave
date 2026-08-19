@@ -1,11 +1,17 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { count, shortKey } from "../format";
 import type { SlotEntry } from "../types";
 import { useStore } from "../useStore";
 import { Logo } from "./Logo";
 
-/** Rows in the live slot list, newest first. */
-const ROWS = 48;
+/**
+ * Rows in the live slot list, newest first.
+ *
+ * Everything the client holds. The server sends 512 slots on connect and the
+ * store keeps that many, so a smaller figure here threw away rows that had
+ * already been paid for over the wire.
+ */
+const ROWS = 512;
 
 /**
  * The live slot list, with a filter down to this validator's own leader slots.
@@ -92,7 +98,14 @@ function Chevron({ collapsed }: { collapsed: boolean }) {
   );
 }
 
-function SidebarRow({ entry }: { entry: SlotEntry }) {
+/**
+ * Memoised because the list is long and the store is chatty: it notifies on
+ * every published value, including the once-a-second meter samples that touch
+ * no slot at all. The store replaces only the entries that changed, so identity
+ * holds for the rest and five hundred untouched rows are skipped rather than
+ * diffed.
+ */
+const SidebarRow = memo(function SidebarRow({ entry }: { entry: SlotEntry }) {
   const name =
     entry.leader_name ?? (entry.leader ? shortKey(entry.leader, 4, 4) : "unknown");
 
@@ -107,4 +120,4 @@ function SidebarRow({ entry }: { entry: SlotEntry }) {
       <div className={`sidebar-level level-${entry.level}`} title={entry.level.replace(/_/g, " ")} />
     </div>
   );
-}
+});
