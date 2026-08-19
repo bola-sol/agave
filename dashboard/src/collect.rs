@@ -771,7 +771,7 @@ impl Collector {
         leaders.extend(self.slots.recent_leaders(SLOT_OVERVIEW_LEN));
 
         let mut stakes: HashMap<String, u64> = HashMap::new();
-        for (_vote_pubkey, (stake, account)) in bank.vote_accounts().iter() {
+        for (stake, account) in bank.vote_accounts().values() {
             if *stake == 0 {
                 continue;
             }
