@@ -8,6 +8,15 @@ import { Logo } from "./Logo";
 import { ScrollTop } from "./ScrollTop";
 
 /**
+ * Leader turns still to come, kept above the list rather than in it.
+ *
+ * Enough to see who is next without the list opening on slots that have not
+ * happened. More than this and the scroll position on arrival would be a
+ * stretch of empty schedule rather than the newest block.
+ */
+const AHEAD_GROUPS = 2;
+
+/**
  * The leader schedule, with what each block turned out to contain.
  *
  * The same slots the sidebar lists, folded into the runs the schedule hands
@@ -41,7 +50,11 @@ export function SchedulePage() {
   const wanted = <T extends Led>(group: LeaderGroup<T>) =>
     matchesQuery(group, query) && (!oursOnly || group.mine);
 
-  const aheadGroups = groupByLeader([...ahead].reverse()).filter(wanted);
+  // Descending, so the turn about to happen is last and sits against the
+  // newest produced block below it. The nearest few are all that is kept.
+  const aheadGroups = groupByLeader([...ahead].reverse())
+    .filter(wanted)
+    .slice(-AHEAD_GROUPS);
   const pastGroups = groupByLeader(past).filter(wanted);
 
   return (
@@ -65,10 +78,8 @@ export function SchedulePage() {
         </div>
       </div>
 
-      <div className="schedule-list" ref={list}>
-        <ScrollTop scroller={list} />
-        {aheadGroups.length > 0 && (
-        <>
+      {aheadGroups.length > 0 && (
+        <div className="schedule-ahead">
           <h2 className="schedule-heading">Upcoming</h2>
           {aheadGroups.map((group) => (
             <UpcomingGroup
@@ -78,15 +89,22 @@ export function SchedulePage() {
               totalStake={stake?.total_stake}
             />
           ))}
-        </>
-      )}
-
-      <h2 className="schedule-heading">Past</h2>
-      {pastGroups.length === 0 && (
-        <div className="sidebar-empty">
-          {past.length === 0 ? "waiting for slots…" : "nothing matches that"}
         </div>
       )}
+
+      {/* Only what has happened scrolls. Held out of the list, the turns still
+          to come stay on screen, and the top of the list is the newest block
+          rather than a stretch of empty schedule — which also keeps the live
+          edge at nothing scrolled, where the pill and the held position both
+          expect it. */}
+      <div className="schedule-list" ref={list}>
+        <ScrollTop scroller={list} />
+        <h2 className="schedule-heading">Past</h2>
+        {pastGroups.length === 0 && (
+          <div className="sidebar-empty">
+            {past.length === 0 ? "waiting for slots…" : "nothing matches that"}
+          </div>
+        )}
         {pastGroups.map((group) => (
           <PastGroup
             key={group.slots[0].slot}

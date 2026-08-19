@@ -57,11 +57,15 @@ const NEXT_LEADER_LOOKAHEAD: u64 = 20_000;
 
 /// Slots of the leader schedule published ahead of the tip.
 ///
-/// Thirty-two leader groups, about a minute of them. Sent on the slow tier
-/// rather than every tick: the list shifts by a couple of slots a second and
-/// republishing it that often would spend more on the wire than the minute it
-/// describes is worth. The client drops the entries that have since happened.
-const UPCOMING_SLOTS: u64 = 128;
+/// Eight leader turns, about thirteen seconds. The page shows the next two and
+/// the rest is headroom: the list is published on the slow tier, so by the time
+/// a client reads it several of the leading entries have already happened, and
+/// a search may want a turn further out than the two on screen.
+///
+/// On the slow tier rather than every tick because the list shifts by a couple
+/// of slots a second, and republishing it that often would spend more on the
+/// wire than the seconds it describes are worth.
+const UPCOMING_SLOTS: u64 = 32;
 
 /// Produced blocks kept for the block detail panel. A validator leads about
 /// four slots in every eight hundred, so this is hours of them.

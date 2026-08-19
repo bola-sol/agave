@@ -1503,6 +1503,15 @@ body {
   min-height: 0;
 }
 
+/* Held out of the scroller, so the turns still to come stay on screen while
+   what has happened scrolls under them. */
+.schedule-ahead {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  gap: var(--gap);
+}
+
 .schedule-list {
   display: flex;
   flex-direction: column;
