@@ -874,13 +874,6 @@ body {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  /* Applied to the container rather than passed to scrollTo, so the preference
-     is honoured by the browser instead of being read in script. */
-  .sidebar-rows,
-  .schedule-list {
-    scroll-behavior: smooth;
-  }
-
   .startup-phase.is-current .startup-marker {
     animation: startup-pulse 1.6s ease-in-out infinite;
   }

@@ -10,6 +10,21 @@ import { heldScrollTop } from "../scroll";
 const LIVE_EDGE_PX = 120;
 
 /**
+ * Whether a deliberate jump should be animated.
+ *
+ * Read here rather than set as `scroll-behavior` on the list, which was the
+ * mistake it replaces: that applies to every programmatic scroll, so the
+ * corrections below animated too. Each one then took a third of a second to
+ * arrive, during which the list was moving a pixel or two a frame and every
+ * render saw a scroll position it had not set — so it stood aside, while its
+ * own animation carried on. A recording of fifteen seconds had two hundred and
+ * thirty-seven scroll changes with nothing on the page having changed.
+ */
+function jumpBehaviour(): ScrollBehavior {
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+}
+
+/**
  * Where `target` sits in `scroller`'s content, in pixels from its top.
  *
  * Measured through the viewport rather than by `offsetTop`, which is relative
@@ -91,6 +106,7 @@ export function ScrollTop({
             const target = live?.current;
             element.scrollTo({
               top: target ? Math.max(0, contentTop(element, target) - liveOffset) : 0,
+              behavior: jumpBehaviour(),
             });
           }}
         >
@@ -119,6 +135,10 @@ export function ScrollTop({
  * scroller, so anything that moves it is followed rather than only growth.
  * Without one the measure is the list's height, and a viewer sitting at the top
  * is left alone: being there is a request to see what arrives.
+ *
+ * Corrections are instant, always. They are not a movement anyone asked for —
+ * they exist so that nothing appears to move — and animating them is what made
+ * the page restless rather than still.
  */
 function useHeldScroll(
   scroller: RefObject<HTMLElement | null>,
