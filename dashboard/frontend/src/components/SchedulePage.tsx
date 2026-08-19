@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { count, percent, shortKey, sol, solCompact } from "../format";
 import { groupByLeader, matchesQuery, type Led, type LeaderGroup } from "../schedule";
 import type { Peer, SlotEntry, StakeSummary, UpcomingSlot } from "../types";
 import { useStore } from "../useStore";
 import { Copyable } from "./Copyable";
 import { Logo } from "./Logo";
+import { ScrollTop } from "./ScrollTop";
 
 /**
  * The leader schedule, with what each block turned out to contain.
@@ -17,6 +18,10 @@ import { Logo } from "./Logo";
 export function SchedulePage() {
   const store = useStore();
   const [query, setQuery] = useState("");
+  // The list scrolls inside the page rather than scrolling the page, so the
+  // filter above it stays put and the way back to live is the same gesture as
+  // in the slot list down the side.
+  const list = useRef<HTMLDivElement>(null);
   const [oursOnly, setOursOnly] = useState(false);
 
   const completed = store.get<number>("summary", "completed_slot");
@@ -60,7 +65,9 @@ export function SchedulePage() {
         </div>
       </div>
 
-      {aheadGroups.length > 0 && (
+      <div className="schedule-list" ref={list}>
+        <ScrollTop scroller={list} />
+        {aheadGroups.length > 0 && (
         <>
           <h2 className="schedule-heading">Upcoming</h2>
           {aheadGroups.map((group) => (
@@ -80,14 +87,15 @@ export function SchedulePage() {
           {past.length === 0 ? "waiting for slots…" : "nothing matches that"}
         </div>
       )}
-      {pastGroups.map((group) => (
-        <PastGroup
-          key={group.slots[0].slot}
-          group={group}
-          peer={group.leader ? byIdentity.get(group.leader) : undefined}
-          totalStake={stake?.total_stake}
-        />
-      ))}
+        {pastGroups.map((group) => (
+          <PastGroup
+            key={group.slots[0].slot}
+            group={group}
+            peer={group.leader ? byIdentity.get(group.leader) : undefined}
+            totalStake={stake?.total_stake}
+          />
+        ))}
+      </div>
     </section>
   );
 }

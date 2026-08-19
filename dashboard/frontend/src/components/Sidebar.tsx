@@ -1,4 +1,5 @@
 import { memo, useRef, useState } from "react";
+import { ScrollTop } from "./ScrollTop";
 import { count, shortKey } from "../format";
 import type { SlotEntry } from "../types";
 import { useStore } from "../useStore";
@@ -12,14 +13,6 @@ import { Logo } from "./Logo";
  * already been paid for over the wire.
  */
 const ROWS = 512;
-
-/**
- * How far the list must be scrolled before the way back is offered.
- *
- * A few rows, so that nudging the list does not put a button over it, and so
- * that the button is gone whenever the newest slot is already on screen.
- */
-const LIVE_EDGE_PX = 120;
 
 /**
  * The live slot list, with a filter down to this validator's own leader slots.
@@ -37,9 +30,8 @@ export function Sidebar({
 }) {
   const store = useStore();
   const [ownOnly, setOwnOnly] = useState(false);
-  const rows = useRef<HTMLDivElement>(null);
   // Newest first, so the live edge of the list is the top of it.
-  const [away, setAway] = useState(false);
+  const rows = useRef<HTMLDivElement>(null);
   const all = store.getSlots();
   const slots = (ownOnly ? all.filter((entry) => entry.mine) : all)
     .slice(-ROWS)
@@ -78,26 +70,8 @@ export function Sidebar({
         )}
       </div>
       {!collapsed && (
-        <div
-          className="sidebar-rows"
-          id="slot-list"
-          ref={rows}
-          onScroll={(event) => setAway(event.currentTarget.scrollTop > LIVE_EDGE_PX)}
-        >
-          {/* Sticks to the top of the list rather than the sidebar, so it needs
-              no measurement of the header above it, and carries no height of
-              its own so that showing it does not shift the rows underneath. */}
-          <div className="sidebar-live-anchor">
-            {away && (
-              <button
-                type="button"
-                className="sidebar-to-top"
-                onClick={() => rows.current?.scrollTo({ top: 0 })}
-              >
-                Top <span aria-hidden="true">↑</span>
-              </button>
-            )}
-          </div>
+        <div className="sidebar-rows" id="slot-list" ref={rows}>
+          <ScrollTop scroller={rows} />
           {slots.length === 0 && (
             <div className="sidebar-empty">
               {ownOnly ? "no leader slots seen yet" : "waiting for slots…"}

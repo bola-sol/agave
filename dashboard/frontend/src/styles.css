@@ -870,7 +870,8 @@ body {
 @media (prefers-reduced-motion: no-preference) {
   /* Applied to the container rather than passed to scrollTo, so the preference
      is honoured by the browser instead of being read in script. */
-  .sidebar-rows {
+  .sidebar-rows,
+  .schedule-list {
     scroll-behavior: smooth;
   }
 
@@ -1025,19 +1026,25 @@ body {
   display: none;
 }
 
-/* Carries no height, so the button hangs over the rows instead of moving
-   them. Sticky rather than absolute so it tracks the list and not the sidebar,
-   whose header sits above it. */
-.sidebar-live-anchor {
+/* Carries no height, so the button hangs over the rows instead of moving them.
+   Sticky rather than absolute so it tracks the list it belongs to and not the
+   page around it. */
+.scroll-top-anchor {
   position: sticky;
   top: 0;
-  z-index: 2;
+  z-index: 3;
   height: 0;
   display: flex;
   justify-content: center;
 }
 
-.sidebar-to-top {
+/* A flex stack with a gap gives even a zero-height item one. Pulled back so
+   the pill costs no space in the lists that are flex stacks. */
+.schedule-list > .scroll-top-anchor {
+  margin-bottom: calc(-1 * var(--gap));
+}
+
+.scroll-top {
   position: relative;
   top: 8px;
   margin: 0;
@@ -1054,12 +1061,12 @@ body {
   cursor: pointer;
 }
 
-.sidebar-to-top:hover {
+.scroll-top:hover {
   color: var(--text);
   border-color: var(--accent);
 }
 
-.sidebar-to-top:focus-visible {
+.scroll-top:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 1px;
 }
@@ -1484,11 +1491,32 @@ body {
 
 /* ---- schedule ---- */
 
+/* Fills the column and scrolls its list rather than scrolling the page, so
+   the filter above stays put and new leader groups arriving at the top do not
+   push the rows being read down the screen. */
 .schedule {
   display: flex;
   flex-direction: column;
+  flex: 1;
   gap: var(--gap);
   min-width: 0;
+  min-height: 0;
+}
+
+.schedule-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: var(--gap);
+  min-height: 0;
+  overflow-y: auto;
+  /* As in the slot list: on a long list the bar is a sliver, and the way back
+     is the button that appears when it is needed. */
+  scrollbar-width: none;
+}
+
+.schedule-list::-webkit-scrollbar {
+  display: none;
 }
 
 .schedule-controls {
