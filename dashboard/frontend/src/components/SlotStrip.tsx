@@ -251,7 +251,7 @@ function SlotDetail({ entry }: { entry: SlotEntry | null }) {
           {leader}
         </span>
       )}
-      {entry.transactions !== null && <span>{count(entry.transactions)} txns</span>}
+      {entry.block && <span>{count(entry.block.transactions)} txns</span>}
       {entry.mine && <span className="slot-detail-mine">ours</span>}
     </span>
   );
@@ -284,7 +284,7 @@ function SlotBar({
     LEVEL_NAMES.get(entry.level) ?? entry.level,
     durationMs === null ? null : `${Math.round(durationMs)} ms`,
     leader,
-    entry.transactions === null ? null : `${count(entry.transactions)} txns`,
+    entry.block === null ? null : `${count(entry.block.transactions)} txns`,
     entry.mine ? "our leader slot" : null,
   ]
     .filter(Boolean)

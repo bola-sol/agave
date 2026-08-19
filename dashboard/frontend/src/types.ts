@@ -15,9 +15,21 @@ export interface SlotEntry {
   leader_name: string | null;
   leader_icon: string | null;
   mine: boolean;
-  transactions: number | null;
-  non_vote_transactions: number | null;
+  /** What replay found in the block. Null for a slot with no block. */
+  block: BlockDetail | null;
   duration_nanos: number | null;
+}
+
+/** What one block contained, as the collector read it off the frozen bank. */
+export interface BlockDetail {
+  transactions: number;
+  non_vote_transactions: number;
+  failed_transactions: number;
+  entries: number;
+  block_cost: number;
+  block_cost_limit: number;
+  total_fees: number;
+  priority_fees: number;
 }
 
 export interface Tps {

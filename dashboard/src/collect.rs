@@ -18,7 +18,7 @@ use {
         context::{DashboardContext, StartupProgressFn},
         produced::{ProducedBlock, ProducedRing},
         proto::{Debounced, Publisher, TOPIC_EPOCH, TOPIC_SLOT, TOPIC_SUMMARY},
-        slots::{SlotEntry, SlotLevel, SlotRing},
+        slots::{BlockDetail, SlotEntry, SlotLevel, SlotRing},
         startup::StartupPublisher,
         validator_info::{self, ValidatorInfoCache},
     },
@@ -695,15 +695,25 @@ impl Collector {
                         .saturating_sub(parent.non_vote_transaction_count_since_restart()),
                 )
             });
-            // Our own blocks are read here and nowhere else. The cost tracker
-            // and the collected fees live on the bank, so they go with it when
-            // it is dropped after rooting. A bank stays frozen for many ticks,
-            // and the ring keeps the first sighting only.
-            if let Some((total, non_vote)) = counts
-                && !self.produced.contains(slot)
+            // Read once, at the first sighting of a frozen bank, and for every
+            // block rather than only our own. The cost tracker and the
+            // collected fees live on the bank, so they go with it when it is
+            // dropped after rooting; a bank stays frozen for many ticks, and
+            // reading it again would only spend work on the same answer.
+            let fresh = self
+                .slots
+                .get(slot)
+                .is_none_or(|entry| entry.block.is_none());
+            let detail = counts
+                .filter(|_| fresh)
+                .map(|(total, non_vote)| block_detail(bank, total, non_vote));
+
+            // Our own blocks carry a blockhash and a start time on top of that,
+            // which the block panel shows and nothing else needs.
+            if let Some(detail) = &detail
                 && self.slots.get(slot).is_some_and(|entry| entry.mine)
             {
-                let block = self.capture_block(slot, bank, total, non_vote);
+                let block = self.capture_block(slot, bank, detail);
                 if self.produced.insert(block) {
                     captured = true;
                 }
@@ -712,9 +722,8 @@ impl Collector {
             let level = level_for(slot, root, confirmed, finalized);
             if let Some(entry) = self.slots.update(slot, |entry| {
                 entry.level = level;
-                if let Some((total, non_vote)) = counts {
-                    entry.transactions = Some(total);
-                    entry.non_vote_transactions = Some(non_vote);
+                if let Some(detail) = &detail {
+                    entry.block = Some(detail.clone());
                 }
             }) {
                 changed.push(entry);
@@ -745,40 +754,31 @@ impl Collector {
         }
     }
 
-    /// Reads a frozen bank's own figures for the block detail panel.
+    /// Adds what only our own blocks report to what every block reports.
     ///
+    /// The blockhash and the start time are here rather than on every slot
+    /// because five hundred slots are sent to each client at once and a
+    /// blockhash is forty-four characters that only the block panel reads.
+    ///
+    /// Historical note on the rest, which now lives in [`block_detail`]:
     /// `transactions` and `non_vote` are already differenced against the
-    /// parent by the caller. Everything taken here is the bank's own: the
+    /// parent by the caller. Everything taken there is the bank's own: the
     /// error and entry counters are reset for each bank rather than inherited
     /// from the parent, so differencing them would subtract the wrong thing.
-    fn capture_block(
-        &self,
-        slot: Slot,
-        bank: &Bank,
-        transactions: u64,
-        non_vote: u64,
-    ) -> ProducedBlock {
-        // Poisoned only if a replay thread panicked while holding it, in which
-        // case the validator has more pressing problems than a missing bar.
-        let (block_cost, block_cost_limit) = match bank.read_cost_tracker() {
-            Ok(tracker) => (tracker.block_cost(), tracker.get_block_limit()),
-            Err(_) => (0, 0),
-        };
-        let fees = bank.get_collector_fee_details();
-
+    fn capture_block(&self, slot: Slot, bank: &Bank, detail: &BlockDetail) -> ProducedBlock {
         ProducedBlock {
             slot,
             slot_time_millis: self.first_shred_time(slot),
             blockhash: bank.last_blockhash().to_string(),
             duration_nanos: self.slots.get(slot).and_then(|entry| entry.duration_nanos),
-            transactions,
-            non_vote_transactions: non_vote,
-            failed_transactions: bank.transaction_error_count(),
-            entries: bank.transaction_entries_count(),
-            block_cost,
-            block_cost_limit,
-            total_fees: fees.total_transaction_fee(),
-            priority_fees: fees.total_priority_fee(),
+            transactions: detail.transactions,
+            non_vote_transactions: detail.non_vote_transactions,
+            failed_transactions: detail.failed_transactions,
+            entries: detail.entries,
+            block_cost: detail.block_cost,
+            block_cost_limit: detail.block_cost_limit,
+            total_fees: detail.total_fees,
+            priority_fees: detail.priority_fees,
         }
     }
 
@@ -1495,6 +1495,33 @@ fn windowed_mean_nanos(window: &VecDeque<(Slot, u64)>, span_ms: u64) -> Option<u
 
     let nanos = (millis as f64 / slots as f64) * 1_000_000.0;
     Some(nanos as u64)
+}
+
+/// Reads a frozen bank's own figures for one block.
+///
+/// `transactions` and `non_vote` are already differenced against the parent by
+/// the caller. Everything taken here is the bank's own: the error and entry
+/// counters are reset for each bank rather than inherited from the parent, so
+/// differencing them would subtract the wrong thing.
+fn block_detail(bank: &Bank, transactions: u64, non_vote: u64) -> BlockDetail {
+    // Poisoned only if a replay thread panicked while holding it, in which case
+    // the validator has more pressing problems than a missing bar.
+    let (block_cost, block_cost_limit) = match bank.read_cost_tracker() {
+        Ok(tracker) => (tracker.block_cost(), tracker.get_block_limit()),
+        Err(_) => (0, 0),
+    };
+    let fees = bank.get_collector_fee_details();
+
+    BlockDetail {
+        transactions,
+        non_vote_transactions: non_vote,
+        failed_transactions: bank.transaction_error_count(),
+        entries: bank.transaction_entries_count(),
+        block_cost,
+        block_cost_limit,
+        total_fees: fees.total_transaction_fee(),
+        priority_fees: fees.total_priority_fee(),
+    }
 }
 
 /// The rate this epoch has actually run at, from the cluster's own clock.
