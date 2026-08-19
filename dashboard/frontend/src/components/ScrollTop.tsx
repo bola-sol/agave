@@ -10,6 +10,19 @@ import { heldScrollTop } from "../scroll";
 const LIVE_EDGE_PX = 120;
 
 /**
+ * Where `target` sits in `scroller`'s content, in pixels from its top.
+ *
+ * Measured through the viewport rather than by `offsetTop`, which is relative
+ * to the nearest positioned ancestor and so only agrees between the two when
+ * they happen to share one. They do today; a `position` on anything between
+ * them would have broken it silently.
+ */
+function contentTop(scroller: HTMLElement, target: HTMLElement): number {
+  const delta = target.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+  return scroller.scrollTop + delta;
+}
+
+/**
  * A pill that returns a scrolled list to its live edge.
  *
  * `live` names the element the list is read against — for the schedule, the
@@ -53,7 +66,7 @@ export function ScrollTop({
     const liveTop = () => {
       const target = live?.current;
       if (!target) return 0;
-      return Math.max(0, target.offsetTop - element.offsetTop - liveOffset);
+      return Math.max(0, contentTop(element, target) - liveOffset);
     };
     const follow = () => {
       top.current = element.scrollTop;
@@ -77,15 +90,13 @@ export function ScrollTop({
             if (!element) return;
             const target = live?.current;
             element.scrollTo({
-              top: target
-                ? Math.max(0, target.offsetTop - element.offsetTop - liveOffset)
-                : 0,
+              top: target ? Math.max(0, contentTop(element, target) - liveOffset) : 0,
             });
           }}
         >
           {/* The slot list is only ever scrolled away downwards, so its way
               back is up. The schedule has a list either side of its live edge
-              and can be either side of it. */}
+              and can be on either side of it. */}
           {live ? "Live" : "Top"} <span aria-hidden="true">{live ? "↕" : "↑"}</span>
         </button>
       )}
@@ -116,22 +127,31 @@ function useHeldScroll(
   top: { current: number },
   anchor?: RefObject<HTMLElement | null>,
 ): void {
-  const measured = useRef(0);
+  // Undefined until the first measurement rather than zero. Seeded at zero, the
+  // first render reads the anchor as having moved the whole way down the list
+  // and scrolls there, which is a page-length jump on arrival and again on
+  // every remount.
+  const measured = useRef<number | undefined>(undefined);
 
   useLayoutEffect(() => {
     const element = scroller.current;
     if (!element) return;
 
     const held = anchor?.current;
-    const measure = held ? held.offsetTop : element.scrollHeight;
-    const next = heldScrollTop(
-      element.scrollTop,
-      top.current,
-      measured.current,
-      measure,
-      held != null,
-    );
+    const measure = held ? contentTop(element, held) : element.scrollHeight;
+    const previous = measured.current;
     measured.current = measure;
+
+    // Nothing to compare against yet, and nothing to hold: a list that does not
+    // scroll cannot have been pushed.
+    if (previous === undefined || element.scrollHeight <= element.clientHeight) {
+      top.current = element.scrollTop;
+      return;
+    }
+
+    // Compared before `top` is refreshed, or the check for a position something
+    // else has already moved could never fire.
+    const next = heldScrollTop(element.scrollTop, top.current, previous, measure, held != null);
     if (next !== element.scrollTop) {
       element.scrollTop = next;
     }

@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState, type RefObject } from "react";
+import { memo, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { count, percent, shortKey, sol, solCompact } from "../format";
 import {
   groupByLeader,
@@ -128,6 +128,11 @@ export function SchedulePage() {
  * Once, because after that the position is the viewer's. The list is scrolled
  * rather than trimmed, so everything further ahead stays reachable by scrolling
  * up: the difference between a starting position and a limit.
+ *
+ * Before the paint rather than after it, so that arriving on the page does not
+ * show the top of the schedule for a frame and then jump. It shares the phase
+ * with the held position, which sees the move as one it did not make and stands
+ * aside — the same way it treats the browser's own anchoring.
  */
 function usePinToBoundary(
   list: RefObject<HTMLDivElement | null>,
@@ -136,14 +141,21 @@ function usePinToBoundary(
 ): void {
   const settled = useRef(false);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (settled.current || !ready) return;
     const scroller = list.current;
     const target = live.current;
     if (!scroller || !target) return;
+    // Nothing to scroll yet: the boundary is already on screen, and settling
+    // now would spend the one chance on a list that has not filled.
+    if (scroller.scrollHeight <= scroller.clientHeight) return;
+
     settled.current = true;
-    scroller.scrollTop = Math.max(0, target.offsetTop - scroller.offsetTop - AHEAD_PINNED_PX);
-  }, [list, live, ready]);
+    const boundary =
+      scroller.scrollTop +
+      (target.getBoundingClientRect().top - scroller.getBoundingClientRect().top);
+    scroller.scrollTop = Math.max(0, boundary - AHEAD_PINNED_PX);
+  });
 }
 
 /**
