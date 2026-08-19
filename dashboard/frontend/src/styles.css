@@ -868,6 +868,12 @@ body {
 }
 
 @media (prefers-reduced-motion: no-preference) {
+  /* Applied to the container rather than passed to scrollTo, so the preference
+     is honoured by the browser instead of being read in script. */
+  .sidebar-rows {
+    scroll-behavior: smooth;
+  }
+
   .startup-phase.is-current .startup-marker {
     animation: startup-pulse 1.6s ease-in-out infinite;
   }
@@ -1009,6 +1015,53 @@ body {
 .sidebar-rows {
   overflow-y: auto;
   min-height: 0;
+  /* The list is five hundred rows long, so the bar is a thin sliver that says
+     nothing useful and crowds an already narrow rail. The way back to the top
+     is the button below, which only appears when it is needed. */
+  scrollbar-width: none;
+}
+
+.sidebar-rows::-webkit-scrollbar {
+  display: none;
+}
+
+/* Carries no height, so the button hangs over the rows instead of moving
+   them. Sticky rather than absolute so it tracks the list and not the sidebar,
+   whose header sits above it. */
+.sidebar-live-anchor {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  height: 0;
+  display: flex;
+  justify-content: center;
+}
+
+.sidebar-to-top {
+  position: relative;
+  top: 8px;
+  margin: 0;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-raised);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 35%);
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.sidebar-to-top:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.sidebar-to-top:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .sidebar-empty {
