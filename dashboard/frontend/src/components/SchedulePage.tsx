@@ -107,16 +107,16 @@ export function SchedulePage() {
   if (prepended > 0) setFirstRow((first) => first - prepended);
   seen.current = keys;
 
-  const settleOn = Math.max(
-    0,
-    rows.findIndex((row) => row.kind === "heading" && row.label === "Produced") - AHEAD_PINNED,
-  );
-  // The boundary's index as the list itself numbers rows, which is not the
-  // array's numbering once `firstItemIndex` has shifted it, and is the only
-  // one `scrollToIndex` will accept. Taken from the list as it draws that row
-  // rather than worked out here, so the two cannot disagree.
-  const boundary = useRef<number | null>(null);
-  usePinToBoundary(list, boundary, following);
+  const boundary = rows.findIndex((row) => row.kind === "heading" && row.label === "Produced");
+  const settleOn = Math.max(0, boundary - AHEAD_PINNED);
+  // The boundary's place in the run of every row there has ever been, which is
+  // what says whether it really moved. Its place in the array shifts by one
+  // every time a turn arrives above it; add back what the list has been told to
+  // subtract and the two cancel, leaving a number that changes only when a turn
+  // crosses. `prepended` is included because the state holding it does not
+  // catch up until the next render.
+  const absolute = firstRow - prepended + boundary;
+  usePinToBoundary(list, settleOn, absolute, following);
 
   return (
     <section className="schedule">
@@ -164,9 +164,8 @@ export function SchedulePage() {
             // A screen either side, so a turn is measured before it is scrolled
             // into rather than resizing the list underneath the scroll.
             increaseViewportBy={600}
-            itemContent={(index, row) => {
-              if (row.kind === "heading" && row.label === "Produced") boundary.current = index;
-              return row.kind === "heading" ? (
+            itemContent={(_index, row) =>
+              row.kind === "heading" ? (
                 <h2 className="schedule-heading">{row.label}</h2>
               ) : (
                 <Group
@@ -174,8 +173,8 @@ export function SchedulePage() {
                   peer={row.group.leader ? byIdentity.get(row.group.leader) : undefined}
                   totalStake={stake?.total_stake}
                 />
-              );
-            }}
+              )
+            }
           />
         )}
       </div>
@@ -332,28 +331,35 @@ function useUserScroll(scroller: HTMLElement | null, leave: () => void): void {
 /**
  * Keeps the boundary at the same place on screen while the list changes.
  *
- * The row indices the list uses do not move when turns arrive above the
- * boundary — that is what `firstItemIndex` is for — so the boundary's index
- * changes for one reason only: a turn crossing it, which moves it a row nearer
- * the top. Scrolling by that much on exactly those renders is what leaves the
- * heading where it was, with the schedule shortening above it and the produced
- * list growing below.
+ * `absolute` decides when: it is unmoved by turns arriving above the boundary,
+ * which the list absorbs on its own, and drops by one when a turn crosses —
+ * which is the only thing that would otherwise walk the heading up the screen,
+ * a turn's worth at a time until it left.
+ *
+ * `index` is where to: a position in the row array, which is what the list
+ * scrolls by. Not the numbering it hands to `itemContent`, which counts from
+ * `firstItemIndex` and would be a million rows past the end of the list.
  *
  * Only while following. Once the viewer has scrolled somewhere, moving the list
  * under them would be the rudest thing this page could do.
  */
 function usePinToBoundary(
   list: RefObject<VirtuosoHandle | null>,
-  boundary: RefObject<number | null>,
+  index: number,
+  absolute: number,
   following: boolean,
 ): void {
   const pinned = useRef<number | null>(null);
 
   useLayoutEffect(() => {
-    if (!following) return;
-    const index = boundary.current;
-    if (index === null || index === pinned.current) return;
-    pinned.current = index;
-    list.current?.scrollToIndex({ align: "start", index: Math.max(0, index - AHEAD_PINNED) });
-  });
+    if (!following) {
+      // Forgotten while away, so that coming back settles wherever the
+      // boundary has got to rather than where it was left.
+      pinned.current = null;
+      return;
+    }
+    if (absolute === pinned.current) return;
+    pinned.current = absolute;
+    list.current?.scrollToIndex({ align: "start", index });
+  }, [list, index, absolute, following]);
 }
