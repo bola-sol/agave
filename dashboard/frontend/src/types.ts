@@ -20,6 +20,20 @@ export interface SlotEntry {
   duration_nanos: number | null;
 }
 
+/**
+ * A slot the leader schedule has assigned that has not happened yet.
+ *
+ * Published on the slow tier, so the front of the list has usually happened by
+ * the time it is read. Filter against the completed slot before rendering.
+ */
+export interface UpcomingSlot {
+  slot: number;
+  leader: string;
+  leader_name: string | null;
+  leader_icon: string | null;
+  mine: boolean;
+}
+
 /** What one block contained, as the collector read it off the frozen bank. */
 export interface BlockDetail {
   transactions: number;

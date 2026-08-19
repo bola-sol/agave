@@ -55,6 +55,14 @@ const MAX_VERSIONS_REPORTED: usize = 5;
 /// How far ahead to look for this validator's next leader slot.
 const NEXT_LEADER_LOOKAHEAD: u64 = 20_000;
 
+/// Slots of the leader schedule published ahead of the tip.
+///
+/// Thirty-two leader groups, about a minute of them. Sent on the slow tier
+/// rather than every tick: the list shifts by a couple of slots a second and
+/// republishing it that often would spend more on the wire than the minute it
+/// describes is worth. The client drops the entries that have since happened.
+const UPCOMING_SLOTS: u64 = 128;
+
 /// Produced blocks kept for the block detail panel. A validator leads about
 /// four slots in every eight hundred, so this is hours of them.
 const PRODUCED_BLOCKS: usize = 64;
@@ -163,6 +171,20 @@ pub struct VersionShare {
     pub other: bool,
 }
 
+/// A slot the leader schedule has assigned that has not happened yet.
+///
+/// Leaner than [`SlotEntry`]: an unstarted slot has no level, no block and no
+/// duration, and saying so with nulls would cost more than leaving them out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpcomingSlot {
+    pub slot: Slot,
+    pub leader: String,
+    pub leader_name: Option<String>,
+    pub leader_icon: Option<String>,
+    /// True when this validator is the scheduled leader.
+    pub mine: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EpochInfo {
     pub epoch: Epoch,
@@ -215,6 +237,7 @@ struct Debounces {
     health: Debounced<Health>,
     epoch: Debounced<EpochInfo>,
     epoch_remaining_nanos: Debounced<u64>,
+    upcoming: Debounced<Vec<UpcomingSlot>>,
 }
 
 pub struct Collector {
@@ -414,6 +437,7 @@ impl Collector {
             self.collect_peers(&working_bank);
             self.collect_health();
             self.collect_skip_rate(&root_bank);
+            self.collect_upcoming(&root_bank, highest_slot);
         }
     }
 
@@ -659,6 +683,45 @@ impl Collector {
             "next_leader_slot",
             next_mine.map(|(first, _last)| first),
         );
+    }
+
+    /// Publishes who leads the slots that have not happened yet.
+    ///
+    /// The schedule is known an epoch ahead, so this is a lookup rather than a
+    /// prediction. It stops where the schedule stops: near an epoch boundary
+    /// the next epoch's leaders may not be derived yet, and a short list is a
+    /// better answer than none.
+    ///
+    /// Anchored on the highest slot bank forks holds rather than on the last
+    /// one replayed, so that the list starts past the slot being worked on
+    /// instead of repeating it.
+    fn collect_upcoming(&mut self, root_bank: &Bank, highest_slot: Slot) {
+        let me = self.ctx.identity();
+        let first = highest_slot.saturating_add(1);
+        let last = highest_slot.saturating_add(UPCOMING_SLOTS);
+
+        let mut upcoming = Vec::new();
+        for slot in first..=last {
+            let Some(leader) = self
+                .ctx
+                .leader_schedule_cache
+                .slot_leader_at(slot, Some(root_bank))
+            else {
+                break;
+            };
+            let (leader_name, leader_icon) = self.peer_display(&leader.id);
+            upcoming.push(UpcomingSlot {
+                slot,
+                leader: leader.id.to_string(),
+                leader_name,
+                leader_icon,
+                mine: leader.id == me,
+            });
+        }
+
+        self.debounces
+            .upcoming
+            .publish(&self.publisher, TOPIC_SLOT, "upcoming", upcoming);
     }
 
     fn collect_slot_levels(&mut self, root_bank: &Bank, frozen: &[(Slot, Arc<Bank>)]) {
@@ -1931,6 +1994,60 @@ mod tests {
             Some(500_000_000)
         );
         assert!(windowed_mean_nanos(&samples, u64::MAX).unwrap() < 420_000_000);
+    }
+
+    // ---- upcoming leaders -----------------------------------------------
+
+    /// The slot numbers of the published upcoming list, in order.
+    fn upcoming_slots(harness: &crate::fixture::Fixture) -> Vec<u64> {
+        let published = harness
+            .published_key("slot", "upcoming")
+            .expect("upcoming is published");
+        let envelope: serde_json::Value = serde_json::from_str(&published).unwrap();
+        envelope["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["slot"].as_u64().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_upcoming_starts_past_the_tip_and_runs_contiguously() {
+        let harness = fixture();
+        harness.advance_to(64);
+        let mut collector = harness.collector();
+        let root_bank = harness.bank_forks.read().unwrap().root_bank();
+
+        collector.collect_upcoming(&root_bank, 64);
+        let slots = upcoming_slots(&harness);
+
+        assert!(!slots.is_empty(), "the schedule for this epoch is known");
+        assert_eq!(slots[0], 65, "starts past the slot being worked on");
+        let contiguous: Vec<u64> = (0..slots.len() as u64)
+            .map(|index| index.saturating_add(65))
+            .collect();
+        assert_eq!(slots, contiguous, "no gaps");
+        assert!(
+            slots.len() as u64 <= UPCOMING_SLOTS,
+            "bounded at {UPCOMING_SLOTS}"
+        );
+    }
+
+    #[test]
+    fn test_upcoming_marks_our_own_slots() {
+        // The fixture stakes this validator alone, so it leads every slot.
+        let harness = fixture();
+        harness.advance_to(8);
+        let mut collector = harness.collector();
+        let root_bank = harness.bank_forks.read().unwrap().root_bank();
+
+        collector.collect_upcoming(&root_bank, 8);
+        let published = harness.published_key("slot", "upcoming").unwrap();
+        assert!(
+            published.contains(r#""mine":true"#),
+            "the only staked leader should be marked as ours"
+        );
     }
 
     // ---- epoch countdown ------------------------------------------------
