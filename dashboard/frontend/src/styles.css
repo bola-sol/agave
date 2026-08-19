@@ -1509,15 +1509,6 @@ body {
   min-height: 0;
 }
 
-/* Held out of the scroller, so the turns still to come stay on screen while
-   what has happened scrolls under them. */
-.schedule-ahead {
-  display: flex;
-  flex-direction: column;
-  flex: none;
-  gap: var(--gap);
-}
-
 .schedule-list {
   display: flex;
   flex-direction: column;
@@ -1693,14 +1684,13 @@ body {
 .schedule-level.level-skipped {
   background: var(--level-skipped);
 }
+.schedule-level.level-scheduled {
+  background: none;
+  border: 1px solid var(--border);
+}
 
 .schedule-fill {
   margin-left: 6px;
-  color: var(--text-faint);
-}
-
-.schedule-pending {
-  text-align: right;
   color: var(--text-faint);
 }
 

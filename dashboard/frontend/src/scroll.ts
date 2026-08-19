@@ -16,8 +16,11 @@
  *
  * Three cases are left alone:
  *
- * - A scroller at the live edge. Sitting at the top is a request to see what
- *   arrives, not to be held away from it.
+ * - A scroller at the top, where that is the live edge. Sitting there is a
+ *   request to see what arrives, not to be held away from it. Where the live
+ *   edge is somewhere else — the schedule settles on the boundary, with more
+ *   schedule above it — `holdAtTop` says so, and the top is held like anywhere
+ *   else.
  * - A list that did not grow. Slots are pruned from the bottom, which moves
  *   nothing above them.
  * - A scroller something else has already moved, which is the important one.
@@ -30,8 +33,9 @@ export function heldScrollTop(
   previousTop: number,
   was: number,
   now: number,
+  holdAtTop = false,
 ): number {
-  if (previousTop <= 0) return scrollTop;
+  if (previousTop <= 0 && !holdAtTop) return scrollTop;
   if (scrollTop !== previousTop) return scrollTop;
   const grown = now - was;
   return grown > 0 ? scrollTop + grown : scrollTop;

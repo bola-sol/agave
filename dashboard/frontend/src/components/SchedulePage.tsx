@@ -1,61 +1,68 @@
-import { useRef, useState } from "react";
+import { memo, useEffect, useRef, useState, type Ref, type RefObject } from "react";
 import { count, percent, shortKey, sol, solCompact } from "../format";
-import { groupByLeader, matchesQuery, type Led, type LeaderGroup } from "../schedule";
-import type { Peer, SlotEntry, StakeSummary, UpcomingSlot } from "../types";
+import {
+  groupByLeader,
+  hasBegun,
+  matchesQuery,
+  timeline,
+  type Led,
+  type LeaderGroup,
+  type TimelineSlot,
+} from "../schedule";
+import type { Peer, StakeSummary, UpcomingSlot } from "../types";
 import { useStore } from "../useStore";
 import { Copyable } from "./Copyable";
 import { Logo } from "./Logo";
 import { ScrollTop } from "./ScrollTop";
 
 /**
- * Leader turns still to come, kept above the list rather than in it.
+ * Leader turns kept above the boundary when the page settles on it.
  *
- * Enough to see who is next without the list opening on slots that have not
- * happened. More than this and the scroll position on arrival would be a
- * stretch of empty schedule rather than the newest block.
+ * Enough to see who is next without opening on a stretch of schedule that has
+ * not happened. Everything further ahead is still there, above them.
  */
-const AHEAD_GROUPS = 2;
+const AHEAD_PINNED = 2;
 
 /**
  * The leader schedule, with what each block turned out to contain.
  *
- * The same slots the sidebar lists, folded into the runs the schedule hands
- * out and widened with the figures the collector reads off each bank as it
- * freezes. Everything here is already on the wire for the rest of the page;
- * this is a second reading of it rather than a second feed.
+ * The slots are the ones the sidebar lists and the block figures are the ones
+ * the collector reads off each bank as it freezes, so this is a second reading
+ * of what is on the wire rather than a second feed.
+ *
+ * Slots that have begun and slots the schedule promises are merged into one run
+ * before being grouped, so a leader's turn is drawn once and whole. Split at the
+ * slot being produced it appeared on both sides of the boundary, losing a row
+ * above and gaining one below several times a turn, and everything after it
+ * moved each time.
  */
 export function SchedulePage() {
   const store = useStore();
   const [query, setQuery] = useState("");
-  // The list scrolls inside the page rather than scrolling the page, so the
-  // filter above it stays put and the way back to live is the same gesture as
-  // in the slot list down the side.
-  const list = useRef<HTMLDivElement>(null);
   const [oursOnly, setOursOnly] = useState(false);
+  const list = useRef<HTMLDivElement>(null);
+  const live = useRef<HTMLDivElement>(null);
 
   const completed = store.get<number>("summary", "completed_slot");
   const stake = store.get<StakeSummary>("summary", "stake");
   const peers = store.get<Peer[]>("peers", "all");
-  // Keyed for lookup by the leader column, which asks once per group.
-  const byIdentity = new Map((peers ?? []).map((peer) => [peer.identity, peer]));
   const upcoming = store.get<UpcomingSlot[]>("slot", "upcoming") ?? [];
-  // Newest first, matching the sidebar: a viewer wants the last block, not the
-  // oldest one still held.
-  const past = [...store.getSlots()].reverse();
+  const byIdentity = new Map((peers ?? []).map((peer) => [peer.identity, peer]));
 
-  // Published on the slow tier, so the front of the list has usually happened
-  // by the time it is read here.
-  const ahead = completed === undefined ? upcoming : upcoming.filter((slot) => slot.slot > completed);
+  // Published on the slow tier, so the front of it has usually happened.
+  const ahead =
+    completed === undefined ? upcoming : upcoming.filter((slot) => slot.slot > completed);
 
   const wanted = <T extends Led>(group: LeaderGroup<T>) =>
     matchesQuery(group, query) && (!oursOnly || group.mine);
 
-  // Descending, so the turn about to happen is last and sits against the
-  // newest produced block below it. The nearest few are all that is kept.
-  const aheadGroups = groupByLeader([...ahead].reverse())
-    .filter(wanted)
-    .slice(-AHEAD_GROUPS);
-  const pastGroups = groupByLeader(past).filter(wanted);
+  const groups = groupByLeader(timeline(store.getSlots(), ahead)).filter(wanted);
+  const scheduled = groups.filter((group) => !hasBegun(group));
+  const produced = groups.filter(hasBegun);
+  // The turn the page settles on, counted back from the boundary.
+  const pinned = Math.max(0, scheduled.length - AHEAD_PINNED);
+
+  usePinToBoundary(list, live, produced.length > 0);
 
   return (
     <section className="schedule">
@@ -78,35 +85,27 @@ export function SchedulePage() {
         </div>
       </div>
 
-      {aheadGroups.length > 0 && (
-        <div className="schedule-ahead">
-          <h2 className="schedule-heading">Upcoming</h2>
-          {aheadGroups.map((group) => (
-            <UpcomingGroup
-              key={group.slots[0].slot}
-              group={group}
-              peer={group.leader ? byIdentity.get(group.leader) : undefined}
-              totalStake={stake?.total_stake}
-            />
-          ))}
-        </div>
-      )}
-
-      {/* Only what has happened scrolls. Held out of the list, the turns still
-          to come stay on screen, and the top of the list is the newest block
-          rather than a stretch of empty schedule — which also keeps the live
-          edge at nothing scrolled, where the pill and the held position both
-          expect it. */}
       <div className="schedule-list" ref={list}>
-        <ScrollTop scroller={list} />
-        <h2 className="schedule-heading">Past</h2>
-        {pastGroups.length === 0 && (
+        <ScrollTop scroller={list} live={live} />
+        {scheduled.length > 0 && <h2 className="schedule-heading">Upcoming</h2>}
+        {scheduled.map((group, index) => (
+          <Group
+            key={group.slots[0].slot}
+            group={group}
+            peer={group.leader ? byIdentity.get(group.leader) : undefined}
+            totalStake={stake?.total_stake}
+            anchor={index === pinned ? live : undefined}
+          />
+        ))}
+
+        <h2 className="schedule-heading">Produced</h2>
+        {produced.length === 0 && (
           <div className="sidebar-empty">
-            {past.length === 0 ? "waiting for slots…" : "nothing matches that"}
+            {groups.length === 0 ? "waiting for slots…" : "nothing matches that"}
           </div>
         )}
-        {pastGroups.map((group) => (
-          <PastGroup
+        {produced.map((group) => (
+          <Group
             key={group.slots[0].slot}
             group={group}
             peer={group.leader ? byIdentity.get(group.leader) : undefined}
@@ -118,7 +117,81 @@ export function SchedulePage() {
   );
 }
 
-/** Leader, name and key, shared by both kinds of group. */
+/**
+ * Settles the list on the boundary once, when the first slots arrive.
+ *
+ * Once, because after that the position is the viewer's. The list is scrolled
+ * rather than trimmed, so everything further ahead stays reachable by scrolling
+ * up: the difference between a starting position and a limit.
+ */
+function usePinToBoundary(
+  list: RefObject<HTMLDivElement | null>,
+  live: RefObject<HTMLDivElement | null>,
+  ready: boolean,
+): void {
+  const settled = useRef(false);
+
+  useEffect(() => {
+    if (settled.current || !ready) return;
+    const scroller = list.current;
+    const target = live.current;
+    if (!scroller || !target) return;
+    settled.current = true;
+    scroller.scrollTop = target.offsetTop - scroller.offsetTop;
+  }, [list, live, ready]);
+}
+
+/**
+ * One leader's turn, drawn the same whether or not it has started.
+ *
+ * Memoised on the slots themselves. The store replaces only the entries that
+ * changed, so a turn whose slots have all settled is skipped rather than
+ * rebuilt — which is most of them, on a page of a hundred and fifty turns that
+ * was otherwise re-rendering whole several times a second.
+ */
+const Group = memo(
+  function Group({
+    group,
+    peer,
+    totalStake,
+    anchor,
+  }: {
+    group: LeaderGroup<TimelineSlot>;
+    peer: Peer | undefined;
+    totalStake: number | undefined;
+    anchor?: Ref<HTMLDivElement>;
+  }) {
+    return (
+      <div
+        className={`schedule-group${hasBegun(group) ? "" : " is-upcoming"}`}
+        ref={anchor}
+      >
+        <GroupLeader group={group} peer={peer} totalStake={totalStake} />
+        <div className="schedule-slots">
+          <div className="schedule-row schedule-head">
+            <span className="schedule-slot">Slot</span>
+            <span>Votes</span>
+            <span>Non-votes</span>
+            <span>Fees</span>
+            <span>Duration</span>
+            <span>Compute</span>
+          </div>
+          {group.slots.map((slot) => (
+            <SlotRow key={slot.slot} slot={slot} />
+          ))}
+        </div>
+      </div>
+    );
+  },
+  (before, after) =>
+    before.peer === after.peer &&
+    before.totalStake === after.totalStake &&
+    before.anchor === after.anchor &&
+    before.group.slots.length === after.group.slots.length &&
+    before.group.slots.every((slot, index) => slot.entry === after.group.slots[index]?.entry),
+);
+
+/** Leader, name and key, with what is known about the validator behind them. */
 function GroupLeader<T extends Led>({
   group,
   peer,
@@ -162,79 +235,30 @@ function GroupLeader<T extends Led>({
   );
 }
 
-/** A turn that has not come round yet: who, and which slots. */
-function UpcomingGroup({
-  group,
-  peer,
-  totalStake,
-}: {
-  group: LeaderGroup<UpcomingSlot>;
-  peer: Peer | undefined;
-  totalStake: number | undefined;
-}) {
-  return (
-    <div className="schedule-group is-upcoming">
-      <GroupLeader group={group} peer={peer} totalStake={totalStake} />
-      <div className="schedule-slots">
-        {group.slots.map((slot) => (
-          <div className="schedule-row" key={slot.slot}>
-            <span className="schedule-slot">{count(slot.slot)}</span>
-            <span className="schedule-pending">scheduled</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-/** A turn that has been and gone, with what each of its blocks held. */
-function PastGroup({
-  group,
-  peer,
-  totalStake,
-}: {
-  group: LeaderGroup<SlotEntry>;
-  peer: Peer | undefined;
-  totalStake: number | undefined;
-}) {
-  return (
-    <div className="schedule-group">
-      <GroupLeader group={group} peer={peer} totalStake={totalStake} />
-      <div className="schedule-slots">
-        <div className="schedule-row schedule-head">
-          <span className="schedule-slot">Slot</span>
-          <span>Votes</span>
-          <span>Non-votes</span>
-          <span>Fees</span>
-          <span>Duration</span>
-          <span>Compute</span>
-        </div>
-        {group.slots.map((slot) => (
-          <SlotRow key={slot.slot} slot={slot} />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function SlotRow({ slot }: { slot: SlotEntry }) {
-  const block = slot.block;
+/** One slot, empty until it has been produced. */
+function SlotRow({ slot }: { slot: TimelineSlot }) {
+  const entry = slot.entry;
+  const block = entry?.block ?? null;
   // Votes are what is left of the block once the rest is taken out. Clamped
   // because the two counters are differenced independently and a bank whose
   // parent has gone reports neither.
   const votes = block ? Math.max(0, block.transactions - block.non_vote_transactions) : null;
-  const filled = block && block.block_cost_limit > 0 ? block.block_cost / block.block_cost_limit : null;
+  const filled =
+    block && block.block_cost_limit > 0 ? block.block_cost / block.block_cost_limit : null;
+  const level = entry?.level ?? "scheduled";
 
   return (
-    <div className={`schedule-row level-${slot.level}`}>
+    <div className={`schedule-row level-${level}`}>
       <span className="schedule-slot">
         {count(slot.slot)}
-        <span className={`schedule-level level-${slot.level}`} title={slot.level.replace(/_/g, " ")} />
+        <span className={`schedule-level level-${level}`} title={level.replace(/_/g, " ")} />
       </span>
       <span>{votes === null ? "—" : count(votes)}</span>
       <span>{block ? count(block.non_vote_transactions) : "—"}</span>
       <span>{block ? sol(block.total_fees, 4) : "—"}</span>
-      <span>{slot.duration_nanos === null ? "—" : `${Math.round(slot.duration_nanos / 1e6)} ms`}</span>
+      <span>
+        {entry?.duration_nanos == null ? "—" : `${Math.round(entry.duration_nanos / 1e6)} ms`}
+      </span>
       <span>
         {block ? count(block.block_cost) : "—"}
         {filled !== null && <span className="schedule-fill">{percent(filled, 0)}</span>}

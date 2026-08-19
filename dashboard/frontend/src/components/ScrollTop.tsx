@@ -12,6 +12,12 @@ const LIVE_EDGE_PX = 120;
 /**
  * A pill that returns a scrolled list to its live edge.
  *
+ * `live` names an element that should sit at the top when the list is where it
+ * belongs; without it the live edge is the top of the scroller. The schedule
+ * needs the first: its live edge is the boundary between what has been produced
+ * and what is still to come, which has the schedule above it and history below,
+ * so both directions are somewhere to go.
+ *
  * Both the slot list and the schedule are newest-first and hundreds of rows
  * long, so the top of the list is where the live data is and scrolling back by
  * hand is a long way. Takes the scroller rather than finding one, because the
@@ -24,27 +30,37 @@ const LIVE_EDGE_PX = 120;
  * Also holds the scroll position while the list grows at the top, which is the
  * other half of making a live list readable; see [`useHeldScroll`].
  */
-export function ScrollTop({ scroller }: { scroller: RefObject<HTMLElement | null> }) {
+export function ScrollTop({
+  scroller,
+  live,
+}: {
+  scroller: RefObject<HTMLElement | null>;
+  live?: RefObject<HTMLElement | null>;
+}) {
   const [away, setAway] = useState(false);
   // Shared with the hook below: it needs to know where the list was left, to
   // tell its own correction apart from one the browser already made.
   const top = useRef(0);
-  useHeldScroll(scroller, top);
+  useHeldScroll(scroller, top, live !== undefined);
 
   useEffect(() => {
     const element = scroller.current;
     if (!element) return;
 
+    const liveTop = () => {
+      const target = live?.current;
+      return target ? target.offsetTop - element.offsetTop : 0;
+    };
     const follow = () => {
       top.current = element.scrollTop;
-      setAway(element.scrollTop > LIVE_EDGE_PX);
+      setAway(Math.abs(element.scrollTop - liveTop()) > LIVE_EDGE_PX);
     };
     element.addEventListener("scroll", follow, { passive: true });
     // The scroller may already be away from the top when this mounts, which is
     // what happens when the page is switched while scrolled down.
     follow();
     return () => element.removeEventListener("scroll", follow);
-  }, [scroller]);
+  }, [scroller, live]);
 
   return (
     <div className="scroll-top-anchor">
@@ -52,7 +68,13 @@ export function ScrollTop({ scroller }: { scroller: RefObject<HTMLElement | null
         <button
           type="button"
           className="scroll-top"
-          onClick={() => scroller.current?.scrollTo({ top: 0 })}
+          onClick={() => {
+            const element = scroller.current;
+            const target = live?.current;
+            element?.scrollTo({
+              top: target ? target.offsetTop - element.offsetTop : 0,
+            });
+          }}
         >
           Top <span aria-hidden="true">↑</span>
         </button>
@@ -81,6 +103,7 @@ function useHeldScroll(
   // A plain box rather than `RefObject`, whose `current` React types as
   // read-only; this one is written on both sides.
   top: { current: number },
+  holdAtTop: boolean,
 ): void {
   const height = useRef(0);
 
@@ -93,6 +116,7 @@ function useHeldScroll(
       top.current,
       height.current,
       element.scrollHeight,
+      holdAtTop,
     );
     height.current = element.scrollHeight;
     if (held !== element.scrollTop) {

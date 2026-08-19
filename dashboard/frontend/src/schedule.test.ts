@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { groupByLeader, matchesQuery, type Led } from "./schedule";
+import { groupByLeader, hasBegun, matchesQuery, timeline, type Led } from "./schedule";
+import type { SlotEntry, UpcomingSlot } from "./types";
 
 function slot(number: number, leader: string, name: string | null = null): Led {
   return {
@@ -64,5 +65,68 @@ describe("matchesQuery", () => {
 
   it("does not match something absent", () => {
     expect(matchesQuery(group, "nansen")).toBe(false);
+  });
+});
+
+function held(slot: number, leader: string): SlotEntry {
+  return {
+    slot,
+    level: "completed",
+    leader,
+    leader_name: null,
+    leader_icon: null,
+    mine: false,
+    block: null,
+    duration_nanos: null,
+  };
+}
+
+function scheduled(slot: number, leader: string): UpcomingSlot {
+  return { slot, leader, leader_name: null, leader_icon: null, mine: false };
+}
+
+describe("timeline", () => {
+  it("reads the two sources as one run, newest first", () => {
+    const rows = timeline([held(100, "alice"), held(101, "alice")], [
+      scheduled(102, "alice"),
+      scheduled(103, "alice"),
+    ]);
+    expect(rows.map((row) => row.slot)).toEqual([103, 102, 101, 100]);
+    expect(rows.map((row) => row.entry !== null)).toEqual([false, false, true, true]);
+  });
+
+  it("prefers the slot that happened over the one that was promised", () => {
+    // The store knows what happened; the schedule only knows who was asked to.
+    const rows = timeline([held(100, "alice")], [scheduled(100, "alice")]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].entry).not.toBeNull();
+  });
+
+  it("gathers a straddling turn into one group rather than two", () => {
+    // The whole point: without the merge this leader appears twice, shrinking
+    // above the boundary and growing below it as its slots are produced.
+    const rows = timeline(
+      [held(100, "alice"), held(101, "alice")],
+      [scheduled(102, "alice"), scheduled(103, "alice")],
+    );
+    const groups = groupByLeader(rows);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].slots).toHaveLength(4);
+  });
+});
+
+describe("hasBegun", () => {
+  it("is true once the turn's own first slot has started", () => {
+    const groups = groupByLeader(
+      timeline([held(100, "alice")], [scheduled(101, "alice"), scheduled(102, "alice")]),
+    );
+    expect(hasBegun(groups[0])).toBe(true);
+  });
+
+  it("is false while every slot is still only scheduled", () => {
+    const groups = groupByLeader(
+      timeline([], [scheduled(101, "alice"), scheduled(102, "alice")]),
+    );
+    expect(hasBegun(groups[0])).toBe(false);
   });
 });
