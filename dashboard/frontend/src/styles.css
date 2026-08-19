@@ -1448,3 +1448,201 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- pages ---- */
+
+.nav {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-tab {
+  padding: 6px 12px;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  text-decoration: none;
+}
+
+.nav-tab:hover {
+  color: var(--text-dim);
+}
+
+.nav-tab.is-current {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+.nav-tab:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ---- schedule ---- */
+
+.schedule {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-width: 0;
+}
+
+.schedule-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.schedule-search {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.schedule-search:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.schedule-heading {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+.schedule-group {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+/* Dimmed, because nothing in it has happened. */
+.schedule-group.is-upcoming {
+  opacity: 0.7;
+}
+
+.schedule-leader {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.schedule-leader-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.schedule-leader-key {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.schedule-mine {
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--panel);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.schedule-slots {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  /* A leader's turn is a handful of slots, so the table scrolls sideways on a
+     narrow screen rather than wrapping into something unreadable. */
+  overflow-x: auto;
+}
+
+.schedule-row {
+  display: grid;
+  grid-template-columns: 150px repeat(5, minmax(70px, 1fr));
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.schedule-row > span:not(.schedule-slot) {
+  text-align: right;
+}
+
+.schedule-head {
+  color: var(--text-faint);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.schedule-slot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+
+.schedule-level {
+  width: 4px;
+  height: 12px;
+  border-radius: 1px;
+  background: var(--level-incomplete);
+}
+
+.schedule-level.level-completed {
+  background: var(--level-completed);
+}
+.schedule-level.level-optimistically_confirmed {
+  background: var(--level-optimistically_confirmed);
+}
+.schedule-level.level-rooted {
+  background: var(--level-rooted);
+}
+.schedule-level.level-finalized {
+  background: var(--level-finalized);
+}
+.schedule-level.level-skipped {
+  background: var(--level-skipped);
+}
+
+.schedule-fill {
+  margin-left: 6px;
+  color: var(--text-faint);
+}
+
+.schedule-pending {
+  text-align: right;
+  color: var(--text-faint);
+}
+
+@media (max-width: 700px) {
+  .schedule-group {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+}

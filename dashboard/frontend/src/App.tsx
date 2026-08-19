@@ -10,9 +10,11 @@ import { Header } from "./components/Header";
 import { IngestCard } from "./components/IngestCard";
 import { NetworkCard } from "./components/NetworkCard";
 import { ProducedBlocksCard } from "./components/ProducedBlocksCard";
+import { SchedulePage } from "./components/SchedulePage";
 import { Sidebar } from "./components/Sidebar";
 import { VersionsCard } from "./components/VersionsCard";
 import { SlotStrip } from "./components/SlotStrip";
+import { usePage, type Page } from "./route";
 import { useStore } from "./useStore";
 
 /** Base title, kept in step with index.html so the tab reads the same before
@@ -25,6 +27,7 @@ export function App() {
   const name = store.get<string | null>("summary", "identity_name");
   const identity = store.get<string>("summary", "identity_key");
   const [collapsed, setCollapsed] = useState(readSidebarCollapsed);
+  const [page, setPage] = usePage();
 
   // Named after the validator so that an operator watching several at once can
   // tell the tabs apart. `Private` matches what the header shows for a node
@@ -51,22 +54,63 @@ export function App() {
             Disconnected from the validator. Retrying…
           </div>
         )}
-        <SlotStrip />
-        <div className="grid">
-          <EpochCard />
-          <StatusCard />
-          <ValidatorsCard />
-          <VersionsCard />
-        </div>
-        <TransactionsCard />
-        {/* Both read the same traffic from opposite ends: bytes on the wire,
-            and what the sockets failed to take off it. */}
-        <div className="grid">
-          <NetworkCard />
-          <IngestCard />
-        </div>
-        <ProducedBlocksCard />
+        <Nav page={page} onSelect={setPage} />
+        {page === "overview" ? <Overview /> : <SchedulePage />}
       </main>
     </div>
+  );
+}
+
+/** What this validator is doing, which is what the dashboard opens on. */
+function Overview() {
+  return (
+    <>
+      <SlotStrip />
+      <div className="grid">
+        <EpochCard />
+        <StatusCard />
+        <ValidatorsCard />
+        <VersionsCard />
+      </div>
+      <TransactionsCard />
+      {/* Both read the same traffic from opposite ends: bytes on the wire, and
+          what the sockets failed to take off it. */}
+      <div className="grid">
+        <NetworkCard />
+        <IngestCard />
+      </div>
+      <ProducedBlocksCard />
+    </>
+  );
+}
+
+const PAGES: { page: Page; label: string }[] = [
+  { page: "overview", label: "Overview" },
+  { page: "schedule", label: "Schedule" },
+];
+
+/**
+ * Anchors rather than buttons, so a page can be opened in a new tab and the
+ * address bar says which one is on screen. The click is still handled, to keep
+ * the switch to a re-render rather than a reload.
+ */
+function Nav({ page, onSelect }: { page: Page; onSelect: (page: Page) => void }) {
+  return (
+    <nav className="nav" aria-label="Pages">
+      {PAGES.map((entry) => (
+        <a
+          key={entry.page}
+          href={entry.page === "overview" ? "#" : `#/${entry.page}`}
+          className={`nav-tab${page === entry.page ? " is-current" : ""}`}
+          aria-current={page === entry.page ? "page" : undefined}
+          onClick={(event) => {
+            event.preventDefault();
+            onSelect(entry.page);
+          }}
+        >
+          {entry.label}
+        </a>
+      ))}
+    </nav>
   );
 }
