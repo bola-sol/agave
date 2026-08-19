@@ -1,5 +1,13 @@
-import { memo, useMemo, useRef, useState } from "react";
-import { Virtuoso, type ListRange, type VirtuosoHandle } from "react-virtuoso";
+import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { count, percent, shortKey, sol, solCompact } from "../format";
 import {
   groupByLeader,
@@ -63,7 +71,12 @@ export function SchedulePage() {
   const list = useRef<VirtuosoHandle>(null);
   const seen = useRef<string[]>([]);
   const [firstRow, setFirstRow] = useState(FIRST_ROW);
-  const [range, setRange] = useState<ListRange | null>(null);
+  // Following until the viewer scrolls for themselves, and again when they ask
+  // to come back. Read from what they did rather than from where the list is:
+  // the list moves on its own, and it moving is not them leaving.
+  const [following, setFollowing] = useState(true);
+  const [scroller, setScroller] = useState<HTMLElement | null>(null);
+  useUserScroll(scroller, () => setFollowing(false));
 
   const completed = store.get<number>("summary", "completed_slot");
   const stake = store.get<StakeSummary>("summary", "stake");
@@ -94,12 +107,16 @@ export function SchedulePage() {
   if (prepended > 0) setFirstRow((first) => first - prepended);
   seen.current = keys;
 
-  const boundary = rows.findIndex((row) => row.kind === "heading" && row.label === "Produced");
-  const settleOn = Math.max(0, boundary - AHEAD_PINNED);
-  // Away once the boundary is off screen entirely: what is being read is then
-  // either history or schedule rather than what is happening now.
-  const away =
-    range !== null && boundary >= 0 && (boundary < range.startIndex || boundary > range.endIndex);
+  const settleOn = Math.max(
+    0,
+    rows.findIndex((row) => row.kind === "heading" && row.label === "Produced") - AHEAD_PINNED,
+  );
+  // The boundary's index as the list itself numbers rows, which is not the
+  // array's numbering once `firstItemIndex` has shifted it, and is the only
+  // one `scrollToIndex` will accept. Taken from the list as it draws that row
+  // rather than worked out here, so the two cannot disagree.
+  const boundary = useRef<number | null>(null);
+  usePinToBoundary(list, boundary, following);
 
   return (
     <section className="schedule">
@@ -123,11 +140,11 @@ export function SchedulePage() {
       </div>
 
       <div className="schedule-list">
-        {away && (
+        {!following && (
           <button
             type="button"
             className="scroll-top schedule-live"
-            onClick={() => list.current?.scrollToIndex({ index: settleOn, align: "start" })}
+            onClick={() => setFollowing(true)}
           >
             Live <span aria-hidden="true">↕</span>
           </button>
@@ -143,12 +160,13 @@ export function SchedulePage() {
             firstItemIndex={firstRow}
             initialTopMostItemIndex={settleOn}
             computeItemKey={(_index, row) => rowKey(row)}
-            rangeChanged={setRange}
+            scrollerRef={(element) => setScroller(element instanceof HTMLElement ? element : null)}
             // A screen either side, so a turn is measured before it is scrolled
             // into rather than resizing the list underneath the scroll.
             increaseViewportBy={600}
-            itemContent={(_index, row) =>
-              row.kind === "heading" ? (
+            itemContent={(index, row) => {
+              if (row.kind === "heading" && row.label === "Produced") boundary.current = index;
+              return row.kind === "heading" ? (
                 <h2 className="schedule-heading">{row.label}</h2>
               ) : (
                 <Group
@@ -156,8 +174,8 @@ export function SchedulePage() {
                   peer={row.group.leader ? byIdentity.get(row.group.leader) : undefined}
                   totalStake={stake?.total_stake}
                 />
-              )
-            }
+              );
+            }}
           />
         )}
       </div>
@@ -282,4 +300,60 @@ function SlotRow({ slot }: { slot: TimelineSlot }) {
       </span>
     </div>
   );
+}
+
+/**
+ * Calls back when the viewer scrolls the list themselves.
+ *
+ * Listens for the input rather than for the scrolling, because the list scrolls
+ * on its own all the time — holding the boundary in place is scrolling — and a
+ * position change says nothing about who wanted it. A wheel, a drag or a key
+ * only ever comes from a person.
+ */
+function useUserScroll(scroller: HTMLElement | null, leave: () => void): void {
+  useEffect(() => {
+    if (!scroller) return;
+    const options = { passive: true } as const;
+    scroller.addEventListener("wheel", leave, options);
+    scroller.addEventListener("touchmove", leave, options);
+    scroller.addEventListener("keydown", leave, options);
+    return () => {
+      scroller.removeEventListener("wheel", leave);
+      scroller.removeEventListener("touchmove", leave);
+      scroller.removeEventListener("keydown", leave);
+    };
+    // `leave` is a fresh closure each render and the listeners are cheap to
+    // swap, so it is left out rather than wrapped in a callback that would have
+    // to be kept in step by hand.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scroller]);
+}
+
+/**
+ * Keeps the boundary at the same place on screen while the list changes.
+ *
+ * The row indices the list uses do not move when turns arrive above the
+ * boundary — that is what `firstItemIndex` is for — so the boundary's index
+ * changes for one reason only: a turn crossing it, which moves it a row nearer
+ * the top. Scrolling by that much on exactly those renders is what leaves the
+ * heading where it was, with the schedule shortening above it and the produced
+ * list growing below.
+ *
+ * Only while following. Once the viewer has scrolled somewhere, moving the list
+ * under them would be the rudest thing this page could do.
+ */
+function usePinToBoundary(
+  list: RefObject<VirtuosoHandle | null>,
+  boundary: RefObject<number | null>,
+  following: boolean,
+): void {
+  const pinned = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (!following) return;
+    const index = boundary.current;
+    if (index === null || index === pinned.current) return;
+    pinned.current = index;
+    list.current?.scrollToIndex({ align: "start", index: Math.max(0, index - AHEAD_PINNED) });
+  });
 }
