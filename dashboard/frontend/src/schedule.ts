@@ -106,21 +106,3 @@ export function turnKey(turn: Turn): string {
   return `turn:${turn.slots.at(-1)?.slot}`;
 }
 
-/**
- * How many turns were added above `previous` to make `keys`.
- *
- * The virtualised list is told this rather than left to work it out, and it
- * shifts its own record of where everything sits by that much — which is how
- * the view stays put while turns arrive above it. Measuring pixels after the
- * fact, which is what this replaces, can only ever guess at it.
- *
- * A first turn that is no longer in the list at all means the two have nothing
- * in common — a search was typed, or the connection dropped and came back — and
- * nothing can be held across that.
- */
-export function prependedCount(previous: string[], keys: string[]): number {
-  const first = previous[0];
-  if (first === undefined) return 0;
-  const at = keys.indexOf(first);
-  return at > 0 ? at : 0;
-}

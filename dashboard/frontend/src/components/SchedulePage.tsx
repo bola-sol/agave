@@ -1,27 +1,11 @@
 import { memo, useMemo, useRef, useState } from "react";
-import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { count, percent, shortKey, sol, solCompact } from "../format";
-import {
-  matchesQuery,
-  prependedCount,
-  turnKey,
-  turnsOf,
-  type Turn,
-  type TurnSlot,
-} from "../schedule";
+import { matchesQuery, turnKey, turnsOf, type Turn, type TurnSlot } from "../schedule";
 import type { Peer, StakeSummary } from "../types";
 import { useStore } from "../useStore";
 import { Copyable } from "./Copyable";
 import { Logo } from "./Logo";
-
-/**
- * Where the turn indices start.
- *
- * The virtualised list identifies rows by an index that only ever decreases as
- * turns arrive above them, so it has to begin high enough to keep counting down
- * for as long as the page is open. At a turn every second or so this is years.
- */
-const FIRST_TURN = 1_000_000;
+import { ScrollTop } from "./ScrollTop";
 
 /**
  * What each leader's turn at producing contained.
@@ -34,23 +18,16 @@ const FIRST_TURN = 1_000_000;
  * four slots share a leader by definition, so the rest are drawn as empty rows
  * and filled where they stand. Nothing below a turn moves while it fills.
  *
- * The list is virtualised, and that is what holds it still. Turns arrive at the
- * top faster than they can be read, and the list is *told* how many rather than
- * left to infer it from the page afterwards: `firstItemIndex` drops by the
- * number prepended and the view does not move. Every attempt here to work that
- * out from pixels found a new way to be wrong. Firedancer's schedule is built
- * on the same library for the same reason.
+ * The live edge is the top, which is the same arrangement as the slot list down
+ * the side, so it wants the same handling and gets it from the same component:
+ * arrivals are seen while the top is on screen, and held off what is being read
+ * once it is not.
  */
 export function SchedulePage() {
   const store = useStore();
   const [query, setQuery] = useState("");
   const [oursOnly, setOursOnly] = useState(false);
-  const list = useRef<VirtuosoHandle>(null);
-  const seen = useRef<string[]>([]);
-  const [firstTurn, setFirstTurn] = useState(FIRST_TURN);
-  // The newest turn is the top of the list, so the list being at its top is the
-  // whole of what it means to be live. The list itself reports that.
-  const [atTop, setAtTop] = useState(true);
+  const list = useRef<HTMLDivElement>(null);
 
   const stake = store.get<StakeSummary>("summary", "stake");
   const peers = store.get<Peer[]>("peers", "all");
@@ -65,14 +42,6 @@ export function SchedulePage() {
     () => turnsOf(slots).filter((turn) => matchesQuery(turn, query) && (!oursOnly || turn.mine)),
     [slots, query, oursOnly],
   );
-
-  // Counted during the render that introduces the turns, so the list is handed
-  // them and the shift that goes with them together. Told afterwards, it would
-  // draw them in the wrong place for a frame first.
-  const keys = turns.map(turnKey);
-  const prepended = prependedCount(seen.current, keys);
-  if (prepended > 0) setFirstTurn((first) => first - prepended);
-  seen.current = keys;
 
   return (
     <section className="schedule">
@@ -95,39 +64,21 @@ export function SchedulePage() {
         </div>
       </div>
 
-      <div className="schedule-list">
-        {!atTop && (
-          <button
-            type="button"
-            className="scroll-top schedule-live"
-            onClick={() => list.current?.scrollToIndex({ align: "start", index: 0 })}
-          >
-            Live <span aria-hidden="true">↑</span>
-          </button>
-        )}
-        {turns.length === 0 ? (
+      <div className="schedule-list" ref={list}>
+        <ScrollTop scroller={list} />
+        {turns.length === 0 && (
           <div className="sidebar-empty">
             {slots.length === 0 ? "waiting for slots…" : "nothing matches that"}
           </div>
-        ) : (
-          <Virtuoso
-            ref={list}
-            data={turns}
-            firstItemIndex={firstTurn}
-            computeItemKey={(_index, turn) => turnKey(turn)}
-            atTopStateChange={setAtTop}
-            // A screen either side, so a turn is measured before it is scrolled
-            // into rather than resizing the list underneath the scroll.
-            increaseViewportBy={600}
-            itemContent={(_index, turn) => (
-              <TurnCard
-                turn={turn}
-                peer={turn.leader ? byIdentity.get(turn.leader) : undefined}
-                totalStake={stake?.total_stake}
-              />
-            )}
-          />
         )}
+        {turns.map((turn) => (
+          <TurnCard
+            key={turnKey(turn)}
+            turn={turn}
+            peer={turn.leader ? byIdentity.get(turn.leader) : undefined}
+            totalStake={stake?.total_stake}
+          />
+        ))}
       </div>
     </section>
   );

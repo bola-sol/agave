@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { matchesQuery, prependedCount, turnKey, turnsOf } from "./schedule";
+import { matchesQuery, turnKey, turnsOf } from "./schedule";
 import type { SlotEntry } from "./types";
 
 function held(slot: number, leader = "alice", name: string | null = null): SlotEntry {
@@ -96,23 +96,5 @@ describe("turnKey", () => {
     // them would identify nothing.
     const [turn] = turnsOf([held(100), held(101)]);
     expect(turnKey(turn)).toBe("turn:100");
-  });
-});
-
-describe("prependedCount", () => {
-  it("counts what appeared above the turn that used to be first", () => {
-    expect(prependedCount(["b", "c"], ["a", "b", "c"])).toBe(1);
-    expect(prependedCount(["c"], ["a", "b", "c"])).toBe(2);
-  });
-
-  it("counts nothing when the front has not moved", () => {
-    expect(prependedCount(["a", "b"], ["a", "b", "c"])).toBe(0);
-  });
-
-  it("counts nothing across a list with nothing in common", () => {
-    // A search was typed, or the connection dropped: there is no position to
-    // hold, and guessing one would throw the list somewhere arbitrary.
-    expect(prependedCount(["a"], ["x", "y"])).toBe(0);
-    expect(prependedCount([], ["a", "b"])).toBe(0);
   });
 });
