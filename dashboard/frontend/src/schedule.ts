@@ -9,6 +9,17 @@
 
 import type { SlotEntry, UpcomingSlot } from "./types";
 
+/**
+ * Slots the leader schedule hands out at a time.
+ *
+ * A validator drawn twice in a row leads eight consecutive slots, and three
+ * times, twelve. Those are separate turns and are drawn as separate cards: run
+ * together they made cards of two and three times the height of every other,
+ * and a page whose rows are all different heights has no fixed position to
+ * hold. Firedancer draws them apart for the same reason.
+ */
+const SLOTS_PER_TURN = 4;
+
 /** The parts of a slot that decide which group it belongs to. */
 export interface Led {
   slot: number;
@@ -28,19 +39,26 @@ export interface LeaderGroup<T extends Led> {
 }
 
 /**
- * Consecutive slots with the same leader, in the order given.
+ * Consecutive slots with the same leader, one turn at a time, in the order
+ * given.
  *
- * A gap in the slot numbers starts a new group even when the leader matches.
- * Two separate runs by the same validator are two turns at leading, and drawing
- * them as one would claim a run that never happened.
+ * A gap in the slot numbers starts a new group even when the leader matches:
+ * two separate runs by the same validator are two turns at leading, and drawing
+ * them as one would claim a run that never happened. So does crossing one of
+ * the schedule's own boundaries, which is what keeps every card the same size —
+ * see [`SLOTS_PER_TURN`].
  */
 export function groupByLeader<T extends Led>(rows: T[]): LeaderGroup<T>[] {
   const groups: LeaderGroup<T>[] = [];
+  const turnOf = (slot: number) => Math.floor(slot / SLOTS_PER_TURN);
 
   for (const row of rows) {
     const open = groups.at(-1);
     const previous = open?.slots.at(-1);
-    const adjacent = previous !== undefined && Math.abs(previous.slot - row.slot) === 1;
+    const adjacent =
+      previous !== undefined &&
+      Math.abs(previous.slot - row.slot) === 1 &&
+      turnOf(previous.slot) === turnOf(row.slot);
 
     if (open && adjacent && open.leader === row.leader) {
       open.slots.push(row);

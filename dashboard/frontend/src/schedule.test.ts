@@ -38,6 +38,16 @@ describe("groupByLeader", () => {
     expect(groups.map((group) => group.leader)).toEqual(["alice", "bob"]);
   });
 
+  it("splits a leader drawn twice in a row into two turns", () => {
+    // Eight consecutive slots is two turns, not one. Run together the card is
+    // twice the height of every other, and a list of cards that are all
+    // different heights has no fixed place to hold.
+    const slots = [103, 102, 101, 100, 99, 98, 97, 96].map((n) => slot(n, "alice"));
+    const groups = groupByLeader(slots);
+    expect(groups.map((group) => group.slots.length)).toEqual([4, 4]);
+    expect(groups[0].slots.map((entry) => entry.slot)).toEqual([103, 102, 101, 100]);
+  });
+
   it("starts a new group across a gap even when the leader is the same", () => {
     // Two separate turns at leading. Drawn as one they would claim a run that
     // never happened.

@@ -27,12 +27,15 @@ import { Copyable } from "./Copyable";
 import { Logo } from "./Logo";
 
 /**
- * Leader turns kept above the boundary when the page settles on it.
+ * Where the boundary sits, in pixels from the top of the list.
  *
- * Enough to see who is next without opening on a stretch of schedule that has
- * not happened. Everything further ahead is still there, above them.
+ * Pixels rather than a count of turns above it. Counting turns puts the
+ * boundary wherever those particular turns happen to end, and the answer
+ * changes every time the pair above it does — which is what left the Produced
+ * line wandering. Given as an offset, the line has one place and everything
+ * else moves around it. Roughly two turns.
  */
-const AHEAD_PINNED = 2;
+const BOUNDARY_TOP_PX = 280;
 
 /**
  * Where the row indices start.
@@ -108,7 +111,6 @@ export function SchedulePage() {
   seen.current = keys;
 
   const boundary = rows.findIndex((row) => row.kind === "heading" && row.label === "Produced");
-  const settleOn = Math.max(0, boundary - AHEAD_PINNED);
   // The boundary's place in the run of every row there has ever been, which is
   // what says whether it really moved. Its place in the array shifts by one
   // every time a turn arrives above it; add back what the list has been told to
@@ -116,7 +118,7 @@ export function SchedulePage() {
   // crosses. `prepended` is included because the state holding it does not
   // catch up until the next render.
   const absolute = firstRow - prepended + boundary;
-  usePinToBoundary(list, settleOn, absolute, following);
+  usePinToBoundary(list, boundary, absolute, following);
 
   return (
     <section className="schedule">
@@ -158,7 +160,11 @@ export function SchedulePage() {
             ref={list}
             data={rows}
             firstItemIndex={firstRow}
-            initialTopMostItemIndex={settleOn}
+            initialTopMostItemIndex={{
+              align: "start",
+              index: Math.max(0, boundary),
+              offset: -BOUNDARY_TOP_PX,
+            }}
             computeItemKey={(_index, row) => rowKey(row)}
             scrollerRef={(element) => setScroller(element instanceof HTMLElement ? element : null)}
             // A screen either side, so a turn is measured before it is scrolled
@@ -336,9 +342,12 @@ function useUserScroll(scroller: HTMLElement | null, leave: () => void): void {
  * which is the only thing that would otherwise walk the heading up the screen,
  * a turn's worth at a time until it left.
  *
- * `index` is where to: a position in the row array, which is what the list
- * scrolls by. Not the numbering it hands to `itemContent`, which counts from
- * `firstItemIndex` and would be a million rows past the end of the list.
+ * `index` is the boundary itself, as a position in the row array — which is
+ * what the list scrolls by, not the numbering it hands to `itemContent`, which
+ * counts from `firstItemIndex` and would be a million rows past the end. It is
+ * held at a fixed offset down the viewport rather than below a fixed number of
+ * turns, because turns above it come and go and a count of them lands the line
+ * somewhere different each time.
  *
  * Only while following. Once the viewer has scrolled somewhere, moving the list
  * under them would be the rudest thing this page could do.
@@ -360,6 +369,6 @@ function usePinToBoundary(
     }
     if (absolute === pinned.current) return;
     pinned.current = absolute;
-    list.current?.scrollToIndex({ align: "start", index });
+    list.current?.scrollToIndex({ align: "start", index, offset: -BOUNDARY_TOP_PX });
   }, [list, index, absolute, following]);
 }
