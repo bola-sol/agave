@@ -1514,8 +1514,7 @@ body {
 
 /* Rows are positioned by the list, so their spacing is a margin rather than a
    gap on a flex parent that no longer exists. */
-.schedule-list .schedule-group,
-.schedule-list .schedule-heading {
+.schedule-list .schedule-group {
   margin-bottom: var(--gap);
 }
 
@@ -1552,15 +1551,6 @@ body {
   outline-offset: -1px;
 }
 
-.schedule-heading {
-  margin: 0;
-  font-size: 11px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-faint);
-}
-
 .schedule-group {
   display: grid;
   grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
@@ -1569,11 +1559,6 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--panel);
-}
-
-/* Dimmed, because nothing in it has happened. */
-.schedule-group.is-upcoming {
-  opacity: 0.7;
 }
 
 .schedule-leader {

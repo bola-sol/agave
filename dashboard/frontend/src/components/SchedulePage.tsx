@@ -1,71 +1,45 @@
-import {
-  memo,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-  type RefObject,
-} from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { count, percent, shortKey, sol, solCompact } from "../format";
 import {
-  groupByLeader,
-  hasBegun,
   matchesQuery,
   prependedCount,
-  rowKey,
-  scheduleRows,
-  timeline,
-  type Led,
-  type LeaderGroup,
-  type TimelineSlot,
+  turnKey,
+  turnsOf,
+  type Turn,
+  type TurnSlot,
 } from "../schedule";
-import type { Peer, StakeSummary, UpcomingSlot } from "../types";
+import type { Peer, StakeSummary } from "../types";
 import { useStore } from "../useStore";
 import { Copyable } from "./Copyable";
 import { Logo } from "./Logo";
 
 /**
- * Where the boundary sits, in pixels from the top of the list.
- *
- * Pixels rather than a count of turns above it. Counting turns puts the
- * boundary wherever those particular turns happen to end, and the answer
- * changes every time the pair above it does — which is what left the Produced
- * line wandering. Given as an offset, the line has one place and everything
- * else moves around it. Roughly two turns.
- */
-const BOUNDARY_TOP_PX = 280;
-
-/**
- * Where the row indices start.
+ * Where the turn indices start.
  *
  * The virtualised list identifies rows by an index that only ever decreases as
  * turns arrive above them, so it has to begin high enough to keep counting down
  * for as long as the page is open. At a turn every second or so this is years.
  */
-const FIRST_ROW = 1_000_000;
+const FIRST_TURN = 1_000_000;
 
 /**
- * The leader schedule, with what each block turned out to contain.
+ * What each leader's turn at producing contained.
  *
  * The slots are the ones the sidebar lists and the block figures are the ones
  * the collector reads off each bank as it freezes, so this is a second reading
  * of what is on the wire rather than a second feed.
  *
- * Slots that have begun and slots the schedule promises are merged into one run
- * before being grouped, so a leader's turn is drawn once and whole. Split at the
- * slot being produced it appeared on both sides of the boundary, losing a row
- * above and gaining one below several times a turn.
+ * Newest first, and a turn appears whole the moment its first slot begins: all
+ * four slots share a leader by definition, so the rest are drawn as empty rows
+ * and filled where they stand. Nothing below a turn moves while it fills.
  *
- * The list is virtualised, and that is what keeps it still. Turns arrive above
- * whatever is being read two and a half times a second, and the list is *told*
- * how many rather than left to infer it from the page afterwards:
- * `firstItemIndex` drops by the number prepended and the view does not move.
- * Every attempt here to work that out from pixels found a new way to be wrong —
- * a seed that read as a page-length jump, two corrections in different render
- * phases, a smooth-scroll animation racing its own correction. Firedancer's
- * schedule is built on the same library for the same reason.
+ * The list is virtualised, and that is what holds it still. Turns arrive at the
+ * top faster than they can be read, and the list is *told* how many rather than
+ * left to infer it from the page afterwards: `firstItemIndex` drops by the
+ * number prepended and the view does not move. Every attempt here to work that
+ * out from pixels found a new way to be wrong. Firedancer's schedule is built
+ * on the same library for the same reason.
  */
 export function SchedulePage() {
   const store = useStore();
@@ -73,18 +47,13 @@ export function SchedulePage() {
   const [oursOnly, setOursOnly] = useState(false);
   const list = useRef<VirtuosoHandle>(null);
   const seen = useRef<string[]>([]);
-  const [firstRow, setFirstRow] = useState(FIRST_ROW);
-  // Following until the viewer scrolls for themselves, and again when they ask
-  // to come back. Read from what they did rather than from where the list is:
-  // the list moves on its own, and it moving is not them leaving.
-  const [following, setFollowing] = useState(true);
-  const [scroller, setScroller] = useState<HTMLElement | null>(null);
-  useUserScroll(scroller, () => setFollowing(false));
+  const [firstTurn, setFirstTurn] = useState(FIRST_TURN);
+  // The newest turn is the top of the list, so the list being at its top is the
+  // whole of what it means to be live. The list itself reports that.
+  const [atTop, setAtTop] = useState(true);
 
-  const completed = store.get<number>("summary", "completed_slot");
   const stake = store.get<StakeSummary>("summary", "stake");
   const peers = store.get<Peer[]>("peers", "all");
-  const upcoming = store.get<UpcomingSlot[]>("slot", "upcoming") ?? [];
   const slots = store.getSlots();
 
   const byIdentity = useMemo(
@@ -92,33 +61,18 @@ export function SchedulePage() {
     [peers],
   );
 
-  const rows = useMemo(() => {
-    // Published on the slow tier, so the front of it has usually happened.
-    const ahead =
-      completed === undefined ? upcoming : upcoming.filter((slot) => slot.slot > completed);
-    const groups = groupByLeader(timeline(slots, ahead)).filter(
-      (group) => matchesQuery(group, query) && (!oursOnly || group.mine),
-    );
-    return scheduleRows(groups);
-  }, [slots, upcoming, completed, query, oursOnly]);
+  const turns = useMemo(
+    () => turnsOf(slots).filter((turn) => matchesQuery(turn, query) && (!oursOnly || turn.mine)),
+    [slots, query, oursOnly],
+  );
 
-  // Counted during the render that introduces the rows, so the list is handed
+  // Counted during the render that introduces the turns, so the list is handed
   // them and the shift that goes with them together. Told afterwards, it would
   // draw them in the wrong place for a frame first.
-  const keys = rows.map(rowKey);
+  const keys = turns.map(turnKey);
   const prepended = prependedCount(seen.current, keys);
-  if (prepended > 0) setFirstRow((first) => first - prepended);
+  if (prepended > 0) setFirstTurn((first) => first - prepended);
   seen.current = keys;
-
-  const boundary = rows.findIndex((row) => row.kind === "heading" && row.label === "Produced");
-  // The boundary's place in the run of every row there has ever been, which is
-  // what says whether it really moved. Its place in the array shifts by one
-  // every time a turn arrives above it; add back what the list has been told to
-  // subtract and the two cancel, leaving a number that changes only when a turn
-  // crosses. `prepended` is included because the state holding it does not
-  // catch up until the next render.
-  const absolute = firstRow - prepended + boundary;
-  usePinToBoundary(list, boundary, absolute, following);
 
   return (
     <section className="schedule">
@@ -142,45 +96,36 @@ export function SchedulePage() {
       </div>
 
       <div className="schedule-list">
-        {!following && (
+        {!atTop && (
           <button
             type="button"
             className="scroll-top schedule-live"
-            onClick={() => setFollowing(true)}
+            onClick={() => list.current?.scrollToIndex({ align: "start", index: 0 })}
           >
-            Live <span aria-hidden="true">↕</span>
+            Live <span aria-hidden="true">↑</span>
           </button>
         )}
-        {rows.length <= 1 ? (
+        {turns.length === 0 ? (
           <div className="sidebar-empty">
             {slots.length === 0 ? "waiting for slots…" : "nothing matches that"}
           </div>
         ) : (
           <Virtuoso
             ref={list}
-            data={rows}
-            firstItemIndex={firstRow}
-            initialTopMostItemIndex={{
-              align: "start",
-              index: Math.max(0, boundary),
-              offset: -BOUNDARY_TOP_PX,
-            }}
-            computeItemKey={(_index, row) => rowKey(row)}
-            scrollerRef={(element) => setScroller(element instanceof HTMLElement ? element : null)}
+            data={turns}
+            firstItemIndex={firstTurn}
+            computeItemKey={(_index, turn) => turnKey(turn)}
+            atTopStateChange={setAtTop}
             // A screen either side, so a turn is measured before it is scrolled
             // into rather than resizing the list underneath the scroll.
             increaseViewportBy={600}
-            itemContent={(_index, row) =>
-              row.kind === "heading" ? (
-                <h2 className="schedule-heading">{row.label}</h2>
-              ) : (
-                <Group
-                  group={row.group}
-                  peer={row.group.leader ? byIdentity.get(row.group.leader) : undefined}
-                  totalStake={stake?.total_stake}
-                />
-              )
-            }
+            itemContent={(_index, turn) => (
+              <TurnCard
+                turn={turn}
+                peer={turn.leader ? byIdentity.get(turn.leader) : undefined}
+                totalStake={stake?.total_stake}
+              />
+            )}
           />
         )}
       </div>
@@ -189,25 +134,25 @@ export function SchedulePage() {
 }
 
 /**
- * One leader's turn, drawn the same whether or not it has started.
+ * One leader's turn, the same height from the moment it appears.
  *
  * Memoised on the slots themselves. The store replaces only the entries that
  * changed, so a turn whose slots have all settled is skipped rather than
  * rebuilt as the page updates around it.
  */
-const Group = memo(
-  function Group({
-    group,
+const TurnCard = memo(
+  function TurnCard({
+    turn,
     peer,
     totalStake,
   }: {
-    group: LeaderGroup<TimelineSlot>;
+    turn: Turn;
     peer: Peer | undefined;
     totalStake: number | undefined;
   }) {
     return (
-      <div className={`schedule-group${hasBegun(group) ? "" : " is-upcoming"}`}>
-        <GroupLeader group={group} peer={peer} totalStake={totalStake} />
+      <div className="schedule-group">
+        <TurnLeader turn={turn} peer={peer} totalStake={totalStake} />
         <div className="schedule-slots">
           <div className="schedule-row schedule-head">
             <span className="schedule-slot">Slot</span>
@@ -217,7 +162,7 @@ const Group = memo(
             <span>Duration</span>
             <span>Compute</span>
           </div>
-          {group.slots.map((slot) => (
+          {turn.slots.map((slot) => (
             <SlotRow key={slot.slot} slot={slot} />
           ))}
         </div>
@@ -227,17 +172,17 @@ const Group = memo(
   (before, after) =>
     before.peer === after.peer &&
     before.totalStake === after.totalStake &&
-    before.group.slots.length === after.group.slots.length &&
-    before.group.slots.every((slot, index) => slot.entry === after.group.slots[index]?.entry),
+    before.turn.slots.length === after.turn.slots.length &&
+    before.turn.slots.every((slot, index) => slot.entry === after.turn.slots[index]?.entry),
 );
 
 /** Leader, name and key, with what is known about the validator behind them. */
-function GroupLeader<T extends Led>({
-  group,
+function TurnLeader({
+  turn,
   peer,
   totalStake,
 }: {
-  group: LeaderGroup<T>;
+  turn: Turn;
   peer: Peer | undefined;
   totalStake: number | undefined;
 }) {
@@ -248,14 +193,14 @@ function GroupLeader<T extends Led>({
   return (
     <div className="schedule-leader">
       <div className="schedule-leader-name">
-        <Logo url={group.leader_icon} size={16} />
-        {group.leader_name ?? (group.leader ? shortKey(group.leader, 6, 5) : "unknown")}
-        {group.mine && <span className="schedule-mine">ours</span>}
+        <Logo url={turn.leader_icon} size={16} />
+        {turn.leader_name ?? (turn.leader ? shortKey(turn.leader, 6, 5) : "unknown")}
+        {turn.mine && <span className="schedule-mine">ours</span>}
       </div>
-      {group.leader && (
+      {turn.leader && (
         <Copyable
-          text={group.leader}
-          label={shortKey(group.leader, 8, 8)}
+          text={turn.leader}
+          label={shortKey(turn.leader, 8, 8)}
           className="schedule-leader-key"
         />
       )}
@@ -276,7 +221,7 @@ function GroupLeader<T extends Led>({
 }
 
 /** One slot, empty until it has been produced. */
-function SlotRow({ slot }: { slot: TimelineSlot }) {
+function SlotRow({ slot }: { slot: TurnSlot }) {
   const entry = slot.entry;
   const block = entry?.block ?? null;
   // Votes are what is left of the block once the rest is taken out. Clamped
@@ -305,70 +250,4 @@ function SlotRow({ slot }: { slot: TimelineSlot }) {
       </span>
     </div>
   );
-}
-
-/**
- * Calls back when the viewer scrolls the list themselves.
- *
- * Listens for the input rather than for the scrolling, because the list scrolls
- * on its own all the time — holding the boundary in place is scrolling — and a
- * position change says nothing about who wanted it. A wheel, a drag or a key
- * only ever comes from a person.
- */
-function useUserScroll(scroller: HTMLElement | null, leave: () => void): void {
-  useEffect(() => {
-    if (!scroller) return;
-    const options = { passive: true } as const;
-    scroller.addEventListener("wheel", leave, options);
-    scroller.addEventListener("touchmove", leave, options);
-    scroller.addEventListener("keydown", leave, options);
-    return () => {
-      scroller.removeEventListener("wheel", leave);
-      scroller.removeEventListener("touchmove", leave);
-      scroller.removeEventListener("keydown", leave);
-    };
-    // `leave` is a fresh closure each render and the listeners are cheap to
-    // swap, so it is left out rather than wrapped in a callback that would have
-    // to be kept in step by hand.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scroller]);
-}
-
-/**
- * Keeps the boundary at the same place on screen while the list changes.
- *
- * `absolute` decides when: it is unmoved by turns arriving above the boundary,
- * which the list absorbs on its own, and drops by one when a turn crosses —
- * which is the only thing that would otherwise walk the heading up the screen,
- * a turn's worth at a time until it left.
- *
- * `index` is the boundary itself, as a position in the row array — which is
- * what the list scrolls by, not the numbering it hands to `itemContent`, which
- * counts from `firstItemIndex` and would be a million rows past the end. It is
- * held at a fixed offset down the viewport rather than below a fixed number of
- * turns, because turns above it come and go and a count of them lands the line
- * somewhere different each time.
- *
- * Only while following. Once the viewer has scrolled somewhere, moving the list
- * under them would be the rudest thing this page could do.
- */
-function usePinToBoundary(
-  list: RefObject<VirtuosoHandle | null>,
-  index: number,
-  absolute: number,
-  following: boolean,
-): void {
-  const pinned = useRef<number | null>(null);
-
-  useLayoutEffect(() => {
-    if (!following) {
-      // Forgotten while away, so that coming back settles wherever the
-      // boundary has got to rather than where it was left.
-      pinned.current = null;
-      return;
-    }
-    if (absolute === pinned.current) return;
-    pinned.current = absolute;
-    list.current?.scrollToIndex({ align: "start", index, offset: -BOUNDARY_TOP_PX });
-  }, [list, index, absolute, following]);
 }
