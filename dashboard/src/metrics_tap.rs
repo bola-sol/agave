@@ -8,8 +8,14 @@
 //!
 //! The observer runs on whichever validator thread submitted the point, so what
 //! happens here is a string comparison against a handful of names and, for the
-//! few that match, a scan of their fields into atomics. Nothing allocates,
-//! nothing locks, and a point this module does not want costs one comparison.
+//! few that match, a scan of their fields into atomics. A point this module does
+//! not want costs one comparison, and nothing on that path allocates or locks.
+//!
+//! One point is the exception. The scheduler's per-slot counts are kept in a
+//! queue behind a lock rather than summed into atomics, because they are not
+//! summed at all — each belongs to one leader slot and is shown against it. That
+//! point arrives four times in every eight hundred slots on a small validator,
+//! where the rest of this reads several hundred a second.
 //!
 //! Totals only ever climb. The points themselves carry deltas — each one is what
 //! happened since the last was sent — so accumulating them gives a figure that
@@ -18,10 +24,14 @@
 
 use {
     serde::Serialize,
+    solana_clock::Slot,
     solana_metrics::datapoint::DataPoint,
-    std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+    std::{
+        collections::VecDeque,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
     },
 };
 
@@ -68,6 +78,24 @@ const PACKETS_COUNT: &str = "packets_count";
 /// has set their log level to.
 const SCHEDULER_COUNTS: &str = "banking_stage_scheduler_counts";
 
+/// The same twenty-one counters again, covering one leader slot rather than one
+/// second, and carrying the slot they belong to as a field.
+///
+/// Submitted only while this validator is producing: the slot on it comes from
+/// `decision.bank()`, which is `Some` for `Consume` and nothing else. So this
+/// point exists for exactly the slots this node led and for no others, which is
+/// what makes the produced block panel its home — on the schedule page, where
+/// all but a handful of the turns belong to other validators, there would be
+/// nothing to show against them.
+const SCHEDULER_SLOT_COUNTS: &str = "banking_stage_scheduler_slot_counts";
+
+/// The field naming the slot a point covers.
+const SLOT: &str = "slot";
+
+/// Leader slots kept. Matched to the produced block panel's own retention, so
+/// every block it can show has its waterfall for as long as it is shown.
+const SLOT_WATERFALLS: usize = 64;
+
 /// Running totals of the counters worth watching.
 #[derive(Debug, Default)]
 pub struct MetricsTap {
@@ -103,6 +131,23 @@ pub struct MetricsTap {
 
     /// Where the transactions handed to the banking stage ended up.
     pub scheduler: SchedulerCounters,
+
+    /// The same, per leader slot, for the slots this validator produced.
+    ///
+    /// The one thing here behind a lock rather than an atomic. It is taken once
+    /// per slot this node leads — four times in every eight hundred slots on a
+    /// small validator, against the several hundred points a second the rest of
+    /// this reads without locking anything — and held only long enough to push
+    /// a struct of counts or to copy the queue out.
+    slot_waterfalls: Mutex<VecDeque<SlotWaterfall>>,
+}
+
+/// One leader slot's waterfall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SlotWaterfall {
+    pub slot: Slot,
+    #[serde(flatten)]
+    pub counts: SchedulerTotals,
 }
 
 /// The banking stage scheduler's counters, in the order a transaction meets
@@ -261,45 +306,8 @@ impl MetricsTap {
             SHREDS_REPAIR => self.add_packets(&self.shreds_repair, point),
             GOSSIP_RECEIVER => self.add_packets(&self.packets_gossip, point),
             TPU_VOTE_RECEIVER => self.add_packets(&self.packets_tpu_vote, point),
-            SCHEDULER_COUNTS => {
-                let counters = &self.scheduler;
-                for (name, value) in &point.fields {
-                    // Named on the left as the scheduler names them and on the
-                    // right as the panel reads them. The two vocabularies are
-                    // kept apart deliberately: this is the only place that has
-                    // to change if a counter is renamed upstream, and every
-                    // rename upstream is silent — a field that stops matching
-                    // simply stops being counted.
-                    let counter = match *name {
-                        "num_received" => &counters.received,
-                        "num_dropped_on_receive" => &counters.not_held,
-                        "num_dropped_on_check_work_queue_full" => &counters.check_queue_full,
-                        "num_dropped_on_parsing_and_sanitization" => &counters.unparsable,
-                        "num_dropped_on_validate_locks" => &counters.bad_locks,
-                        "num_dropped_on_receive_compute_budget" => &counters.compute_budget,
-                        "num_dropped_on_receive_age" => &counters.too_old,
-                        "num_dropped_on_receive_already_processed" => &counters.already_processed,
-                        "num_dropped_on_receive_fee_payer" => &counters.fee_payer,
-                        "num_dropped_on_filter_key" => &counters.filtered,
-                        "num_dropped_on_nonce_dedup" => &counters.nonce_conflict,
-                        "num_buffered" => &counters.buffered,
-                        "num_dropped_on_capacity" => &counters.queue_full,
-                        "num_evicted_on_nonce_dedup" => &counters.nonce_evicted,
-                        "num_dropped_on_clear" => &counters.cleared,
-                        "num_dropped_on_clean" => &counters.cleaned,
-                        "num_scheduled" => &counters.scheduled,
-                        "num_unschedulable_conflicts" => &counters.blocked_conflicts,
-                        "num_unschedulable_threads" => &counters.blocked_threads,
-                        "num_finished" => &counters.finished,
-                        "num_retryable" => &counters.retried,
-                        // `min_priority` and `max_priority` are gauges rather
-                        // than counts, and accumulating them would be
-                        // meaningless.
-                        _ => continue,
-                    };
-                    add_field(counter, value);
-                }
-            }
+            SCHEDULER_COUNTS => self.scheduler.add_point(point),
+            SCHEDULER_SLOT_COUNTS => self.remember_slot(point),
             _ => (),
         }
     }
@@ -313,6 +321,59 @@ impl MetricsTap {
                 return;
             }
         }
+    }
+
+    /// Records one leader slot's waterfall.
+    ///
+    /// These counts are already one slot's own — the scheduler resets them as
+    /// it reports, and reports when the slot it is producing changes — so
+    /// unlike everything else here they are kept as they arrive rather than
+    /// accumulated and differenced later.
+    ///
+    /// A point without a readable slot is dropped. It has nowhere to be shown:
+    /// the panel joins these to blocks by slot number, and a waterfall that
+    /// cannot say which slot it describes belongs to none of them.
+    fn remember_slot(&self, point: &DataPoint) {
+        let Some(slot) = point
+            .fields
+            .iter()
+            .find(|(name, _)| *name == SLOT)
+            .and_then(|(_, value)| field_u64(value))
+        else {
+            return;
+        };
+
+        let counters = SchedulerCounters::default();
+        counters.add_point(point);
+        let waterfall = SlotWaterfall {
+            slot,
+            counts: counters.totals(),
+        };
+
+        let Ok(mut slots) = self.slot_waterfalls.lock() else {
+            // A panicking observer would have poisoned this. The dashboard
+            // losing a panel is not worth taking the validator down over.
+            return;
+        };
+        // Replaced rather than appended if the slot is already held, which
+        // needs the scheduler to report the same slot twice. Appending would
+        // leave two rows for one slot and push a real one off the end.
+        if let Some(held) = slots.iter_mut().find(|held| held.slot == slot) {
+            *held = waterfall;
+            return;
+        }
+        slots.push_back(waterfall);
+        while slots.len() > SLOT_WATERFALLS {
+            slots.pop_front();
+        }
+    }
+
+    /// The leader slots held, oldest first.
+    pub fn slot_waterfalls(&self) -> Vec<SlotWaterfall> {
+        self.slot_waterfalls
+            .lock()
+            .map(|slots| slots.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// The totals as they stand, read together so a reading is coherent enough
@@ -332,6 +393,47 @@ impl MetricsTap {
 }
 
 impl SchedulerCounters {
+    /// Adds the counts one scheduler point carries.
+    ///
+    /// Both of the scheduler's points — the one covering an interval and the
+    /// one covering a single leader slot — carry the same twenty-one fields
+    /// under the same names, so the mapping between the scheduler's vocabulary
+    /// and the panel's lives here once. Two copies of it would be two places
+    /// for a pair to be crossed over, and a crossed pair is invisible: the
+    /// numbers would still add up, against the wrong labels.
+    fn add_point(&self, point: &DataPoint) {
+        for (name, value) in &point.fields {
+            let counter = match *name {
+                "num_received" => &self.received,
+                "num_dropped_on_receive" => &self.not_held,
+                "num_dropped_on_check_work_queue_full" => &self.check_queue_full,
+                "num_dropped_on_parsing_and_sanitization" => &self.unparsable,
+                "num_dropped_on_validate_locks" => &self.bad_locks,
+                "num_dropped_on_receive_compute_budget" => &self.compute_budget,
+                "num_dropped_on_receive_age" => &self.too_old,
+                "num_dropped_on_receive_already_processed" => &self.already_processed,
+                "num_dropped_on_receive_fee_payer" => &self.fee_payer,
+                "num_dropped_on_filter_key" => &self.filtered,
+                "num_dropped_on_nonce_dedup" => &self.nonce_conflict,
+                "num_buffered" => &self.buffered,
+                "num_dropped_on_capacity" => &self.queue_full,
+                "num_evicted_on_nonce_dedup" => &self.nonce_evicted,
+                "num_dropped_on_clear" => &self.cleared,
+                "num_dropped_on_clean" => &self.cleaned,
+                "num_scheduled" => &self.scheduled,
+                "num_unschedulable_conflicts" => &self.blocked_conflicts,
+                "num_unschedulable_threads" => &self.blocked_threads,
+                "num_finished" => &self.finished,
+                "num_retryable" => &self.retried,
+                // `min_priority` and `max_priority` are gauges rather than
+                // counts, and `slot` names the point rather than measuring
+                // anything. None of the three belongs in a total.
+                _ => continue,
+            };
+            add_field(counter, value);
+        }
+    }
+
     /// The counters as they stand.
     fn totals(&self) -> SchedulerTotals {
         let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
@@ -676,6 +778,75 @@ mod tests {
         assert_eq!(step.plus(&step).received, 300);
         // Backwards, which only happens if a counter was reset under us.
         assert_eq!(first.since(&second).received, 0);
+    }
+
+    /// The per-slot point: the same counters, plus the slot they belong to.
+    fn slot_point(slot: &str, fields: &[(&'static str, &str)]) -> DataPoint {
+        let mut all = vec![("slot", slot)];
+        all.extend_from_slice(fields);
+        named(SCHEDULER_SLOT_COUNTS, &all)
+    }
+
+    #[test]
+    fn test_a_leader_slot_is_kept_whole_rather_than_accumulated() {
+        // These are already one slot's own counts — the scheduler resets them
+        // as it reports — so they are held as they arrived. Adding them to the
+        // running totals the way every other point here is handled would give
+        // each led slot's work twice.
+        let tap = MetricsTap::default();
+        tap.observe(&slot_point(
+            "430789128",
+            &[("num_received", "500i"), ("num_buffered", "80i")],
+        ));
+        tap.observe(&slot_point(
+            "430789129",
+            &[("num_received", "600i"), ("num_buffered", "90i")],
+        ));
+
+        let held = tap.slot_waterfalls();
+        assert_eq!(held.len(), 2);
+        assert_eq!(held[0].slot, 430_789_128);
+        assert_eq!(held[0].counts.received, 500);
+        assert_eq!(held[1].counts.buffered, 90);
+        // And the interval totals are untouched: this point is not one of them.
+        assert_eq!(tap.counters().scheduler.received, 0);
+    }
+
+    #[test]
+    fn test_a_waterfall_with_no_slot_is_dropped() {
+        // It has nowhere to go. The panel joins these to blocks by slot number,
+        // so one that cannot say which slot it describes belongs to none.
+        let tap = MetricsTap::default();
+        tap.observe(&named(SCHEDULER_SLOT_COUNTS, &[("num_received", "500i")]));
+        assert!(tap.slot_waterfalls().is_empty());
+    }
+
+    #[test]
+    fn test_a_slot_reported_twice_is_replaced_rather_than_repeated() {
+        // Appending would leave two rows describing one slot and push a real
+        // one off the end of the queue.
+        let tap = MetricsTap::default();
+        tap.observe(&slot_point("100", &[("num_received", "5i")]));
+        tap.observe(&slot_point("100", &[("num_received", "9i")]));
+
+        let held = tap.slot_waterfalls();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].counts.received, 9);
+    }
+
+    #[test]
+    fn test_only_the_newest_leader_slots_are_kept() {
+        // Matched to what the produced block panel retains, so every block it
+        // can show still has its waterfall, and nothing is held for a block
+        // that has already scrolled out of reach.
+        let tap = MetricsTap::default();
+        for slot in 0..u64::try_from(SLOT_WATERFALLS).unwrap().saturating_add(10) {
+            tap.observe(&slot_point(&format!("{slot}"), &[("num_received", "1i")]));
+        }
+
+        let held = tap.slot_waterfalls();
+        assert_eq!(held.len(), SLOT_WATERFALLS);
+        assert_eq!(held[0].slot, 10);
     }
 
     #[test]

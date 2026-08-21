@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { blockTime, count, percent, sol } from "../format";
-import type { ProducedBlock } from "../types";
+import type { ProducedBlock, SlotWaterfall } from "../types";
 import { useStore } from "../useStore";
 import { Copyable } from "./Copyable";
-import { Card, Meter } from "./primitives";
+import { Card, Explain, Meter } from "./primitives";
+import { WaterfallRows } from "./WaterfallRows";
 
 /**
  * Detail for the blocks this validator produced.
@@ -16,7 +17,16 @@ import { Card, Meter } from "./primitives";
 export function ProducedBlocksCard() {
   const store = useStore();
   const blocks = store.get<ProducedBlock[]>("summary", "produced_blocks");
+  const waterfalls = store.get<SlotWaterfall[]>("summary", "slot_waterfalls");
   const [open, setOpen] = useState<number | null>(null);
+
+  // Joined by slot rather than nested on the block, because the two are built
+  // on different threads and either can arrive first. A block whose waterfall
+  // has not landed yet simply has none, and gains it on the next tick.
+  const bySlot = useMemo(
+    () => new Map((waterfalls ?? []).map((slot) => [slot.slot, slot])),
+    [waterfalls],
+  );
 
   if (!blocks || blocks.length === 0) return null;
 
@@ -25,11 +35,15 @@ export function ProducedBlocksCard() {
 
   return (
     <Card title="Produced Blocks" className="produced-body">
-      <div className="produced">
+      {/* The list grows while a block is open. Its detail is far taller than
+          the six-row window this scrolls in normally, and the waterfall inside
+          it is most of that. */}
+      <div className={`produced${open === null ? "" : " is-expanded"}`}>
         {newest.map((block) => (
           <BlockRow
             key={block.slot}
             block={block}
+            waterfall={bySlot.get(block.slot)}
             open={open === block.slot}
             onToggle={() => setOpen(open === block.slot ? null : block.slot)}
           />
@@ -44,10 +58,12 @@ export function ProducedBlocksCard() {
 
 function BlockRow({
   block,
+  waterfall,
   open,
   onToggle,
 }: {
   block: ProducedBlock;
+  waterfall: SlotWaterfall | undefined;
   open: boolean;
   onToggle: () => void;
 }) {
@@ -84,6 +100,8 @@ function BlockRow({
             <Figure label="Base fees" value={`${sol(block.total_fees - block.priority_fees, 6)} SOL`} />
             <Figure label="Priority fees" value={`${sol(block.priority_fees, 6)} SOL`} />
           </div>
+          {waterfall && <SlotWaterfallDetail waterfall={waterfall} />}
+
           {/* The block's identity, together: which slot, when, and its hash.
               The slot stays in the row above as well, since that is the only
               thing naming a row while it is shut. */}
@@ -101,6 +119,29 @@ function BlockRow({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * What the scheduler did with the transactions it was offered for this slot.
+ *
+ * The same rows as the live waterfall on the front page, over one slot rather
+ * than a rolling window — the scheduler counts each led slot separately and
+ * says which slot each set belongs to, so this is that slot's own account
+ * rather than a share of a longer period that happens to contain it.
+ *
+ * Only ever drawn under a block this validator produced, which is the only
+ * place the figures exist: the counters are tagged with the bank being
+ * produced, and there is no bank unless we are producing it.
+ */
+function SlotWaterfallDetail({ waterfall }: { waterfall: SlotWaterfall }) {
+  return (
+    <div className="produced-waterfall">
+      <Explain text="Every transaction the banking stage was handed during this slot, and what became of it. The indented rows are the ones that got no further, and why. Received is exactly buffered plus those first reasons; the later stages do not add up the same way, because the queue holds transactions across slots and some of what was scheduled here arrived before this slot began.">
+        <span className="produced-waterfall-title">Scheduler</span>
+      </Explain>
+      <WaterfallRows waterfall={waterfall} />
     </div>
   );
 }

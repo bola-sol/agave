@@ -16,7 +16,7 @@ use {
     crate::{
         collect::{CATCH_UP_SLOTS_PER_SECOND, system_time_nanos},
         context::{DashboardContext, StartupProgressFn},
-        metrics_tap::{MetricsTap, SchedulerTotals, TapCounters},
+        metrics_tap::{MetricsTap, SchedulerTotals, SlotWaterfall, TapCounters},
         net_stats::{self, NetCounters},
         proto::{Debounced, Publisher, TOPIC_SUMMARY},
         udp_drops::{self, PortCounters, PortWindow},
@@ -317,6 +317,7 @@ pub struct Meters {
     /// One interval's worth of the scheduler's counters per sample.
     waterfall_window: VecDeque<SchedulerTotals>,
     waterfall: Debounced<Option<SchedulerTotals>>,
+    slot_waterfalls: Debounced<Vec<SlotWaterfall>>,
 }
 
 impl Meters {
@@ -352,6 +353,7 @@ impl Meters {
             shreds: Debounced::default(),
             waterfall_window: VecDeque::with_capacity(WATERFALL_WINDOW),
             waterfall: Debounced::default(),
+            slot_waterfalls: Debounced::default(),
         }
     }
 
@@ -476,6 +478,23 @@ impl Meters {
         let waterfall = (totals.received > 0).then_some(totals);
         self.waterfall
             .publish(&self.publisher, TOPIC_SUMMARY, "waterfall", waterfall);
+
+        // The per-slot points ride along here rather than being joined onto the
+        // produced blocks before sending. Those are built on the other thread
+        // and published only when one is captured, and these arrive from the
+        // scheduler moments after the bank freezes — close enough that either
+        // could be first. Sent as their own list and joined by slot in the
+        // browser, neither has to wait for the other, and a point that arrives
+        // late is picked up on the next tick rather than missed for good.
+        //
+        // Debounced, so the usual tick between leader slots sends nothing: the
+        // list only changes when this validator has produced.
+        self.slot_waterfalls.publish(
+            &self.publisher,
+            TOPIC_SUMMARY,
+            "slot_waterfalls",
+            self.metrics_tap.slot_waterfalls(),
+        );
     }
 
     fn collect_clock(&self) {

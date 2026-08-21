@@ -227,6 +227,23 @@ export interface Waterfall {
   retried: number;
 }
 
+/**
+ * One leader slot's waterfall, sent as its own list rather than nested on the
+ * produced block it belongs to.
+ *
+ * The two are built on different threads and arrive moments apart in either
+ * order — the block when its bank freezes, this when the scheduler notices the
+ * leader slot has changed — so they are joined here by slot number instead of
+ * one waiting on the other.
+ *
+ * Only ever present for slots this validator led: the counters behind it are
+ * tagged with the bank being produced, and there is no bank unless we are the
+ * one producing.
+ */
+export interface SlotWaterfall extends Waterfall {
+  slot: number;
+}
+
 export interface IngestSummary {
   window_seconds: number;
   paths: IngestPath[];

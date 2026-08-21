@@ -1,8 +1,9 @@
-import { count, percent } from "../format";
+import { percent } from "../format";
 import type { Waterfall } from "../types";
 import { useStore } from "../useStore";
-import { scheduledShare, waterfallRows, type WaterfallRow } from "../waterfall";
+import { scheduledShare } from "../waterfall";
 import { Card, Explain } from "./primitives";
+import { WaterfallRows } from "./WaterfallRows";
 
 /**
  * Where the transactions this validator was handed actually went.
@@ -25,7 +26,6 @@ export function WaterfallCard() {
   const waterfall = store.get<Waterfall>("summary", "waterfall");
   if (!waterfall) return null;
 
-  const rows = waterfallRows(waterfall);
   const kept = scheduledShare(waterfall);
 
   return (
@@ -39,11 +39,7 @@ export function WaterfallCard() {
         </span>
       </div>
 
-      <div className="waterfall">
-        {rows.map((row) => (
-          <Row key={row.key} row={row} />
-        ))}
-      </div>
+      <WaterfallRows waterfall={waterfall} />
 
       <div className="card-footnote">
         Five minutes of the banking stage scheduler's own counters. Rows reading
@@ -51,33 +47,5 @@ export function WaterfallCard() {
         zero can be told from a figure nothing measures.
       </div>
     </Card>
-  );
-}
-
-/**
- * One row: a stage, a loss under it, or a note.
- *
- * The bar is always a share of what was received, never of the stage above it,
- * so lengths are comparable the whole way down instead of each section being
- * renormalised against its own heading.
- */
-function Row({ row }: { row: WaterfallRow }) {
-  return (
-    <div className={`waterfall-row is-${row.kind}`}>
-      <Explain text={row.explain} className="waterfall-label">
-        {row.label}
-      </Explain>
-      <span className="waterfall-count">{count(row.count)}</span>
-      <span className="waterfall-bar" aria-hidden="true">
-        {/* Floored above nought so that a row which fired at all leaves a mark
-            rather than rounding away to an empty track, which reads the same as
-            not having fired. */}
-        <span
-          className="waterfall-fill"
-          style={{ width: `${row.count > 0 ? Math.max(1, row.share * 100) : 0}%` }}
-        />
-      </span>
-      <span className="waterfall-share">{row.count > 0 ? percent(row.share, 1) : ""}</span>
-    </div>
   );
 }

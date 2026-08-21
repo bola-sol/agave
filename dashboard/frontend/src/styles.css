@@ -1246,6 +1246,15 @@ body {
   scrollbar-color: var(--border) transparent;
 }
 
+/* Shut, this list is a short scroller of one-line rows and six of them is
+   plenty. Open, one of those rows carries several hundred pixels of detail, and
+   reading that through a two-hundred-and-sixty-pixel window is worse than a
+   taller card. Grows to hold it, and capped against the viewport so it can
+   never be taller than the screen it is being read on. */
+.produced.is-expanded {
+  max-height: min(780px, 78vh);
+}
+
 .produced-head {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 6em 5.5em 5em;
@@ -1464,6 +1473,26 @@ body {
   font-size: 9.5px;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
+}
+
+/* The same rows again inside an expanded produced block, one slot's worth
+   rather than a rolling window. Separated from the figures above it by a rule
+   rather than a heading alone, because the two are counting different things:
+   the grid is what landed in the block, this is everything that was offered. */
+.produced-waterfall {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  margin-top: 2px;
+  border-top: 1px solid var(--border);
+}
+
+.produced-waterfall-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
 }
 
 @media (max-width: 700px) {
