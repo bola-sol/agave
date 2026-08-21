@@ -24,6 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 soketto = { workspace = true }
 solana-account = { workspace = true }
+solana-accounts-db = { workspace = true }
 solana-clock = { workspace = true }
 solana-cluster-type = { workspace = true }
 solana-config-interface = { workspace = true }

@@ -71,8 +71,7 @@ const UPCOMING_SLOTS: u64 = 32;
 /// four slots in every eight hundred, so this is hours of them.
 const PRODUCED_BLOCKS: usize = 64;
 
-/// Slots of arrival times kept, about five minutes of them. Matches
-/// Firedancer, whose dashboard averages over the same 750.
+/// Slots of arrival times kept, about five minutes of them.
 ///
 /// This is what is retained, not what is reported. Readings are taken over
 /// spans of it: the strip's readout wants a figure that follows the cluster
@@ -90,8 +89,7 @@ const SLOT_TIME_WINDOW_SLOTS: usize = 750;
 const SLOT_READOUT_SPAN_MS: u64 = 60_000;
 
 /// How near the highest slot held replay must come before this validator is
-/// following the cluster rather than replaying towards it. Firedancer uses the
-/// same few slots against its highest turbine slot.
+/// following the cluster rather than replaying towards it.
 const CAUGHT_UP_SLOT_DISTANCE: u64 = 4;
 
 /// Samples the window must already hold before that distance is believed.
@@ -100,8 +98,7 @@ const CAUGHT_UP_SLOT_DISTANCE: u64 = 4;
 /// snapshot and received nothing sits at zero distance, and would mark itself
 /// caught up immediately before replaying half a million slots. Requiring the
 /// window to have filled first means the distance is only read once slots have
-/// been arriving for a while, which is what Firedancer's full-turbine-history
-/// condition does for the same reason.
+/// been arriving for a while.
 const CAUGHT_UP_MIN_SAMPLES: usize = 64;
 
 /// Slots skipped past when the marker is set, so that the interval straddling
@@ -610,10 +607,9 @@ impl Collector {
     /// the cluster, and averaged in they drag the epoch countdown down for as
     /// long as they stay in the window.
     ///
-    /// Firedancer solves this with a one-shot marker: `slot_caught_up` is set
-    /// when its highest turbine slot comes within a few slots of what it has
-    /// replayed, and the average is then truncated to slots after it. This is
-    /// the same shape, and deliberately so. An earlier attempt here tested the
+    /// The fix is a one-shot marker, set when the highest slot held comes
+    /// within a few slots of what has been replayed, after which the average is
+    /// truncated to the slots that follow it. An earlier attempt here tested the
     /// replay rate continuously and cleared the window whenever it looked like
     /// a burst, which fed back on itself: clearing the window shortened it,
     /// a shorter window is more easily tripped, and the reading never settled.

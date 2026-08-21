@@ -22,11 +22,10 @@ import { WaterfallRows } from "./WaterfallRows";
  * They should be close. They are not the same number and the card does not
  * pretend otherwise.
  *
- * One stage of Firedancer's equivalent has no section here. They resolve
- * address lookup tables in a step of their own; Agave does it inside the
- * scheduler's own receive checks and counts a failure under the same counter as
- * a malformed transaction, so it is already inside the "would not parse" row
- * and cannot be separated without a new counter upstream.
+ * Address lookup table resolution has no section of its own. Agave does it
+ * inside the scheduler's receive checks and counts a failure under the same
+ * counter as a malformed transaction, so it is already inside the "would not
+ * parse" row and cannot be split out without a new counter upstream.
  */
 export function WaterfallCard() {
   const store = useStore();
@@ -41,7 +40,7 @@ export function WaterfallCard() {
   return (
     <Card title="TPU Waterfall" className="waterfall-body">
       <div className="waterfall-headline">
-        <Explain text="Of the transactions this validator kept rather than forwarded, the share it managed to hand to a worker. The received count is a poor headline on its own — it is dominated by traffic the node was never going to execute — where this says whether it kept up with what it did take. Absent when it has held nothing recently, which is the ordinary state of a validator that has not been leader.">
+        <Explain text="Of the transactions this validator kept rather than forwarded, the share it managed to hand to a worker. The received count makes a poor headline on its own, being dominated by traffic the node was never going to execute. This says whether it kept up with what it did take. It is absent when the node has held nothing recently, which is the ordinary state of a validator that has not been leader.">
           <span className="waterfall-headline-label">Scheduled of held</span>
         </Explain>
         <span className="waterfall-headline-value">{kept === null ? "—" : percent(kept, 1)}</span>

@@ -144,10 +144,9 @@ const SLOT_WATERFALLS: usize = 64;
 
 /// What the accounts database read, wrote, and is holding.
 ///
-/// Firedancer's equivalent panel draws disk throughput in bytes a second both
-/// ways. Agave counts its reads in accounts and its writes in both, so the read
-/// side here is a rate of accounts rather than of bytes — there is no byte
-/// counter on the load path to build one from.
+/// The read side is a rate of accounts rather than of bytes. Agave counts what
+/// it loaded in accounts and what it flushed in both, and there is no byte
+/// counter anywhere on the load path to build a read throughput from.
 ///
 /// Deliberately not `/proc/self/io`, which would give real bytes for both and
 /// attribute the blockstore's writes to the accounts database while it was at

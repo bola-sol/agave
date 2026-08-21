@@ -15,11 +15,10 @@ import { Card, Explain, Meter, Stat } from "./primitives";
  * it is written only when an eviction runs, so the highest reading across the
  * window is taken rather than the latest.
  *
- * Firedancer's equivalent panel shows this as bytes used against a total,
- * because their cache is a fixed-size arena. Agave's is a map on the heap
- * bounded by a number of entries and with no byte budget at all, so there is no
- * honest way to draw the same gauge, and entries against the entry limit is
- * what stands in for it.
+ * Size is shown in entries rather than in bytes. This cache is a map on the
+ * heap, bounded by how many entries it may hold and given no byte budget at
+ * all, so entries against that limit is the only fill figure it can honestly
+ * report.
  */
 export function ProgramCacheCard() {
   const store = useStore();
@@ -43,7 +42,7 @@ export function ProgramCacheCard() {
         />
         <Stat
           label="Loads"
-          explain="Every program lookup replay made in the window, hits and misses together. Small numbers here are ordinary — a block touches few distinct programs — which is why the rate is summed over a minute rather than read off a single slot."
+          explain="Every program lookup replay made in the window, hits and misses together. Small numbers are ordinary, since a block touches few distinct programs. That is why the rate is summed over a minute rather than read off a single slot."
           value={count(cache.looked_up)}
         />
       </div>
@@ -67,7 +66,7 @@ export function ProgramCacheCard() {
       <div className="stat-grid">
         <Stat
           label="Insertions"
-          explain="Programs compiled and added to the cache in the window. Lost insertions are ones thrown away because the fork they were compiled for had gone by the time they were ready — wasted work, but not a fault."
+          explain="Programs compiled and added to the cache in the window. Lost insertions are ones thrown away because the fork they were compiled for had gone by the time they were ready. Wasted work, but not a fault."
           value={count(cache.insertions)}
           sub={cache.lost_insertions > 0 ? `${count(cache.lost_insertions)} lost` : undefined}
         />
@@ -79,7 +78,7 @@ export function ProgramCacheCard() {
         />
         <Stat
           label="One-hit wonders"
-          explain="Programs compiled, used once, and then evicted. Cache space and compilation time spent for a single use. A high figure alongside a healthy hit rate is ordinary — the network has a long tail of rarely used programs."
+          explain="Programs compiled, used once, and then evicted. Cache space and compilation time spent for a single use. A high figure alongside a healthy hit rate is ordinary, because the network has a long tail of rarely used programs."
           value={count(cache.one_hit_wonders)}
         />
         <Stat
