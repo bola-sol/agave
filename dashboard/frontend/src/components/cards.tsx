@@ -1,6 +1,5 @@
 import { count, decimal, duration, percent, solCompact } from "../format";
 import type {
-  AccountsCache,
   EpochInfo,
   Health,
   Shreds,
@@ -55,7 +54,6 @@ export function StatusCard() {
   const slotDurationNanos = store.get<number>("summary", "estimated_slot_duration_nanos");
   const startup = store.get<StartupProgress>("summary", "startup_progress");
   const skip = store.get<SkipRate>("summary", "skip_rate");
-  const accountsCache = store.get<AccountsCache | null>("summary", "accounts_cache");
   const shreds = store.get<Shreds | null>("summary", "shreds");
 
   // The leader countdown means nothing until the validator is running, so show
@@ -95,16 +93,6 @@ export function StatusCard() {
           tone={health?.replay === "running" ? "good" : "bad"}
         />
         <Stat label="Skip rate" value={percent(skip?.rate)} />
-        <Stat
-          label="Accounts cache"
-          explain="How often an account replay needed was already in memory rather than read from disk, over the last minute. Replay waits on every account a transaction touches, so a low rate slows every block this validator replays and every block it produces."
-          value={percent(accountsCache?.hit_rate ?? null, 1)}
-          sub={
-            accountsCache
-              ? `${count(accountsCache.read)} reads · ${count(accountsCache.evictions)} evicted`
-              : undefined
-          }
-        />
         <Stat
           label="Repaired shreds"
           explain="The share of shreds this validator had to ask another node for because turbine never delivered them, over the last five minutes. Turbine should carry nearly all of them; a rising share means the cluster is not reaching this node, which shows here before it shows in the skip rate."

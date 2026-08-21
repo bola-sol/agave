@@ -78,6 +78,15 @@ const PACKETS_COUNT: &str = "packets_count";
 /// has set their log level to.
 const SCHEDULER_COUNTS: &str = "banking_stage_scheduler_counts";
 
+/// Where the accounts database served reads from, and what it wrote.
+///
+/// Three points rather than one, because the accounts database reports what it
+/// is doing in three places: what it loaded and from where, how big its storage
+/// files are, and what it flushed to them.
+const ACCOUNTS_LOADS: &str = "accounts_db_load_accounts";
+const ACCOUNTS_STORES: &str = "accounts_db-stores";
+const ACCOUNTS_FLUSH: &str = "accounts_db-flush_accounts_cache";
+
 /// The program cache's own account of itself, reported once per bank with its
 /// counters reset as it reports — so each point is one slot's work.
 ///
@@ -132,6 +141,39 @@ const SLOT: &str = "slot";
 /// Leader slots kept. Matched to the produced block panel's own retention, so
 /// every block it can show has its waterfall for as long as it is shown.
 const SLOT_WATERFALLS: usize = 64;
+
+/// What the accounts database read, wrote, and is holding.
+///
+/// Firedancer's equivalent panel draws disk throughput in bytes a second both
+/// ways. Agave counts its reads in accounts and its writes in both, so the read
+/// side here is a rate of accounts rather than of bytes — there is no byte
+/// counter on the load path to build one from.
+///
+/// Deliberately not `/proc/self/io`, which would give real bytes for both and
+/// attribute the blockstore's writes to the accounts database while it was at
+/// it. Process-wide disk figures are worth having; they are not this card.
+#[derive(Debug, Default)]
+pub struct AccountsCounters {
+    /// Accounts served from each of the three places a read can be answered
+    /// from. The last is the one that touches a file.
+    pub loaded_from_write_cache: AtomicU64,
+    pub loaded_from_read_cache: AtomicU64,
+    pub loaded_from_storage: AtomicU64,
+
+    /// Accounts written out of the cache to storage, and their size.
+    pub stored_accounts: AtomicU64,
+    pub stored_bytes: AtomicU64,
+
+    /// Levels rather than counts: how much storage exists and how much of it is
+    /// still live. The difference between them is the fragmentation that shrink
+    /// exists to reclaim.
+    pub storage_bytes: AtomicU64,
+    pub storage_alive_bytes: AtomicU64,
+    pub storage_count: AtomicU64,
+    /// Bytes held by the read cache, and entries in it.
+    pub cache_bytes: AtomicU64,
+    pub cache_entries: AtomicU64,
+}
 
 /// How the program cache is faring: what replay asked of it, and what it lost.
 #[derive(Debug, Default)]
@@ -259,6 +301,9 @@ pub struct MetricsTap {
     pub packets_gossip: AtomicU64,
     pub packets_tpu_vote: AtomicU64,
 
+    /// What the accounts database read, wrote, and is holding.
+    pub accounts: AccountsCounters,
+
     /// How the program cache is faring.
     pub program_cache: ProgramCacheCounters,
 
@@ -374,6 +419,15 @@ pub struct SchedulerCounters {
 /// scheduler's, and twenty-one lines of assigning one to the other would be
 /// twenty-one chances to cross a pair over silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct AccountsTotals {
+    pub loaded_from_write_cache: u64,
+    pub loaded_from_read_cache: u64,
+    pub loaded_from_storage: u64,
+    pub stored_accounts: u64,
+    pub stored_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ProgramCacheTotals {
     pub hits: u64,
     pub misses: u64,
@@ -450,6 +504,13 @@ pub struct TapCounters {
     pub packets_gossip: u64,
     pub packets_tpu_vote: u64,
     pub scheduler: SchedulerTotals,
+    pub accounts: AccountsTotals,
+    /// Levels, read as they stand rather than differenced.
+    pub accounts_storage_bytes: u64,
+    pub accounts_storage_alive_bytes: u64,
+    pub accounts_storage_count: u64,
+    pub accounts_cache_bytes: u64,
+    pub accounts_cache_entries: u64,
     pub program_cache: ProgramCacheTotals,
     /// Entries loaded when an eviction last ran. A level, so it is read as it
     /// stands rather than differenced.
@@ -480,12 +541,15 @@ impl MetricsTap {
     /// Adds what one point carries, if it is one of the few worth reading.
     ///
     /// A point this module does not want leaves after the match below, which is
-    /// a comparison against eleven names. Everything the validator measures about
+    /// a comparison against fourteen names. Everything the validator measures about
     /// itself arrives here, so that is the cost paid on every one of them.
     fn observe(&self, point: &DataPoint) {
         match point.name {
             ACCOUNTS_DB_TIMINGS => {
                 for (name, value) in &point.fields {
+                    // The same point carries the cache's size and entry
+                    // count, which are levels rather than counts.
+                    self.accounts.add_point(point);
                     let counter = match *name {
                         "read_only_accounts_cache_hits" => &self.accounts_cache_hits,
                         "read_only_accounts_cache_misses" => &self.accounts_cache_misses,
@@ -501,6 +565,7 @@ impl MetricsTap {
             TPU_VOTE_RECEIVER => self.add_packets(&self.packets_tpu_vote, point),
             SCHEDULER_COUNTS => self.scheduler.add_point(point),
             SCHEDULER_SLOT_COUNTS => self.remember_slot(point),
+            ACCOUNTS_LOADS | ACCOUNTS_STORES | ACCOUNTS_FLUSH => self.accounts.add_point(point),
             PROGRAM_CACHE => self.program_cache.add_point(point),
             QUIC_TPU => self.quic.add_point(point),
             TPU_VERIFIER => self.verify.add_point(point),
@@ -585,11 +650,64 @@ impl MetricsTap {
             packets_gossip: self.packets_gossip.load(Ordering::Relaxed),
             packets_tpu_vote: self.packets_tpu_vote.load(Ordering::Relaxed),
             scheduler: self.scheduler.totals(),
+            accounts: self.accounts.totals(),
+            accounts_storage_bytes: self.accounts.storage_bytes.load(Ordering::Relaxed),
+            accounts_storage_alive_bytes: self.accounts.storage_alive_bytes.load(Ordering::Relaxed),
+            accounts_storage_count: self.accounts.storage_count.load(Ordering::Relaxed),
+            accounts_cache_bytes: self.accounts.cache_bytes.load(Ordering::Relaxed),
+            accounts_cache_entries: self.accounts.cache_entries.load(Ordering::Relaxed),
             program_cache: self.program_cache.totals(),
             program_cache_water_level: self.program_cache.water_level.load(Ordering::Relaxed),
             quic: self.quic.totals(),
             verify: self.verify.totals(),
             executed: self.executed.totals(),
+        }
+    }
+}
+
+impl AccountsCounters {
+    /// Adds one of the three accounts points.
+    ///
+    /// Matched on field name across all three rather than one method each: the
+    /// names do not collide, and a single mapping is one place to look for
+    /// where a figure on the card comes from.
+    fn add_point(&self, point: &DataPoint) {
+        for (name, value) in &point.fields {
+            // Levels first. These say how things stand rather than what has
+            // happened since the last point, so they are replaced, not summed.
+            let gauge = match *name {
+                "total_bytes" => Some(&self.storage_bytes),
+                "total_alive_bytes" => Some(&self.storage_alive_bytes),
+                "total_count" => Some(&self.storage_count),
+                "read_only_accounts_cache_data_size" => Some(&self.cache_bytes),
+                "read_only_accounts_cache_entries" => Some(&self.cache_entries),
+                _ => None,
+            };
+            if let Some(gauge) = gauge {
+                set_field(gauge, value);
+                continue;
+            }
+
+            let counter = match *name {
+                "num_loaded_from_write_cache" => &self.loaded_from_write_cache,
+                "num_loaded_from_read_cache" => &self.loaded_from_read_cache,
+                "num_loaded_from_index_storage" => &self.loaded_from_storage,
+                "num_accounts_stored" => &self.stored_accounts,
+                "account_bytes_stored" => &self.stored_bytes,
+                _ => continue,
+            };
+            add_field(counter, value);
+        }
+    }
+
+    fn totals(&self) -> AccountsTotals {
+        let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        AccountsTotals {
+            loaded_from_write_cache: read(&self.loaded_from_write_cache),
+            loaded_from_read_cache: read(&self.loaded_from_read_cache),
+            loaded_from_storage: read(&self.loaded_from_storage),
+            stored_accounts: read(&self.stored_accounts),
+            stored_bytes: read(&self.stored_bytes),
         }
     }
 }
@@ -832,6 +950,14 @@ macro_rules! counter_arithmetic {
         }
     };
 }
+
+counter_arithmetic!(AccountsTotals {
+    loaded_from_write_cache,
+    loaded_from_read_cache,
+    loaded_from_storage,
+    stored_accounts,
+    stored_bytes,
+});
 
 counter_arithmetic!(ProgramCacheTotals {
     hits,
@@ -1251,6 +1377,54 @@ mod tests {
         let held = tap.slot_waterfalls();
         assert_eq!(held.len(), SLOT_WATERFALLS);
         assert_eq!(held[0].slot, 10);
+    }
+
+    #[test]
+    fn test_the_accounts_points_add_into_one_set_of_figures() {
+        // Three points from three parts of the accounts database, matched on
+        // field name in one place. Loads come from one, the flush figures from
+        // another, and the storage levels from a third.
+        let tap = MetricsTap::default();
+        tap.observe(&named(
+            ACCOUNTS_LOADS,
+            &[
+                ("num_loaded_from_write_cache", "10i"),
+                ("num_loaded_from_read_cache", "900i"),
+                ("num_loaded_from_index_storage", "40i"),
+            ],
+        ));
+        tap.observe(&named(
+            ACCOUNTS_FLUSH,
+            &[
+                ("num_accounts_stored", "500i"),
+                ("account_bytes_stored", "64000i"),
+            ],
+        ));
+        tap.observe(&named(
+            ACCOUNTS_STORES,
+            &[
+                ("total_bytes", "137400000000i"),
+                ("total_alive_bytes", "27700000000i"),
+                ("total_count", "812i"),
+            ],
+        ));
+
+        let counters = tap.counters();
+        assert_eq!(counters.accounts.loaded_from_storage, 40);
+        assert_eq!(counters.accounts.stored_bytes, 64_000);
+        assert_eq!(counters.accounts_storage_alive_bytes, 27_700_000_000);
+        assert_eq!(counters.accounts_storage_count, 812);
+    }
+
+    #[test]
+    fn test_the_storage_levels_are_replaced_rather_than_summed() {
+        // How much storage exists, not how much appeared since the last point.
+        // Summed, a validator holding a steady hundred gigabytes would report
+        // tens of terabytes within a minute.
+        let tap = MetricsTap::default();
+        tap.observe(&named(ACCOUNTS_STORES, &[("total_bytes", "100i")]));
+        tap.observe(&named(ACCOUNTS_STORES, &[("total_bytes", "104i")]));
+        assert_eq!(tap.counters().accounts_storage_bytes, 104);
     }
 
     #[test]

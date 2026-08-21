@@ -7,6 +7,7 @@ import {
   ValidatorsCard,
 } from "./components/cards";
 import { Header } from "./components/Header";
+import { AccountsCard } from "./components/AccountsCard";
 import { IngestCard } from "./components/IngestCard";
 import { NetworkCard } from "./components/NetworkCard";
 import { ProducedBlocksCard } from "./components/ProducedBlocksCard";
@@ -91,8 +92,11 @@ function Overview() {
         <NetworkCard />
         <IngestCard />
       </div>
+      {/* Both are what replay spends its time waiting on, so they sit
+          together: one holds compiled programs, the other account data. */}
       <div className="grid">
         <ProgramCacheCard />
+        <AccountsCard />
       </div>
       {/* Picks the same traffic up where the socket card leaves it: those two
           count what reached the host, this counts what became of it once the

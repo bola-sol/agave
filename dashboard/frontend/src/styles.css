@@ -1604,6 +1604,24 @@ body {
   color: var(--text-faint);
 }
 
+/* A group of figures inside a cache card, under a heading of its own. The
+   groups count different things — reads, writes, what is on disk — and running
+   them together as one grid read as one list of unrelated numbers. */
+.cache-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.cache-section-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
 /* ---- socket ingest ---- */
 
 .ingest-body {

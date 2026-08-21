@@ -43,6 +43,30 @@ export interface AccountsCache {
   read: number;
   hit_rate: number;
   evictions: number;
+  cache_bytes: number;
+  cache_entries: number;
+  /**
+   * Where reads were answered from. `from_storage` is the only one that touches
+   * a file, and is the nearest thing here to a disk read rate — counted in
+   * accounts rather than bytes, because nothing counts the bytes on that path.
+   */
+  from_write_cache: number;
+  from_read_cache: number;
+  from_storage: number;
+  /** The write side, which does have a byte figure. */
+  stored_accounts: number;
+  stored_bytes: number;
+  /** What the window actually spans, for turning totals into rates. */
+  window_seconds: number;
+  disk: AccountsDisk | null;
+}
+
+export interface AccountsDisk {
+  used: number;
+  allocated: number;
+  /** Dead account data still on disk, which is what shrink reclaims. */
+  fragmented: number;
+  storages: number;
 }
 
 /**

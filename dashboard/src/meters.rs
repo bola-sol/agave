@@ -17,8 +17,8 @@ use {
         collect::{CATCH_UP_SLOTS_PER_SECOND, system_time_nanos},
         context::{DashboardContext, StartupProgressFn},
         metrics_tap::{
-            ExecutedTotals, MetricsTap, ProgramCacheTotals, QuicTotals, SchedulerTotals,
-            SlotWaterfall, TapCounters, VerifyTotals, WindowedCounters,
+            AccountsTotals, ExecutedTotals, MetricsTap, ProgramCacheTotals, QuicTotals,
+            SchedulerTotals, SlotWaterfall, TapCounters, VerifyTotals, WindowedCounters,
         },
         net_stats::{self, NetCounters},
         proto::{Debounced, Publisher, TOPIC_SUMMARY},
@@ -100,6 +100,45 @@ pub struct AccountsCache {
     pub hit_rate: f64,
     /// Accounts dropped from the cache over the window.
     pub evictions: u64,
+    /// What the cache is holding right now.
+    pub cache_bytes: u64,
+    pub cache_entries: u64,
+
+    /// Where reads were answered from, over the window. The third is the only
+    /// one that touches a file, and is the closest thing here to a disk read
+    /// rate — counted in accounts, because nothing counts the bytes.
+    pub from_write_cache: u64,
+    pub from_read_cache: u64,
+    pub from_storage: u64,
+
+    /// Accounts written out to storage over the window, and their size. Unlike
+    /// the read side this does have a byte figure.
+    pub stored_accounts: u64,
+    pub stored_bytes: u64,
+    /// Seconds the window actually covers, so the panel can turn the totals
+    /// above into rates without assuming it is full.
+    pub window_seconds: f64,
+
+    /// How much storage exists, how much of it is still live, and how many
+    /// files it is spread over.
+    ///
+    /// `None` until the accounts database has reported once, which it does on a
+    /// clean cycle rather than a timer — so this is absent for the first while
+    /// after startup rather than nought.
+    pub disk: Option<AccountsDisk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountsDisk {
+    /// Bytes still referenced by a live account.
+    pub used: u64,
+    /// Bytes the storage files occupy.
+    pub allocated: u64,
+    /// The difference: dead account data still on disk, which is what shrink
+    /// reclaims. Agave shrinks continuously as candidates appear rather than on
+    /// a schedule, so there is no next-compaction time to count down to.
+    pub fragmented: u64,
+    pub storages: u64,
 }
 
 /// How often replay found a program already compiled.
@@ -341,6 +380,8 @@ pub struct Meters {
     metrics_tap: Arc<MetricsTap>,
     last_tap: Option<TapCounters>,
     accounts_cache_window: VecDeque<(u64, u64, u64)>,
+    /// One interval's worth of the accounts database's own counters per sample.
+    accounts_window: VecDeque<AccountsTotals>,
     accounts_cache: Debounced<Option<AccountsCache>>,
     /// `(turbine, repair)` shreds per sample.
     shreds_window: VecDeque<(u64, u64)>,
@@ -393,6 +434,7 @@ impl Meters {
             metrics_tap,
             last_tap: None,
             accounts_cache_window: VecDeque::with_capacity(ACCOUNTS_CACHE_WINDOW),
+            accounts_window: VecDeque::with_capacity(ACCOUNTS_CACHE_WINDOW),
             accounts_cache: Debounced::default(),
             shreds_window: VecDeque::with_capacity(SHREDS_WINDOW),
             shreds: Debounced::default(),
@@ -460,11 +502,41 @@ impl Meters {
             self.accounts_cache_window.pop_front();
         }
 
+        let totals = windowed(
+            &mut self.accounts_window,
+            current.accounts.since(&previous.accounts),
+            ACCOUNTS_CACHE_WINDOW,
+        );
+        // What the window actually spans, not what it will span once full. A
+        // rate taken against the full minute would read low for the first one.
+        let window_seconds = self.accounts_cache_window.len() as f64 * METER_INTERVAL.as_secs_f64();
+
+        // Absent rather than zeroed until the accounts database has reported
+        // its storage once, which happens on a clean cycle rather than a timer.
+        // Nought allocated would read as a validator holding no accounts.
+        let disk = (current.accounts_storage_bytes > 0).then(|| AccountsDisk {
+            used: current.accounts_storage_alive_bytes,
+            allocated: current.accounts_storage_bytes,
+            fragmented: current
+                .accounts_storage_bytes
+                .saturating_sub(current.accounts_storage_alive_bytes),
+            storages: current.accounts_storage_count,
+        });
+
         let rate = cache_rate(&self.accounts_cache_window).map(|(read, hit_rate, evictions)| {
             AccountsCache {
                 read,
                 hit_rate,
                 evictions,
+                cache_bytes: current.accounts_cache_bytes,
+                cache_entries: current.accounts_cache_entries,
+                from_write_cache: totals.loaded_from_write_cache,
+                from_read_cache: totals.loaded_from_read_cache,
+                from_storage: totals.loaded_from_storage,
+                stored_accounts: totals.stored_accounts,
+                stored_bytes: totals.stored_bytes,
+                window_seconds,
+                disk,
             }
         });
         self.accounts_cache
