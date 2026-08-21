@@ -828,14 +828,12 @@ mod tests {
                 accounts_cache_hits: 15,
                 accounts_cache_misses: 3,
                 accounts_cache_evicts: 1,
-                // Spelled out rather than defaulted: that a point from one
-                // source leaves another source's counters alone is part of what
-                // this is checking.
-                shreds_turbine: 0,
-                shreds_repair: 0,
-                packets_gossip: 0,
-                packets_tpu_vote: 0,
-                scheduler: SchedulerTotals::default(),
+                // Every other counter left at nought, which is half of what
+                // this test is for: a point from one source must not move
+                // another source's figures. Defaulted rather than written out,
+                // because the comparison is against the whole struct either way
+                // and a hand-written list of them only has to be maintained.
+                ..TapCounters::default()
             }
         );
     }
