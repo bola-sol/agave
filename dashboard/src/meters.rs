@@ -19,7 +19,7 @@ use {
         metrics_tap::{MetricsTap, TapCounters},
         net_stats::{self, NetCounters},
         proto::{Debounced, Publisher, TOPIC_SUMMARY},
-        udp_drops::{self, DropWindow, PortCounters},
+        udp_drops::{self, PortCounters, PortWindow},
     },
     serde::Serialize,
     solana_clock::Slot,
@@ -175,6 +175,29 @@ pub struct IngestPath {
     pub drops_total: u64,
     /// Bytes waiting unread at the instant of the sample.
     pub queued_bytes: u64,
+
+    /// Packets the port handed over, across the same window and from the same
+    /// instant as the two figures above.
+    ///
+    /// Missing rather than zero for a port with no receiver reporting one, and
+    /// the difference matters: nought received alongside drops would say every
+    /// packet was lost. Three of the six ports are in that position — the two
+    /// QUIC ones, whose counters count transactions rather than datagrams, and
+    /// serve repair, whose receiver keeps counters nothing reports.
+    ///
+    /// Sent so the panel can show a share of the traffic. Drops and received
+    /// are disjoint — a dropped datagram never reached the receiver — so their
+    /// sum is what arrived at the socket, and the loss is one over that sum.
+    ///
+    /// `Some(0)` is possible and is not the same as `None`. The counters behind
+    /// these arrive as metrics points, and a point is only submitted when info
+    /// logging is on for the crate that submits it, so an operator running the
+    /// validator quieter than default leaves them at nought. That reads as a
+    /// port that received nothing, which alongside any drops at all works out
+    /// as total loss — so the panel shows a share only where something was
+    /// actually counted.
+    pub received_recent: Option<u64>,
+    pub received_total: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -184,6 +207,19 @@ pub struct IngestSummary {
     /// claim a minute it has not yet watched.
     pub window_seconds: f64,
     pub paths: Vec<IngestPath>,
+}
+
+/// One row's two identities: the port the kernel counts drops against, and the
+/// validator's own count of what that port delivered where there is one.
+///
+/// Internal to the collection below rather than sent anywhere. It exists so the
+/// join between the two sources happens once, in the table that knows both.
+struct IngestPort {
+    name: &'static str,
+    port: u16,
+    /// Running total of packets delivered, or `None` for a port whose traffic
+    /// nothing counts in datagrams.
+    received: Option<u64>,
 }
 
 /// Cumulative transaction counters read off a bank, used to derive per-slot
@@ -227,7 +263,7 @@ pub struct Meters {
     net_unavailable: bool,
 
     /// Trailing history of per-port drop totals, so a startup burst ages out.
-    drops_window: DropWindow,
+    drops_window: PortWindow,
     /// Per-port drops as of the moment the validator finished starting.
     ///
     /// Reported totals are counted from here. Most of a validator's drops
@@ -236,6 +272,15 @@ pub struct Meters {
     /// process left a figure that said nothing about how the validator is
     /// running now.
     drops_baseline: Option<HashMap<u16, u64>>,
+    /// The same window and the same baseline for what each port delivered,
+    /// which is the other term in the share of traffic a row lost.
+    ///
+    /// Kept apart from the drop figures rather than folded in beside them
+    /// because they come from a different source and cover a different set of
+    /// ports: three of the six have no count at all, and a single structure
+    /// would have to carry a hole for them.
+    received_window: PortWindow,
+    received_baseline: Option<HashMap<u16, u64>>,
     /// Last counters seen for each reported port.
     ///
     /// `/proc/net/udp` is not read atomically. The kernel formats it lazily as
@@ -279,8 +324,10 @@ impl Meters {
             last_net: None,
             net_history: Vec::new(),
             net_unavailable: false,
-            drops_window: DropWindow::new(DROPS_WINDOW),
+            drops_window: PortWindow::new(DROPS_WINDOW),
             drops_baseline: None,
+            received_window: PortWindow::new(DROPS_WINDOW),
+            received_baseline: None,
             known_sockets: HashMap::new(),
             drops_unavailable: false,
             ingest_paths: Debounced::default(),
@@ -567,18 +614,44 @@ impl Meters {
     ///
     /// A fixed order rather than sorting by traffic or by drops, so a row does
     /// not move to a different line between samples.
-    fn ingest_ports(&self) -> Vec<(&'static str, u16)> {
+    ///
+    /// Each port is paired here with the running count of what it delivered,
+    /// where anything counts it. Paired at this point rather than looked up
+    /// later because this is the one place that knows which socket is which:
+    /// the kernel's table is keyed by port and the validator's counters by the
+    /// name of the thread reading it, and nothing but this list joins them.
+    fn ingest_ports(&self, tap: &TapCounters) -> Vec<IngestPort> {
         let info = self.ctx.cluster_info.my_contact_info();
         [
-            ("turbine", info.tvu(Protocol::UDP)),
-            ("tpu", info.tpu(Protocol::QUIC)),
-            ("tpu forwards", info.tpu_forwards(Protocol::QUIC)),
-            ("tpu vote", info.tpu_vote(Protocol::UDP)),
-            ("gossip", info.gossip()),
-            ("serve repair", info.serve_repair(Protocol::UDP)),
+            // Everything arriving on the TVU port is a shred, so the count the
+            // shred receiver keeps is the count of what the port delivered.
+            ("turbine", info.tvu(Protocol::UDP), Some(tap.shreds_turbine)),
+            // QUIC. The stream layer counts transactions it managed to pull out
+            // of a connection, which is neither one datagram nor a whole number
+            // of them, and adding that to a datagram drop count would produce a
+            // ratio between two different things.
+            ("tpu", info.tpu(Protocol::QUIC), None),
+            ("tpu forwards", info.tpu_forwards(Protocol::QUIC), None),
+            (
+                "tpu vote",
+                info.tpu_vote(Protocol::UDP),
+                Some(tap.packets_tpu_vote),
+            ),
+            ("gossip", info.gossip(), Some(tap.packets_gossip)),
+            // The one port that could have a count and does not. Its receiver
+            // keeps the same counters as the others and nothing ever reports
+            // them, so they are accumulated on every packet and thrown away
+            // when the service ends. Reaching them means a change to `core`.
+            ("serve repair", info.serve_repair(Protocol::UDP), None),
         ]
         .into_iter()
-        .filter_map(|(name, addr)| addr.map(|addr| (name, addr.port())))
+        .filter_map(|(name, addr, received)| {
+            Some(IngestPort {
+                name,
+                port: addr?.port(),
+                received,
+            })
+        })
         .collect()
     }
 
@@ -600,7 +673,7 @@ impl Meters {
             }
         };
         let now = Instant::now();
-        let ports = self.ingest_ports();
+        let ports = self.ingest_ports(&self.metrics_tap.counters());
 
         // A port absent from this snapshot keeps the counters it had. The read
         // is not atomic, so a socket can drop out of one sample and return in
@@ -610,43 +683,59 @@ impl Meters {
         //
         // Only the reported ports are remembered. Keeping every UDP socket on
         // the host would hold a minute of history to answer six rows.
-        for &(_, port) in &ports {
-            if let Some(counters) = current.get(&port) {
-                self.known_sockets.insert(port, *counters);
+        for port in &ports {
+            if let Some(counters) = current.get(&port.port) {
+                self.known_sockets.insert(port.port, *counters);
             }
         }
 
-        let totals: HashMap<u16, u64> = ports
+        let drops: HashMap<u16, u64> = ports
             .iter()
-            .filter_map(|&(_, port)| Some((port, self.known_sockets.get(&port)?.drops)))
+            .filter_map(|port| Some((port.port, self.known_sockets.get(&port.port)?.drops)))
+            .collect();
+        // Only the ports that have a count. A port left out here is left out of
+        // both windows and of both baselines, so it never acquires a received
+        // figure by accident.
+        let received: HashMap<u16, u64> = ports
+            .iter()
+            .filter_map(|port| Some((port.port, port.received?)))
             .collect();
 
         // Taken the first tick the validator reports itself running, which is
         // where the startup burst ends. Before that the raw counters stand, so
         // the burst is visible while it is happening rather than hidden.
+        //
+        // Both baselines are taken at that same instant, which is what lets the
+        // two totals be divided by each other. Counted from where each source
+        // happened to start — the kernel from when the socket opened, the tap
+        // from when the dashboard began watching — the spans would differ by
+        // however long the validator took to start, and the share would come
+        // out too low by exactly the amount nobody could see.
         if self.drops_baseline.is_none() && (self.startup_progress)().running {
-            self.drops_baseline = Some(totals.clone());
+            self.drops_baseline = Some(drops.clone());
+            self.received_baseline = Some(received.clone());
         }
-        self.drops_window.push(now, totals);
+        self.drops_window.push(now, drops);
+        self.received_window.push(now, received);
 
         let paths: Vec<IngestPath> = ports
             .iter()
-            .filter_map(|&(name, port)| {
-                let counters = self.known_sockets.get(&port)?;
-                let baseline = self
-                    .drops_baseline
-                    .as_ref()
-                    .and_then(|baseline| baseline.get(&port))
-                    .copied()
-                    .unwrap_or(0);
+            .filter_map(|port| {
+                let counters = self.known_sockets.get(&port.port)?;
+                let dropped_by = at_baseline(self.drops_baseline.as_ref(), port.port);
+                let received_by = at_baseline(self.received_baseline.as_ref(), port.port);
                 Some(IngestPath {
-                    name,
-                    port,
-                    drops_recent: self.drops_window.since(port, counters.drops),
+                    name: port.name,
+                    port: port.port,
+                    drops_recent: self.drops_window.since(port.port, counters.drops),
                     // Saturating rather than wrapping: a socket rebound after
                     // the baseline was taken restarts below it.
-                    drops_total: counters.drops.saturating_sub(baseline),
+                    drops_total: counters.drops.saturating_sub(dropped_by),
                     queued_bytes: counters.queued,
+                    received_recent: port
+                        .received
+                        .map(|total| self.received_window.since(port.port, total)),
+                    received_total: port.received.map(|total| total.saturating_sub(received_by)),
                 })
             })
             .collect();
@@ -672,6 +761,20 @@ impl Meters {
         self.ingest_paths
             .publish(&self.publisher, TOPIC_SUMMARY, "ingest_paths", summary);
     }
+}
+
+/// What a port's counter read when the baseline was taken.
+///
+/// Nought before there is one, which makes the first minute of a validator's
+/// life report totals counted from when each counter itself started. That is
+/// the honest reading while the startup burst is still happening: hiding it
+/// until the baseline lands would leave the panel blank over the one stretch
+/// where it has the most to say.
+fn at_baseline(baseline: Option<&HashMap<u16, u64>>, port: u16) -> u64 {
+    baseline
+        .and_then(|baseline| baseline.get(&port))
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Appends a chart sample and republishes the retained series.
@@ -721,6 +824,54 @@ mod tests {
         // one that has not been asked.
         assert!(cache_rate(&window(&[])).is_none());
         assert!(cache_rate(&window(&[(0, 0, 0), (0, 0, 4)])).is_none());
+    }
+
+    #[test]
+    fn test_only_the_ports_counted_in_datagrams_carry_a_received_figure() {
+        // The whole of the denominator's correctness is this join. The kernel
+        // keys drops by port and the validator keys packets by the name of the
+        // thread that read them, and nothing else in the dashboard knows that
+        // `shred_fetch_receiver` is the socket gossip advertises as `tvu`.
+        let harness = fixture();
+        let meters = harness.meters();
+        let counted = meters.ingest_ports(&TapCounters {
+            shreds_turbine: 900,
+            packets_gossip: 40,
+            packets_tpu_vote: 70,
+            ..TapCounters::default()
+        });
+        let by_name: HashMap<&str, Option<u64>> = counted
+            .iter()
+            .map(|port| (port.name, port.received))
+            .collect();
+
+        assert_eq!(by_name["turbine"], Some(900));
+        assert_eq!(by_name["gossip"], Some(40));
+        assert_eq!(by_name["tpu vote"], Some(70));
+
+        // Nothing rather than nought, and the distinction is the point: a row
+        // reporting no packets received alongside any drops at all works out to
+        // every packet lost, which is a false alarm on a healthy validator.
+        assert_eq!(
+            by_name["tpu"], None,
+            "QUIC counts transactions, not packets"
+        );
+        assert_eq!(by_name["tpu forwards"], None);
+        assert_eq!(
+            by_name["serve repair"], None,
+            "its receiver keeps counters that nothing reports"
+        );
+    }
+
+    #[test]
+    fn test_a_port_with_no_baseline_yet_counts_from_its_own_start() {
+        // Which is what the panel shows over the startup burst, before the
+        // validator reports itself running and the baselines are taken. The
+        // alternative is a blank column across the one stretch where the drop
+        // figures have the most to say.
+        assert_eq!(at_baseline(None, 8001), 0);
+        assert_eq!(at_baseline(Some(&HashMap::new()), 8001), 0);
+        assert_eq!(at_baseline(Some(&HashMap::from([(8001, 42)])), 8001), 42);
     }
 
     #[test]

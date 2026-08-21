@@ -156,6 +156,16 @@ export interface IngestPath {
   drops_recent: number;
   drops_total: number;
   queued_bytes: number;
+  /**
+   * Packets the port delivered, over the same window and from the same instant
+   * as the drops beside them, so that one can be divided by their sum.
+   *
+   * Null for a port whose traffic nothing counts in datagrams: the two QUIC
+   * ports, whose counters count transactions pulled out of streams, and serve
+   * repair, whose receiver keeps counters that nothing reports.
+   */
+  received_recent: number | null;
+  received_total: number | null;
 }
 
 export interface ProducedBlock {

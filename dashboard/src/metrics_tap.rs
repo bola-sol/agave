@@ -34,7 +34,19 @@ const ACCOUNTS_DB_TIMINGS: &str = "accounts_db_store_timings";
 const SHREDS_TURBINE: &str = "shred_fetch_receiver";
 const SHREDS_REPAIR: &str = "shred_fetch_repair_receiver";
 
-/// Packets seen, which for both of those receivers is shreds.
+/// The receivers on the other two UDP ports the socket panel lists.
+///
+/// There is no third. The TPU and TPU forwards ports speak QUIC, where the
+/// in-process counters count transactions pulled out of streams rather than
+/// datagrams off the wire, and a share worked out from those against a datagram
+/// drop count would be a ratio between two different things. The serve repair
+/// port does keep a receiver of this kind, but nothing ever reports it: the
+/// stats are built, counted into on every packet, and dropped when the service
+/// ends. Reaching them would take a change to `core`, which this does not make.
+const GOSSIP_RECEIVER: &str = "gossip_receiver";
+const TPU_VOTE_RECEIVER: &str = "tpu_vote_receiver";
+
+/// Packets seen, which for the shred receivers is shreds.
 const PACKETS_COUNT: &str = "packets_count";
 
 /// Running totals of the counters worth watching.
@@ -50,8 +62,25 @@ pub struct MetricsTap {
     /// Shreds that arrived on their own, and shreds this validator had to ask
     /// for. A node the cluster is not reaching gets the second where it should
     /// have had the first.
+    ///
+    /// The first doubles as the turbine port's received count. That is the same
+    /// figure read for a second purpose rather than a second reading of it:
+    /// everything arriving on the TVU port is a shred, so what that receiver
+    /// counted is what the port delivered.
     pub shreds_turbine: AtomicU64,
     pub shreds_repair: AtomicU64,
+
+    /// Packets delivered on the gossip and TPU vote ports.
+    ///
+    /// Wanted for the denominator the kernel will not give. `/proc/net/udp`
+    /// counts the datagrams a socket discarded but not the ones it handed over,
+    /// so a drop count on its own cannot be turned into a share of the traffic —
+    /// and a number of drops that cannot be judged against anything is the
+    /// weakest thing the socket panel shows. These are the other half of that
+    /// sum, and they count datagrams too, one per packet, which is what makes
+    /// them addable to a drop count in the first place.
+    pub packets_gossip: AtomicU64,
+    pub packets_tpu_vote: AtomicU64,
 }
 
 /// A snapshot of the totals, for differencing between readings.
@@ -62,6 +91,8 @@ pub struct TapCounters {
     pub accounts_cache_evicts: u64,
     pub shreds_turbine: u64,
     pub shreds_repair: u64,
+    pub packets_gossip: u64,
+    pub packets_tpu_vote: u64,
 }
 
 impl MetricsTap {
@@ -85,7 +116,7 @@ impl MetricsTap {
     /// Adds what one point carries, if it is one of the few worth reading.
     ///
     /// A point this module does not want leaves after the match below, which is
-    /// a comparison against three names. Everything the validator measures about
+    /// a comparison against five names. Everything the validator measures about
     /// itself arrives here, so that is the cost paid on every one of them.
     fn observe(&self, point: &DataPoint) {
         match point.name {
@@ -102,12 +133,14 @@ impl MetricsTap {
             }
             SHREDS_TURBINE => self.add_packets(&self.shreds_turbine, point),
             SHREDS_REPAIR => self.add_packets(&self.shreds_repair, point),
+            GOSSIP_RECEIVER => self.add_packets(&self.packets_gossip, point),
+            TPU_VOTE_RECEIVER => self.add_packets(&self.packets_tpu_vote, point),
             _ => (),
         }
     }
 
-    /// Adds a shred receiver's packet count, the whole of what is wanted from
-    /// those two points.
+    /// Adds a socket receiver's packet count, the whole of what is wanted from
+    /// any of those four points.
     fn add_packets(&self, counter: &AtomicU64, point: &DataPoint) {
         for (name, value) in &point.fields {
             if *name == PACKETS_COUNT {
@@ -126,6 +159,8 @@ impl MetricsTap {
             accounts_cache_evicts: self.accounts_cache_evicts.load(Ordering::Relaxed),
             shreds_turbine: self.shreds_turbine.load(Ordering::Relaxed),
             shreds_repair: self.shreds_repair.load(Ordering::Relaxed),
+            packets_gossip: self.packets_gossip.load(Ordering::Relaxed),
+            packets_tpu_vote: self.packets_tpu_vote.load(Ordering::Relaxed),
         }
     }
 }
@@ -205,6 +240,8 @@ mod tests {
                 // this is checking.
                 shreds_turbine: 0,
                 shreds_repair: 0,
+                packets_gossip: 0,
+                packets_tpu_vote: 0,
             }
         );
     }
@@ -234,6 +271,23 @@ mod tests {
         let counters = tap.counters();
         assert_eq!(counters.shreds_turbine, 1_000);
         assert_eq!(counters.shreds_repair, 12);
+    }
+
+    #[test]
+    fn test_each_socket_receiver_counts_into_its_own_port() {
+        // The socket panel's denominator. Four receivers report packets under
+        // the same field name, and a row's share of traffic lost is only right
+        // if each one lands against the port it was read from.
+        let tap = MetricsTap::default();
+        tap.observe(&named(SHREDS_TURBINE, &[("packets_count", "900i")]));
+        tap.observe(&named(GOSSIP_RECEIVER, &[("packets_count", "40i")]));
+        tap.observe(&named(TPU_VOTE_RECEIVER, &[("packets_count", "70i")]));
+        tap.observe(&named(GOSSIP_RECEIVER, &[("packets_count", "2i")]));
+
+        let counters = tap.counters();
+        assert_eq!(counters.shreds_turbine, 900);
+        assert_eq!(counters.packets_gossip, 42);
+        assert_eq!(counters.packets_tpu_vote, 70);
     }
 
     #[test]
