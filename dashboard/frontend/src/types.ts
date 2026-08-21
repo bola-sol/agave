@@ -54,8 +54,24 @@ export interface AccountsCache {
  */
 export interface ProgramCache {
   looked_up: number;
+  hits: number;
+  misses: number;
   hit_rate: number;
   evictions: number;
+  reloads: number;
+  insertions: number;
+  lost_insertions: number;
+  replacements: number;
+  one_hit_wonders: number;
+  prunes_orphan: number;
+  prunes_environment: number;
+  /**
+   * The most entries seen loaded at any eviction in the window, against the
+   * limit eviction keeps them under. Null until an eviction has happened at
+   * all: the figure behind it is only written when one runs.
+   */
+  peak_entries: number | null;
+  entry_limit: number;
 }
 
 /**

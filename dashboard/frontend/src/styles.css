@@ -1535,6 +1535,45 @@ body {
   }
 }
 
+/* ---- program cache ---- */
+
+.cache-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Drawn whether or not an eviction has been seen, so the card holds its height
+   on a validator quiet enough never to have evicted anything. */
+.cache-storage {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.cache-storage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.cache-storage-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.cache-storage-value {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.cache-storage-limit {
+  color: var(--text-faint);
+}
+
 /* ---- socket ingest ---- */
 
 .ingest-body {

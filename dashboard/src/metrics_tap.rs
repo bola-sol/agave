@@ -78,6 +78,17 @@ const PACKETS_COUNT: &str = "packets_count";
 /// has set their log level to.
 const SCHEDULER_COUNTS: &str = "banking_stage_scheduler_counts";
 
+/// The program cache's own account of itself, reported once per bank with its
+/// counters reset as it reports — so each point is one slot's work.
+///
+/// Read from here rather than off the cache object the bank holds, which is
+/// where this used to come from. Two reasons, and the second is the better one:
+/// reaching the cache needs an accessor that upstream keeps behind
+/// `dev-context-only-utils`, and polling a counter that resets every four
+/// hundred milliseconds on a one-second tick reads part of one slot and misses
+/// the rest. The point is emitted at every reset, so nothing is missed.
+const PROGRAM_CACHE: &str = "loaded-programs-cache-stats";
+
 /// The QUIC listener on the TPU port, the stage before verification.
 ///
 /// Only the one port. Forwards and vote have listeners of their own reporting
@@ -121,6 +132,46 @@ const SLOT: &str = "slot";
 /// Leader slots kept. Matched to the produced block panel's own retention, so
 /// every block it can show has its waterfall for as long as it is shown.
 const SLOT_WATERFALLS: usize = 64;
+
+/// How the program cache is faring: what replay asked of it, and what it lost.
+#[derive(Debug, Default)]
+pub struct ProgramCacheCounters {
+    /// Programs replay wanted that were already compiled, and that were not.
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
+    /// Compiled programs dropped to keep the cache within its entry limit,
+    /// which is the usual reason a hit rate falls.
+    pub evictions: AtomicU64,
+    /// An entry that had been unloaded being compiled again — the cost of an
+    /// eviction, paid later.
+    pub reloads: AtomicU64,
+    /// Programs added to the cache, and additions that were thrown away
+    /// because the fork they belonged to was gone by the time they finished.
+    pub insertions: AtomicU64,
+    pub lost_insertions: AtomicU64,
+    /// An entry already present being compiled a second time by mistake.
+    pub replacements: AtomicU64,
+    /// Programs used once and then evicted, which is cache space spent for
+    /// nothing.
+    pub one_hit_wonders: AtomicU64,
+    /// Entries dropped because their fork was abandoned, and because they were
+    /// not recompiled for the incoming epoch.
+    pub prunes_orphan: AtomicU64,
+    pub prunes_environment: AtomicU64,
+    /// Keys left holding no versions at all once pruning had finished.
+    pub empty_entries: AtomicU64,
+
+    /// Entries loaded when an eviction last ran.
+    ///
+    /// A level rather than a count, so it is stored rather than added to — and
+    /// an awkward one, because it is only written when an eviction happens and
+    /// is reset with everything else at each bank. It reads nought on any slot
+    /// that evicted nothing, which is most of them. The panel takes the highest
+    /// reading across its window rather than the latest for that reason: what
+    /// is worth knowing is how full the cache got, not whether it happened to
+    /// evict in the last second.
+    pub water_level: AtomicU64,
+}
 
 /// What the QUIC listener did with the transactions it pulled off the wire.
 ///
@@ -207,6 +258,9 @@ pub struct MetricsTap {
     /// them addable to a drop count in the first place.
     pub packets_gossip: AtomicU64,
     pub packets_tpu_vote: AtomicU64,
+
+    /// How the program cache is faring.
+    pub program_cache: ProgramCacheCounters,
 
     /// The three stages either side of the scheduler, which together with it
     /// make the whole path a transaction takes through this validator.
@@ -320,6 +374,21 @@ pub struct SchedulerCounters {
 /// scheduler's, and twenty-one lines of assigning one to the other would be
 /// twenty-one chances to cross a pair over silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct ProgramCacheTotals {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub reloads: u64,
+    pub insertions: u64,
+    pub lost_insertions: u64,
+    pub replacements: u64,
+    pub one_hit_wonders: u64,
+    pub prunes_orphan: u64,
+    pub prunes_environment: u64,
+    pub empty_entries: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct QuicTotals {
     pub handed_on: u64,
     pub queue_full: u64,
@@ -381,6 +450,10 @@ pub struct TapCounters {
     pub packets_gossip: u64,
     pub packets_tpu_vote: u64,
     pub scheduler: SchedulerTotals,
+    pub program_cache: ProgramCacheTotals,
+    /// Entries loaded when an eviction last ran. A level, so it is read as it
+    /// stands rather than differenced.
+    pub program_cache_water_level: u64,
     pub quic: QuicTotals,
     pub verify: VerifyTotals,
     pub executed: ExecutedTotals,
@@ -407,7 +480,7 @@ impl MetricsTap {
     /// Adds what one point carries, if it is one of the few worth reading.
     ///
     /// A point this module does not want leaves after the match below, which is
-    /// a comparison against ten names. Everything the validator measures about
+    /// a comparison against eleven names. Everything the validator measures about
     /// itself arrives here, so that is the cost paid on every one of them.
     fn observe(&self, point: &DataPoint) {
         match point.name {
@@ -428,6 +501,7 @@ impl MetricsTap {
             TPU_VOTE_RECEIVER => self.add_packets(&self.packets_tpu_vote, point),
             SCHEDULER_COUNTS => self.scheduler.add_point(point),
             SCHEDULER_SLOT_COUNTS => self.remember_slot(point),
+            PROGRAM_CACHE => self.program_cache.add_point(point),
             QUIC_TPU => self.quic.add_point(point),
             TPU_VERIFIER => self.verify.add_point(point),
             WORKER_COUNTS => self.executed.add_point(point),
@@ -511,9 +585,57 @@ impl MetricsTap {
             packets_gossip: self.packets_gossip.load(Ordering::Relaxed),
             packets_tpu_vote: self.packets_tpu_vote.load(Ordering::Relaxed),
             scheduler: self.scheduler.totals(),
+            program_cache: self.program_cache.totals(),
+            program_cache_water_level: self.program_cache.water_level.load(Ordering::Relaxed),
             quic: self.quic.totals(),
             verify: self.verify.totals(),
             executed: self.executed.totals(),
+        }
+    }
+}
+
+impl ProgramCacheCounters {
+    fn add_point(&self, point: &DataPoint) {
+        for (name, value) in &point.fields {
+            // `water_level` is a level and `slot` names the point; neither is
+            // something to add to a running total.
+            if *name == "water_level" {
+                set_field(&self.water_level, value);
+                continue;
+            }
+            let counter = match *name {
+                "hits" => &self.hits,
+                "misses" => &self.misses,
+                "evictions" => &self.evictions,
+                "reloads" => &self.reloads,
+                "insertions" => &self.insertions,
+                "lost_insertions" => &self.lost_insertions,
+                // The field is not named after the counter behind it.
+                "replace_entry" => &self.replacements,
+                "one_hit_wonders" => &self.one_hit_wonders,
+                "prunes_orphan" => &self.prunes_orphan,
+                "prunes_environment" => &self.prunes_environment,
+                "empty_entries" => &self.empty_entries,
+                _ => continue,
+            };
+            add_field(counter, value);
+        }
+    }
+
+    fn totals(&self) -> ProgramCacheTotals {
+        let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        ProgramCacheTotals {
+            hits: read(&self.hits),
+            misses: read(&self.misses),
+            evictions: read(&self.evictions),
+            reloads: read(&self.reloads),
+            insertions: read(&self.insertions),
+            lost_insertions: read(&self.lost_insertions),
+            replacements: read(&self.replacements),
+            one_hit_wonders: read(&self.one_hit_wonders),
+            prunes_orphan: read(&self.prunes_orphan),
+            prunes_environment: read(&self.prunes_environment),
+            empty_entries: read(&self.empty_entries),
         }
     }
 }
@@ -711,6 +833,20 @@ macro_rules! counter_arithmetic {
     };
 }
 
+counter_arithmetic!(ProgramCacheTotals {
+    hits,
+    misses,
+    evictions,
+    reloads,
+    insertions,
+    lost_insertions,
+    replacements,
+    one_hit_wonders,
+    prunes_orphan,
+    prunes_environment,
+    empty_entries,
+});
+
 counter_arithmetic!(QuicTotals {
     handed_on,
     queue_full,
@@ -762,6 +898,18 @@ counter_arithmetic!(SchedulerTotals {
 fn add_field(counter: &AtomicU64, value: &str) {
     if let Some(delta) = field_u64(value) {
         counter.fetch_add(delta, Ordering::Relaxed);
+    }
+}
+
+/// Replaces a gauge with the reading a point carries.
+///
+/// Stored rather than added, which is the whole difference between the two
+/// kinds of figure here: a counter says how much happened since the last point
+/// and only means anything summed, a gauge says how things stand and only means
+/// anything as the latest value.
+fn set_field(gauge: &AtomicU64, value: &str) {
+    if let Some(latest) = field_u64(value) {
+        gauge.store(latest, Ordering::Relaxed);
     }
 }
 
@@ -1103,6 +1251,35 @@ mod tests {
         let held = tap.slot_waterfalls();
         assert_eq!(held.len(), SLOT_WATERFALLS);
         assert_eq!(held[0].slot, 10);
+    }
+
+    #[test]
+    fn test_a_level_is_replaced_rather_than_accumulated() {
+        // `water_level` says where the cache stood, not what happened since the
+        // last point. Added up the way every counter beside it is, a cache that
+        // held four hundred entries all minute would report having held tens of
+        // thousands.
+        let tap = MetricsTap::default();
+        tap.observe(&named(PROGRAM_CACHE, &[("water_level", "400i")]));
+        tap.observe(&named(PROGRAM_CACHE, &[("water_level", "412i")]));
+        assert_eq!(tap.counters().program_cache_water_level, 412);
+    }
+
+    #[test]
+    fn test_the_cache_counter_named_differently_from_its_field_still_lands() {
+        // The point calls it `replace_entry` where the counter behind it is
+        // `replacements`. A mapping taken from the struct rather than from the
+        // wire would silently read nought for ever.
+        let tap = MetricsTap::default();
+        tap.observe(&named(
+            PROGRAM_CACHE,
+            &[("replace_entry", "3i"), ("hits", "90i"), ("misses", "10i")],
+        ));
+
+        let cache = tap.counters().program_cache;
+        assert_eq!(cache.replacements, 3);
+        assert_eq!(cache.hits, 90);
+        assert_eq!(cache.misses, 10);
     }
 
     #[test]

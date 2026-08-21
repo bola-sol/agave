@@ -27,6 +27,7 @@ use {
     serde::Serialize,
     solana_clock::Slot,
     solana_gossip::contact_info::Protocol,
+    solana_program_runtime::loaded_programs::MAX_LOADED_ENTRY_COUNT,
     solana_runtime::bank::Bank,
     std::{
         collections::{HashMap, VecDeque},
@@ -110,11 +111,37 @@ pub struct AccountsCache {
 pub struct ProgramCache {
     /// Loads seen in the window, hits and misses together.
     pub looked_up: u64,
+    pub hits: u64,
+    pub misses: u64,
     /// Of those, the ones already compiled and in the cache, in `[0, 1]`.
     pub hit_rate: f64,
     /// Compiled programs dropped from the cache over the window, which is the
     /// usual reason a hit rate falls.
     pub evictions: u64,
+    /// An evicted program being compiled again: the cost of an eviction, paid
+    /// on the next block that wants it.
+    pub reloads: u64,
+    /// Programs added, and additions thrown away because the fork they were
+    /// for had gone by the time they finished compiling.
+    pub insertions: u64,
+    pub lost_insertions: u64,
+    /// Something already cached compiled a second time by mistake.
+    pub replacements: u64,
+    /// Compiled, used once, and evicted — cache space spent for nothing.
+    pub one_hit_wonders: u64,
+    /// Dropped because their fork was abandoned, and because they were not
+    /// recompiled for the incoming epoch. Neither is a fault; both are the
+    /// cache keeping up with the chain.
+    pub prunes_orphan: u64,
+    pub prunes_environment: u64,
+    /// The most entries seen loaded at any eviction in the window, and the
+    /// limit that eviction is keeping them under.
+    ///
+    /// A high-water mark rather than a current reading: the figure behind it is
+    /// only written when an eviction runs, so on any slot that evicted nothing
+    /// it reads nought. `None` until an eviction has happened at all.
+    pub peak_entries: Option<u64>,
+    pub entry_limit: u64,
 }
 
 /// A window of `(hits, misses, evictions)` samples as `(asked, rate, evicted)`,
@@ -124,9 +151,8 @@ pub struct ProgramCache {
 /// and a hit rate of nought reads as a cache that is failing rather than one
 /// that has not been asked.
 ///
-/// Shared by both caches. They count different things and their counters reach
-/// here by different routes, but a hit rate is a hit rate, and two copies of
-/// this would be two places for it to be wrong.
+/// The accounts read cache only, now. The program cache had this too until it
+/// grew enough figures to want a shape of its own.
 fn cache_rate(window: &VecDeque<(u64, u64, u64)>) -> Option<(u64, f64, u64)> {
     let mut hits = 0u64;
     let mut misses = 0u64;
@@ -305,8 +331,10 @@ pub struct Meters {
     drops_unavailable: bool,
     ingest_paths: Debounced<IngestSummary>,
 
-    /// `(hits, misses, evictions)` per sample, one a second.
-    program_cache_window: VecDeque<(u64, u64, u64)>,
+    /// One interval's worth of the program cache's counters per sample, and
+    /// beside it the level readings, which are peaked rather than summed.
+    program_cache_window: VecDeque<ProgramCacheTotals>,
+    program_cache_levels: VecDeque<u64>,
     program_cache: Debounced<Option<ProgramCache>>,
 
     /// Running totals as of the last reading, so each sample is the difference.
@@ -360,6 +388,7 @@ impl Meters {
             drops_unavailable: false,
             ingest_paths: Debounced::default(),
             program_cache_window: VecDeque::with_capacity(PROGRAM_CACHE_WINDOW),
+            program_cache_levels: VecDeque::with_capacity(PROGRAM_CACHE_WINDOW),
             program_cache: Debounced::default(),
             metrics_tap,
             last_tap: None,
@@ -393,7 +422,6 @@ impl Meters {
             .map(|bank_forks| bank_forks.working_bank());
         if let Some(working_bank) = working_bank {
             self.collect_tps(&working_bank);
-            self.collect_program_cache(&working_bank);
         }
 
         self.collect_network();
@@ -415,6 +443,7 @@ impl Meters {
         };
         self.collect_shreds(&previous, &current);
         self.collect_waterfall(&previous, &current);
+        self.collect_program_cache(&previous, &current);
 
         self.accounts_cache_window.push_back((
             current
@@ -579,33 +608,46 @@ impl Meters {
     /// The cache sits behind a lock the runtime writes to. Taken with `try_read`
     /// for the same reason bank forks is: a dropped sample is cheaper than
     /// holding up replay to draw a number.
-    fn collect_program_cache(&mut self, working_bank: &Bank) {
-        let processor = working_bank.get_transaction_processor();
-        let Ok(cache) = processor.global_program_cache.try_read() else {
-            return;
-        };
-        let sample = (
-            cache.stats.hits.load(Ordering::Relaxed),
-            cache.stats.misses.load(Ordering::Relaxed),
-            cache.stats.evictions.values().copied().sum::<u64>(),
-        );
-        drop(cache);
+    fn collect_program_cache(&mut self, previous: &TapCounters, current: &TapCounters) {
+        let sample = current.program_cache.since(&previous.program_cache);
+        let totals = windowed(&mut self.program_cache_window, sample, PROGRAM_CACHE_WINDOW);
 
-        self.program_cache_window.push_back(sample);
-        while self.program_cache_window.len() > PROGRAM_CACHE_WINDOW {
-            self.program_cache_window.pop_front();
+        // The level is not differenced — it is where the cache stood, not what
+        // happened — so it is kept as its own window and read as a peak.
+        self.program_cache_levels
+            .push_back(current.program_cache_water_level);
+        while self.program_cache_levels.len() > PROGRAM_CACHE_WINDOW {
+            self.program_cache_levels.pop_front();
         }
+        let peak_entries = self
+            .program_cache_levels
+            .iter()
+            .copied()
+            .max()
+            .filter(|peak| *peak > 0);
 
-        let rate =
-            cache_rate(&self.program_cache_window).map(|(looked_up, hit_rate, evictions)| {
-                ProgramCache {
-                    looked_up,
-                    hit_rate,
-                    evictions,
-                }
-            });
+        let looked_up = totals.hits.saturating_add(totals.misses);
+        // Nothing rather than nought: a validator between blocks has looked
+        // nothing up, and a hit rate of zero reads as a cache that is failing
+        // rather than one that has not been asked.
+        let cache = (looked_up > 0).then(|| ProgramCache {
+            looked_up,
+            hits: totals.hits,
+            misses: totals.misses,
+            hit_rate: totals.hits as f64 / looked_up as f64,
+            evictions: totals.evictions,
+            reloads: totals.reloads,
+            insertions: totals.insertions,
+            lost_insertions: totals.lost_insertions,
+            replacements: totals.replacements,
+            one_hit_wonders: totals.one_hit_wonders,
+            prunes_orphan: totals.prunes_orphan,
+            prunes_environment: totals.prunes_environment,
+            peak_entries,
+            entry_limit: MAX_LOADED_ENTRY_COUNT as u64,
+        });
         self.program_cache
-            .publish(&self.publisher, TOPIC_SUMMARY, "program_cache", rate);
+            .publish(&self.publisher, TOPIC_SUMMARY, "program_cache", cache);
     }
 
     fn collect_tps(&mut self, working_bank: &Bank) {

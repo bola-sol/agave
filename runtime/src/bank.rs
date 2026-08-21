@@ -1704,18 +1704,6 @@ impl Bank {
             .prune_by_deployment_slot(deployment_slot);
     }
 
-    /// The batch processor, whose `global_program_cache` is how the program
-    /// cache is reached from outside this crate.
-    ///
-    /// Not behind `dev-context-only-utils`, where it used to be. Both the type
-    /// and the cache field on it are already public, so the gate was the only
-    /// thing making an ordinary build unable to read what a test build could —
-    /// and a caller written against it compiled under `cargo test` and then
-    /// failed to build the validator.
-    pub fn get_transaction_processor(&self) -> &TransactionBatchProcessor<BankForks> {
-        &self.transaction_processor
-    }
-
     /// Epoch in which the new cooldown warmup rate for stake was activated
     pub fn new_warmup_cooldown_rate_epoch(&self) -> Option<Epoch> {
         self.feature_set
@@ -7101,6 +7089,10 @@ impl Bank {
             .accounts
             .accounts_db
             .calculate_accounts_lt_hash_at_startup_from_index(&self.ancestors)
+    }
+
+    pub fn get_transaction_processor(&self) -> &TransactionBatchProcessor<BankForks> {
+        &self.transaction_processor
     }
 
     pub fn set_fee_structure(&mut self, fee_structure: &FeeStructure) {

@@ -10,6 +10,7 @@ import { Header } from "./components/Header";
 import { IngestCard } from "./components/IngestCard";
 import { NetworkCard } from "./components/NetworkCard";
 import { ProducedBlocksCard } from "./components/ProducedBlocksCard";
+import { ProgramCacheCard } from "./components/ProgramCacheCard";
 import { SchedulePage } from "./components/SchedulePage";
 import { Sidebar } from "./components/Sidebar";
 import { VersionsCard } from "./components/VersionsCard";
@@ -89,6 +90,9 @@ function Overview() {
       <div className="grid">
         <NetworkCard />
         <IngestCard />
+      </div>
+      <div className="grid">
+        <ProgramCacheCard />
       </div>
       {/* Picks the same traffic up where the socket card leaves it: those two
           count what reached the host, this counts what became of it once the

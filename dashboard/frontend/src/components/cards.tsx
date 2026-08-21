@@ -3,7 +3,6 @@ import type {
   AccountsCache,
   EpochInfo,
   Health,
-  ProgramCache,
   Shreds,
   SkipRate,
   StartupProgress,
@@ -56,7 +55,6 @@ export function StatusCard() {
   const slotDurationNanos = store.get<number>("summary", "estimated_slot_duration_nanos");
   const startup = store.get<StartupProgress>("summary", "startup_progress");
   const skip = store.get<SkipRate>("summary", "skip_rate");
-  const programCache = store.get<ProgramCache | null>("summary", "program_cache");
   const accountsCache = store.get<AccountsCache | null>("summary", "accounts_cache");
   const shreds = store.get<Shreds | null>("summary", "shreds");
 
@@ -97,16 +95,6 @@ export function StatusCard() {
           tone={health?.replay === "running" ? "good" : "bad"}
         />
         <Stat label="Skip rate" value={percent(skip?.rate)} />
-        <Stat
-          label="Program cache"
-          explain="How often replay found a program already compiled rather than having to build it, over the last minute. A low rate means replay spends its time compiling, which slows a block down and leaves less room to pack the next one. Evictions are the usual cause."
-          value={percent(programCache?.hit_rate ?? null, 1)}
-          sub={
-            programCache
-              ? `${count(programCache.looked_up)} loads · ${count(programCache.evictions)} evicted`
-              : undefined
-          }
-        />
         <Stat
           label="Accounts cache"
           explain="How often an account replay needed was already in memory rather than read from disk, over the last minute. Replay waits on every account a transaction touches, so a low rate slows every block this validator replays and every block it produces."
