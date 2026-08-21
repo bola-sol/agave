@@ -257,10 +257,10 @@ export function quicRows(q: QuicStage): WaterfallRow[] {
   return rowsOf(offered, [
     [
       "quic_offered",
-      "Off the wire",
+      "Read from streams",
       "stage",
       offered,
-      "Transactions pulled out of QUIC streams on the TPU port. QUIC counts no total of its own, so this is the three outcomes below added together — every transaction it finished reading either went on or was thrown away.",
+      "Transactions QUIC finished assembling out of its streams on the TPU port. Not a count of packets: QUIC reassembles a transaction from however many datagrams carried it, so this figure and the datagram counts on the socket panel for the same port measure different things and will not agree. QUIC keeps no total of its own, so this is the three outcomes below added together — everything it finished reading either went on or was thrown away.",
     ],
     [
       "quic_queue_full",
@@ -271,17 +271,17 @@ export function quicRows(q: QuicStage): WaterfallRow[] {
     ],
     [
       "quic_disconnected",
-      "queue gone",
+      "queue closed",
       "loss",
       q.disconnected,
-      "Dropped because the queue onward had been closed, which happens while the validator is shutting down.",
+      "Dropped because the queue onward had been closed rather than merely full. In practice this is a validator shutting down, and a figure here at any other time is worth asking about.",
     ],
     [
       "quic_handed_on",
-      "Handed on",
+      "Passed to verify",
       "stage",
       q.handed_on,
-      "Passed to signature verification. This is the section below's input, though not exactly its received count: the two are measured either side of the fetch stage's own buffering.",
+      "Went on to signature verification. This is the section below's input, though not exactly its received count: the two are measured either side of the fetch stage's own buffering, so they should be close rather than equal.",
     ],
   ]);
 }
