@@ -413,9 +413,45 @@ pub fn get_host_id() -> String {
     HOST_ID.read().unwrap().clone()
 }
 
+/// Called with every point submitted, in the order they are submitted.
+pub type DataPointObserver = Box<dyn Fn(&DataPoint) + Send + Sync>;
+
+static OBSERVER: std::sync::OnceLock<DataPointObserver> = std::sync::OnceLock::new();
+
+/// Watches the points this process submits, whatever the metrics configuration.
+///
+/// Much of what a validator measures about itself — the packet counts through
+/// each stage, the accounts cache hit rate, what repair asked for — is held in
+/// counters that are private to the module that keeps them and are swapped to
+/// zero as they are reported. Reading them at the source therefore means both
+/// reaching into another crate and racing the reporter for values only one
+/// reader can have. Watching what is reported costs neither: the numbers are
+/// already leaving, and taking a copy on the way past changes nothing about who
+/// gets them.
+///
+/// Works with no metrics host configured. Points are submitted regardless of
+/// configuration and it is the InfluxDB writer that discards them, so a
+/// validator reporting to nowhere still measures itself.
+///
+/// The observer runs on the thread that submitted the point, which is a
+/// validator thread doing something else, so it must be cheap and must not
+/// block. Copying what it wants into a bounded channel is the intended shape.
+///
+/// Returns false if an observer is already installed; there is one process and
+/// one observer, and the first wins rather than being replaced out from under
+/// whatever set it.
+pub fn set_datapoint_observer(observer: DataPointObserver) -> bool {
+    OBSERVER.set(observer).is_ok()
+}
+
 /// Submits a new point from any thread.  Note that points are internally queued
 /// and transmitted periodically in batches.
 pub fn submit(point: DataPoint, level: log::Level) {
+    // A relaxed load against an unset cell when nothing is watching, which is
+    // every validator that has not asked to.
+    if let Some(observe) = OBSERVER.get() {
+        observe(&point);
+    }
     let agent = get_singleton_agent();
     agent.submit(point, level);
 }
@@ -586,6 +622,26 @@ pub mod test_mocks {
 #[cfg(test)]
 mod test {
     use {super::*, test_mocks::MockMetricsWriter};
+
+    #[test]
+    fn test_datapoint_observer_sees_points_and_is_set_once() {
+        // One test for both, because the cell is process-wide and once-only:
+        // split in two they would race for which got to be first.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        assert!(set_datapoint_observer(Box::new(move |point| {
+            recorder.lock().unwrap().push(point.name);
+        })));
+
+        submit(DataPoint::new("watched").to_owned(), Level::Info);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["watched"]);
+
+        // The first observer keeps the cell rather than being replaced out
+        // from under whatever installed it.
+        assert!(!set_datapoint_observer(Box::new(|_| {})));
+        submit(DataPoint::new("also_watched").to_owned(), Level::Info);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["watched", "also_watched"]);
+    }
 
     #[test]
     fn test_submit() {
