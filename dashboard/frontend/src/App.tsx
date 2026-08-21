@@ -13,6 +13,7 @@ import { ProducedBlocksCard } from "./components/ProducedBlocksCard";
 import { SchedulePage } from "./components/SchedulePage";
 import { Sidebar } from "./components/Sidebar";
 import { VersionsCard } from "./components/VersionsCard";
+import { WaterfallCard } from "./components/WaterfallCard";
 import { SlotStrip } from "./components/SlotStrip";
 import { usePage, type Page } from "./route";
 import { useStore } from "./useStore";
@@ -89,6 +90,10 @@ function Overview() {
         <NetworkCard />
         <IngestCard />
       </div>
+      {/* Picks the same traffic up where the socket card leaves it: those two
+          count what reached the host, this counts what became of it once the
+          banking stage had it. */}
+      <WaterfallCard />
       <ProducedBlocksCard />
     </>
   );

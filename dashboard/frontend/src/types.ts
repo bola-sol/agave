@@ -183,6 +183,50 @@ export interface ProducedBlock {
   priority_fees: number;
 }
 
+/**
+ * Where the transactions handed to the banking stage went, over the window.
+ *
+ * Counts of what happened inside the window, not a queue depth: the scheduler
+ * reports these once a second with its own counters reset as it does, and the
+ * server sums a window of them.
+ *
+ * The first stretch is an identity — `received` is exactly `buffered` plus
+ * every loss from `not_held` through `nonce_conflict`. The later stretches are
+ * not, and cannot be, because the queue holds a standing population: what was
+ * scheduled in this window was largely buffered in an earlier one.
+ */
+export interface Waterfall {
+  received: number;
+
+  /** Lost at the door, before ever being queued. These plus `buffered` are `received`. */
+  not_held: number;
+  check_queue_full: number;
+  unparsable: number;
+  bad_locks: number;
+  compute_budget: number;
+  too_old: number;
+  already_processed: number;
+  fee_payer: number;
+  filtered: number;
+  nonce_conflict: number;
+
+  buffered: number;
+
+  /** Lost from the queue, having already been buffered. */
+  queue_full: number;
+  nonce_evicted: number;
+  cleared: number;
+  cleaned: number;
+
+  scheduled: number;
+  /** Not losses: work the scheduler had but could not place this pass. */
+  blocked_conflicts: number;
+  blocked_threads: number;
+
+  finished: number;
+  retried: number;
+}
+
 export interface IngestSummary {
   window_seconds: number;
   paths: IngestPath[];

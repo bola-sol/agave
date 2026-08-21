@@ -16,7 +16,7 @@ use {
     crate::{
         collect::{CATCH_UP_SLOTS_PER_SECOND, system_time_nanos},
         context::{DashboardContext, StartupProgressFn},
-        metrics_tap::{MetricsTap, TapCounters},
+        metrics_tap::{MetricsTap, SchedulerTotals, TapCounters},
         net_stats::{self, NetCounters},
         proto::{Debounced, Publisher, TOPIC_SUMMARY},
         udp_drops::{self, PortCounters, PortWindow},
@@ -51,6 +51,14 @@ const ACCOUNTS_CACHE_WINDOW: usize = 60;
 /// bursty by nature — a moment of packet loss and a handful of requests follow —
 /// and a minute of it says more about the last burst than about the connection.
 const SHREDS_WINDOW: usize = 300;
+
+/// Samples the transaction waterfall is summed over.
+///
+/// Five minutes, matching the shreds and for the same reason. The interesting
+/// half of the waterfall only moves while this validator is leader, which for
+/// most nodes is four slots every couple of minutes; a minute of it would be
+/// empty more often than it was not.
+const WATERFALL_WINDOW: usize = 300;
 
 /// Samples the program cache hit rate is taken over, a minute of them.
 ///
@@ -306,6 +314,9 @@ pub struct Meters {
     /// `(turbine, repair)` shreds per sample.
     shreds_window: VecDeque<(u64, u64)>,
     shreds: Debounced<Option<Shreds>>,
+    /// One interval's worth of the scheduler's counters per sample.
+    waterfall_window: VecDeque<SchedulerTotals>,
+    waterfall: Debounced<Option<SchedulerTotals>>,
 }
 
 impl Meters {
@@ -339,6 +350,8 @@ impl Meters {
             accounts_cache: Debounced::default(),
             shreds_window: VecDeque::with_capacity(SHREDS_WINDOW),
             shreds: Debounced::default(),
+            waterfall_window: VecDeque::with_capacity(WATERFALL_WINDOW),
+            waterfall: Debounced::default(),
         }
     }
 
@@ -377,6 +390,7 @@ impl Meters {
             return;
         };
         self.collect_shreds(&previous, &current);
+        self.collect_waterfall(&previous.scheduler, &current.scheduler);
 
         self.accounts_cache_window.push_back((
             current
@@ -434,6 +448,34 @@ impl Meters {
         });
         self.shreds
             .publish(&self.publisher, TOPIC_SUMMARY, "shreds", shreds);
+    }
+
+    /// Publishes where the transactions handed to the banking stage went.
+    ///
+    /// The scheduler counts all of this already and reports it once a second
+    /// with its counters reset as it does, so a sample is one second of work
+    /// and the window is their sum. That makes the published figures counts
+    /// over the window rather than anything the scheduler is holding — a
+    /// standing queue depth is not in here, and could not be got from these.
+    fn collect_waterfall(&mut self, previous: &SchedulerTotals, current: &SchedulerTotals) {
+        self.waterfall_window.push_back(current.since(previous));
+        while self.waterfall_window.len() > WATERFALL_WINDOW {
+            self.waterfall_window.pop_front();
+        }
+
+        let mut totals = SchedulerTotals::default();
+        for sample in &self.waterfall_window {
+            totals = totals.plus(sample);
+        }
+
+        // Nothing rather than a column of noughts. The scheduler submits its
+        // point only when it has something to say, so a window with nothing in
+        // it is a validator nothing has been sent — which is not the same as
+        // one whose scheduler is throwing everything away, and a panel of
+        // zeroes reads as the second.
+        let waterfall = (totals.received > 0).then_some(totals);
+        self.waterfall
+            .publish(&self.publisher, TOPIC_SUMMARY, "waterfall", waterfall);
     }
 
     fn collect_clock(&self) {
@@ -872,6 +914,80 @@ mod tests {
         assert_eq!(at_baseline(None, 8001), 0);
         assert_eq!(at_baseline(Some(&HashMap::new()), 8001), 0);
         assert_eq!(at_baseline(Some(&HashMap::from([(8001, 42)])), 8001), 42);
+    }
+
+    #[test]
+    fn test_the_waterfall_reports_the_window_and_not_the_running_total() {
+        // The tap's counters only ever climb. Publishing them as they stand
+        // would present every transaction since the validator started as
+        // though it had arrived in the last five minutes.
+        let harness = fixture();
+        let mut meters = harness.meters();
+
+        // A counter already well into its life, as it is by the time anyone
+        // opens the page.
+        let start = SchedulerTotals {
+            received: 1_000,
+            buffered: 40,
+            ..SchedulerTotals::default()
+        };
+        let next = SchedulerTotals {
+            received: 1_100,
+            buffered: 50,
+            ..SchedulerTotals::default()
+        };
+        let last = SchedulerTotals {
+            received: 1_250,
+            buffered: 65,
+            ..SchedulerTotals::default()
+        };
+        meters.collect_waterfall(&start, &next);
+        meters.collect_waterfall(&next, &last);
+
+        let published = harness.published_key("summary", "waterfall").unwrap();
+        // A hundred then a hundred and fifty, against a counter reading 1,250.
+        assert!(published.contains(r#""received":250"#), "{published}");
+        assert!(published.contains(r#""buffered":25"#), "{published}");
+    }
+
+    #[test]
+    fn test_a_scheduler_with_no_traffic_reports_nothing_rather_than_noughts() {
+        // The scheduler submits its point only when it has something to say, so
+        // an empty window is a validator nothing was sent. A waterfall of zeroes
+        // would read as one throwing everything away, which is the opposite.
+        let harness = fixture();
+        let mut meters = harness.meters();
+        meters.collect_waterfall(&SchedulerTotals::default(), &SchedulerTotals::default());
+
+        let published = harness.published_key("summary", "waterfall").unwrap();
+        assert!(published.contains(r#""value":null"#), "{published}");
+    }
+
+    #[test]
+    fn test_the_waterfall_window_forgets_what_falls_out_of_it() {
+        // Otherwise the busiest five minutes the validator ever had would stay
+        // on the page for the life of the process.
+        let harness = fixture();
+        let mut meters = harness.meters();
+
+        let mut previous = SchedulerTotals::default();
+        for step in 1..=WATERFALL_WINDOW.saturating_add(10) {
+            let current = SchedulerTotals {
+                received: (step as u64).saturating_mul(10),
+                ..SchedulerTotals::default()
+            };
+            meters.collect_waterfall(&previous, &current);
+            previous = current;
+        }
+
+        assert_eq!(meters.waterfall_window.len(), WATERFALL_WINDOW);
+        let published = harness.published_key("summary", "waterfall").unwrap();
+        // Ten a sample across the window, not across every sample ever taken.
+        let expected = (WATERFALL_WINDOW as u64).saturating_mul(10);
+        assert!(
+            published.contains(&format!(r#""received":{expected}"#)),
+            "{published}"
+        );
     }
 
     #[test]

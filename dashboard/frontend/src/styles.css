@@ -1353,6 +1353,132 @@ body {
   }
 }
 
+/* ---- transaction waterfall ---- */
+
+.waterfall-body {
+  display: flex;
+  flex-direction: column;
+}
+
+/* The one figure worth reading at a glance, kept out of the list so it is not
+   one row among twenty. */
+.waterfall-headline {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--border);
+}
+
+.waterfall-headline-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.waterfall-headline-value {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.waterfall {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.waterfall-row {
+  display: grid;
+  /* The bar takes the free space, not the label. The bar is the thing the card
+     exists to draw, and giving the label the `1fr` left it five hundred pixels
+     wide with a fifty-pixel bar beside it. The label is capped instead and
+     ellipsises; the bar keeps a floor so it never collapses to a stray dot in a
+     narrow column. */
+  grid-template-columns: minmax(0, 16em) 5em minmax(40px, 1fr) 3.4em;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.waterfall-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Stages carry the eye down the card; the reasons under them are subordinate
+   and indented to say so. */
+.waterfall-row.is-stage .waterfall-label {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.waterfall-row.is-loss .waterfall-label,
+.waterfall-row.is-note .waterfall-label {
+  padding-left: 12px;
+  color: var(--text-dim);
+}
+
+.waterfall-row.is-stage {
+  margin-top: 5px;
+}
+
+.waterfall-count {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.waterfall-row.is-loss .waterfall-count,
+.waterfall-row.is-note .waterfall-count {
+  color: var(--text-dim);
+}
+
+.waterfall-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-raised);
+  overflow: hidden;
+}
+
+.waterfall-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+}
+
+/* Losses and pressure are drawn in the same weight as the stages rather than in
+   a warning colour. Most of what lands in the largest of them is a validator
+   forwarding transactions it was never meant to execute, and colouring that as
+   a fault would make the ordinary state of a healthy node look alarming. */
+.waterfall-row.is-loss .waterfall-fill,
+.waterfall-row.is-note .waterfall-fill {
+  background: var(--text-faint);
+}
+
+.waterfall-share {
+  text-align: right;
+  font-size: 9.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 700px) {
+  /* The bar is down to its forty-pixel floor by here and conveys nothing at
+     that size, while five of the labels have started to ellipsise. Drop it and
+     give the room to the words, which is the half that still reads. */
+  .waterfall-row {
+    grid-template-columns: minmax(0, 1fr) 5em 3.4em;
+  }
+
+  .waterfall-bar {
+    display: none;
+  }
+}
+
 /* ---- socket ingest ---- */
 
 .ingest-body {
