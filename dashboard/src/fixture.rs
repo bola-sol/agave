@@ -15,6 +15,7 @@ use {
         collect::Collector,
         context::{DashboardContext, StartupProgress, StartupProgressFn},
         meters::Meters,
+        metrics_tap::MetricsTap,
         proto::Publisher,
         validator_info::ValidatorInfoCache,
     },
@@ -133,7 +134,15 @@ impl Fixture {
 
     /// The once-a-second readings over this fixture, ready to tick.
     pub fn meters(&self) -> Meters {
-        Meters::new(self.ctx.clone(), self.publisher.clone(), running())
+        // A tap of its own rather than the process-wide one: the observer is
+        // installed once per process and the tests share a process, so an
+        // installed tap would carry whatever the rest of the suite measured.
+        Meters::new(
+            self.ctx.clone(),
+            self.publisher.clone(),
+            running(),
+            Arc::new(MetricsTap::default()),
+        )
     }
 }
 

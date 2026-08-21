@@ -16,6 +16,7 @@ use {
     crate::{
         collect::{CATCH_UP_SLOTS_PER_SECOND, system_time_nanos},
         context::{DashboardContext, StartupProgressFn},
+        metrics_tap::{MetricsTap, TapCounters},
         net_stats::{self, NetCounters},
         proto::{Debounced, Publisher, TOPIC_SUMMARY},
         udp_drops::{self, DropWindow, PortCounters},
@@ -42,12 +43,31 @@ const CHART_HISTORY: usize = 1500;
 /// stays visible for a while after it stops, short enough that it clears.
 const DROPS_WINDOW: Duration = Duration::from_secs(60);
 
+/// Samples the accounts cache hit rate is taken over, a minute of them, to
+/// match the program cache beside it.
+const ACCOUNTS_CACHE_WINDOW: usize = 60;
+
 /// Samples the program cache hit rate is taken over, a minute of them.
 ///
 /// One sample is one slot's worth of loads and often only a handful, so a rate
 /// taken from it alone swings between nothing and everything. Summed across the
 /// window it is a rate over real work rather than over the last three lookups.
 const PROGRAM_CACHE_WINDOW: usize = 60;
+
+/// How often an account replay needed was already in memory.
+///
+/// The accounts database reports these once a second with its own counters
+/// reset as it does, so each point is a second's work and the window is the sum
+/// of them — a rate over the last minute rather than since startup.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountsCache {
+    /// Reads in the window, hits and misses together.
+    pub read: u64,
+    /// Of those, the ones already cached, in `[0, 1]`.
+    pub hit_rate: f64,
+    /// Accounts dropped from the cache over the window.
+    pub evictions: u64,
+}
 
 /// How often replay found a program already compiled.
 ///
@@ -65,12 +85,17 @@ pub struct ProgramCache {
     pub evictions: u64,
 }
 
-/// The window's hit rate, or `None` while it has seen no loads at all.
+/// A window of `(hits, misses, evictions)` samples as `(asked, rate, evicted)`,
+/// or `None` while it has been asked nothing at all.
 ///
 /// Nothing rather than zero: a validator between blocks has looked nothing up,
 /// and a hit rate of nought reads as a cache that is failing rather than one
 /// that has not been asked.
-fn program_cache_rate(window: &VecDeque<(u64, u64, u64)>) -> Option<ProgramCache> {
+///
+/// Shared by both caches. They count different things and their counters reach
+/// here by different routes, but a hit rate is a hit rate, and two copies of
+/// this would be two places for it to be wrong.
+fn cache_rate(window: &VecDeque<(u64, u64, u64)>) -> Option<(u64, f64, u64)> {
     let mut hits = 0u64;
     let mut misses = 0u64;
     let mut evictions = 0u64;
@@ -80,12 +105,8 @@ fn program_cache_rate(window: &VecDeque<(u64, u64, u64)>) -> Option<ProgramCache
         evictions = evictions.saturating_add(*sample_evictions);
     }
 
-    let looked_up = hits.saturating_add(misses);
-    (looked_up > 0).then(|| ProgramCache {
-        looked_up,
-        hit_rate: hits as f64 / looked_up as f64,
-        evictions,
-    })
+    let asked = hits.saturating_add(misses);
+    (asked > 0).then(|| (asked, hits as f64 / asked as f64, evictions))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -210,6 +231,12 @@ pub struct Meters {
     /// `(hits, misses, evictions)` per sample, one a second.
     program_cache_window: VecDeque<(u64, u64, u64)>,
     program_cache: Debounced<Option<ProgramCache>>,
+
+    /// Running totals as of the last reading, so each sample is the difference.
+    metrics_tap: Arc<MetricsTap>,
+    last_tap: Option<TapCounters>,
+    accounts_cache_window: VecDeque<(u64, u64, u64)>,
+    accounts_cache: Debounced<Option<AccountsCache>>,
 }
 
 impl Meters {
@@ -217,6 +244,7 @@ impl Meters {
         ctx: DashboardContext,
         publisher: Arc<Publisher>,
         startup_progress: StartupProgressFn,
+        metrics_tap: Arc<MetricsTap>,
     ) -> Self {
         Self {
             ctx,
@@ -234,6 +262,10 @@ impl Meters {
             ingest_paths: Debounced::default(),
             program_cache_window: VecDeque::with_capacity(PROGRAM_CACHE_WINDOW),
             program_cache: Debounced::default(),
+            metrics_tap,
+            last_tap: None,
+            accounts_cache_window: VecDeque::with_capacity(ACCOUNTS_CACHE_WINDOW),
+            accounts_cache: Debounced::default(),
         }
     }
 
@@ -256,6 +288,46 @@ impl Meters {
 
         self.collect_network();
         self.collect_ingest_paths();
+        self.collect_accounts_cache();
+    }
+
+    /// Publishes how often an account replay needed was already in memory.
+    ///
+    /// The totals behind this only climb, so a sample is the difference against
+    /// the last reading. The first reading has nothing to difference against and
+    /// establishes the baseline instead: counted from zero it would report every
+    /// account read since the validator started as though it happened in one
+    /// second.
+    fn collect_accounts_cache(&mut self) {
+        let current = self.metrics_tap.counters();
+        let Some(previous) = self.last_tap.replace(current) else {
+            return;
+        };
+
+        self.accounts_cache_window.push_back((
+            current
+                .accounts_cache_hits
+                .saturating_sub(previous.accounts_cache_hits),
+            current
+                .accounts_cache_misses
+                .saturating_sub(previous.accounts_cache_misses),
+            current
+                .accounts_cache_evicts
+                .saturating_sub(previous.accounts_cache_evicts),
+        ));
+        while self.accounts_cache_window.len() > ACCOUNTS_CACHE_WINDOW {
+            self.accounts_cache_window.pop_front();
+        }
+
+        let rate = cache_rate(&self.accounts_cache_window).map(|(read, hit_rate, evictions)| {
+            AccountsCache {
+                read,
+                hit_rate,
+                evictions,
+            }
+        });
+        self.accounts_cache
+            .publish(&self.publisher, TOPIC_SUMMARY, "accounts_cache", rate);
     }
 
     fn collect_clock(&self) {
@@ -301,12 +373,16 @@ impl Meters {
             self.program_cache_window.pop_front();
         }
 
-        self.program_cache.publish(
-            &self.publisher,
-            TOPIC_SUMMARY,
-            "program_cache",
-            program_cache_rate(&self.program_cache_window),
-        );
+        let rate =
+            cache_rate(&self.program_cache_window).map(|(looked_up, hit_rate, evictions)| {
+                ProgramCache {
+                    looked_up,
+                    hit_rate,
+                    evictions,
+                }
+            });
+        self.program_cache
+            .publish(&self.publisher, TOPIC_SUMMARY, "program_cache", rate);
     }
 
     fn collect_tps(&mut self, working_bank: &Bank) {
@@ -563,29 +639,29 @@ mod tests {
 
     #[test]
     fn test_the_rate_is_taken_over_the_whole_window() {
-        // Three slots of a handful of loads each. Taken one at a time the rate
-        // is 100%, then 50%, then 0; over the window it is the six in nine that
-        // it actually was.
-        let rate = program_cache_rate(&window(&[(4, 0, 0), (1, 1, 0), (1, 2, 0)])).unwrap();
-        assert_eq!(rate.looked_up, 9);
-        assert!((rate.hit_rate - 6.0 / 9.0).abs() < f64::EPSILON, "{rate:?}");
+        // Three samples of a handful of lookups each. Taken one at a time the
+        // rate is 100%, then 50%, then 0; over the window it is the six in nine
+        // that it actually was.
+        let (asked, rate, _) = cache_rate(&window(&[(4, 0, 0), (1, 1, 0), (1, 2, 0)])).unwrap();
+        assert_eq!(asked, 9);
+        assert!((rate - 6.0 / 9.0).abs() < f64::EPSILON, "{rate}");
     }
 
     #[test]
     fn test_evictions_are_summed_alongside() {
         // The usual reason a hit rate falls, so it is reported beside it rather
         // than left to be inferred from the rate dropping.
-        let rate = program_cache_rate(&window(&[(10, 1, 2), (10, 1, 3)])).unwrap();
-        assert_eq!(rate.evictions, 5);
+        let (_, _, evictions) = cache_rate(&window(&[(10, 1, 2), (10, 1, 3)])).unwrap();
+        assert_eq!(evictions, 5);
     }
 
     #[test]
-    fn test_nothing_looked_up_reports_nothing() {
+    fn test_nothing_asked_reports_nothing() {
         // Not zero. A validator between blocks has asked the cache for nothing,
         // and a hit rate of nought reads as a cache that is failing rather than
         // one that has not been asked.
-        assert!(program_cache_rate(&window(&[])).is_none());
-        assert!(program_cache_rate(&window(&[(0, 0, 0), (0, 0, 4)])).is_none());
+        assert!(cache_rate(&window(&[])).is_none());
+        assert!(cache_rate(&window(&[(0, 0, 0), (0, 0, 4)])).is_none());
     }
 
     #[test]

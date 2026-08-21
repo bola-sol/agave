@@ -18,6 +18,7 @@ use {
         config::DashboardConfig,
         context::{DashboardContext, StartupProgressFn},
         meters::{METER_INTERVAL, Meters},
+        metrics_tap::MetricsTap,
         proto::Publisher,
         server,
         startup::StartupPublisher,
@@ -88,6 +89,9 @@ pub struct DashboardService {
     /// caller supplies it once. The validator cannot supply it a second time
     /// anyway: translating its startup enum lives in the binary that owns it.
     startup_progress: StartupProgressFn,
+    /// Counters lifted from the measurements the validator submits about
+    /// itself, watched from `start` so the boot sequence is counted too.
+    metrics_tap: Arc<MetricsTap>,
     server: Option<JoinHandle<()>>,
     boot: Option<JoinHandle<()>>,
     collector: Option<JoinHandle<()>>,
@@ -109,6 +113,11 @@ impl DashboardService {
     ) -> io::Result<Self> {
         let publisher = Arc::new(Publisher::new());
         let exit = Arc::new(AtomicBool::new(false));
+        // Installed with the service rather than with the collector, so that
+        // the points submitted during the boot sequence — which is most of a
+        // cold start — are counted too. A validator with no dashboard installs
+        // nothing and the hook stays empty.
+        let metrics_tap = MetricsTap::install();
         let attached = Arc::new(AtomicBool::new(false));
 
         let runtime = Builder::new_multi_thread()
@@ -167,6 +176,7 @@ impl DashboardService {
             attached,
             publisher,
             startup_progress,
+            metrics_tap,
             server: Some(server),
             boot: Some(boot),
             collector: None,
@@ -240,10 +250,11 @@ impl DashboardService {
             let startup_progress = self.startup_progress.clone();
             let context = context.clone();
             let validator_exit = validator_exit.clone();
+            let metrics_tap = self.metrics_tap.clone();
             thread::Builder::new()
                 .name("solDashMeter".to_string())
                 .spawn(move || {
-                    let mut meters = Meters::new(context, publisher, startup_progress);
+                    let mut meters = Meters::new(context, publisher, startup_progress, metrics_tap);
                     while !exit.load(Ordering::Relaxed) && !validator_exit.load(Ordering::Relaxed) {
                         meters.tick();
                         thread::sleep(METER_INTERVAL);

@@ -21,6 +21,19 @@ export interface SlotEntry {
 }
 
 /**
+ * How often an account replay needed was already in memory, over the last
+ * minute.
+ *
+ * Lifted from the measurements the accounts database submits about itself,
+ * which carry a second's work each. Null while nothing has been read.
+ */
+export interface AccountsCache {
+  read: number;
+  hit_rate: number;
+  evictions: number;
+}
+
+/**
  * How often replay found a program already compiled, over the last minute.
  *
  * The counters behind this are reset for each bank, so `looked_up` is what was

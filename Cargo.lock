@@ -154,6 +154,7 @@ dependencies = [
  "solana-keypair",
  "solana-leader-schedule",
  "solana-ledger",
+ "solana-metrics",
  "solana-net-utils",
  "solana-pubkey 4.3.0",
  "solana-runtime",

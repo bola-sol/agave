@@ -130,6 +130,7 @@ dependencies = [
  "solana-config-interface",
  "solana-gossip",
  "solana-ledger",
+ "solana-metrics",
  "solana-pubkey 4.3.0",
  "solana-runtime",
  "solana-sdk-ids",

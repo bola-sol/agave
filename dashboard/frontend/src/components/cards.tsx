@@ -1,5 +1,6 @@
 import { count, decimal, duration, percent, solCompact } from "../format";
 import type {
+  AccountsCache,
   EpochInfo,
   Health,
   ProgramCache,
@@ -55,6 +56,7 @@ export function StatusCard() {
   const startup = store.get<StartupProgress>("summary", "startup_progress");
   const skip = store.get<SkipRate>("summary", "skip_rate");
   const programCache = store.get<ProgramCache | null>("summary", "program_cache");
+  const accountsCache = store.get<AccountsCache | null>("summary", "accounts_cache");
 
   // The leader countdown means nothing until the validator is running, so show
   // where it has got to in its boot sequence instead.
@@ -100,6 +102,16 @@ export function StatusCard() {
           sub={
             programCache
               ? `${count(programCache.looked_up)} loads · ${count(programCache.evictions)} evicted`
+              : undefined
+          }
+        />
+        <Stat
+          label="Accounts cache"
+          explain="How often an account replay needed was already in memory rather than read from disk, over the last minute. Replay waits on every account a transaction touches, so a low rate slows every block this validator replays and every block it produces."
+          value={percent(accountsCache?.hit_rate ?? null, 1)}
+          sub={
+            accountsCache
+              ? `${count(accountsCache.read)} reads · ${count(accountsCache.evictions)} evicted`
               : undefined
           }
         />
