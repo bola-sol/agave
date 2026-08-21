@@ -781,8 +781,15 @@ mod tests {
     }
 
     /// The per-slot point: the same counters, plus the slot they belong to.
-    fn slot_point(slot: &str, fields: &[(&'static str, &str)]) -> DataPoint {
-        let mut all = vec![("slot", slot)];
+    ///
+    /// The slot carries the same trailing `i` as every other integer field,
+    /// because `add_field_i64` is what puts it there. Formatted here rather
+    /// than written out by each caller: a fixture that left the suffix off
+    /// would be describing a point the validator never sends, and the tap
+    /// would rightly drop it.
+    fn slot_point(slot: u64, fields: &[(&'static str, &str)]) -> DataPoint {
+        let slot = format!("{slot}i");
+        let mut all = vec![("slot", slot.as_str())];
         all.extend_from_slice(fields);
         named(SCHEDULER_SLOT_COUNTS, &all)
     }
@@ -795,11 +802,11 @@ mod tests {
         // each led slot's work twice.
         let tap = MetricsTap::default();
         tap.observe(&slot_point(
-            "430789128",
+            430_789_128,
             &[("num_received", "500i"), ("num_buffered", "80i")],
         ));
         tap.observe(&slot_point(
-            "430789129",
+            430_789_129,
             &[("num_received", "600i"), ("num_buffered", "90i")],
         ));
 
@@ -810,6 +817,25 @@ mod tests {
         assert_eq!(held[1].counts.buffered, 90);
         // And the interval totals are untouched: this point is not one of them.
         assert_eq!(tap.counters().scheduler.received, 0);
+    }
+
+    #[test]
+    fn test_the_slot_is_read_by_the_same_rule_as_every_other_integer() {
+        // Strict, and worth pinning because it is easy to get wrong from the
+        // outside: `add_field_i64` writes "430789128i", not "430789128". If
+        // upstream ever writes the slot another way this test fails, which is
+        // better than the panel quietly emptying — the counters would still be
+        // read, they would just have no slot to be shown against.
+        let tap = MetricsTap::default();
+        let mut bare = DataPoint::new(SCHEDULER_SLOT_COUNTS);
+        bare.fields.push(("slot", "430789128".to_string()));
+        bare.fields.push(("num_received", "500i".to_string()));
+        tap.observe(&bare);
+        assert!(tap.slot_waterfalls().is_empty());
+
+        // The same point written as the validator writes it.
+        tap.observe(&slot_point(430_789_128, &[("num_received", "500i")]));
+        assert_eq!(tap.slot_waterfalls().len(), 1);
     }
 
     #[test]
@@ -826,8 +852,8 @@ mod tests {
         // Appending would leave two rows describing one slot and push a real
         // one off the end of the queue.
         let tap = MetricsTap::default();
-        tap.observe(&slot_point("100", &[("num_received", "5i")]));
-        tap.observe(&slot_point("100", &[("num_received", "9i")]));
+        tap.observe(&slot_point(100, &[("num_received", "5i")]));
+        tap.observe(&slot_point(100, &[("num_received", "9i")]));
 
         let held = tap.slot_waterfalls();
         assert_eq!(held.len(), 1);
@@ -841,7 +867,7 @@ mod tests {
         // that has already scrolled out of reach.
         let tap = MetricsTap::default();
         for slot in 0..u64::try_from(SLOT_WATERFALLS).unwrap().saturating_add(10) {
-            tap.observe(&slot_point(&format!("{slot}"), &[("num_received", "1i")]));
+            tap.observe(&slot_point(slot, &[("num_received", "1i")]));
         }
 
         let held = tap.slot_waterfalls();
