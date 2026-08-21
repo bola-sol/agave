@@ -2,6 +2,7 @@ import { count, decimal, duration, percent, solCompact } from "../format";
 import type {
   EpochInfo,
   Health,
+  ProgramCache,
   SkipRate,
   StartupProgress,
   Tps,
@@ -53,6 +54,7 @@ export function StatusCard() {
   const slotDurationNanos = store.get<number>("summary", "estimated_slot_duration_nanos");
   const startup = store.get<StartupProgress>("summary", "startup_progress");
   const skip = store.get<SkipRate>("summary", "skip_rate");
+  const programCache = store.get<ProgramCache | null>("summary", "program_cache");
 
   // The leader countdown means nothing until the validator is running, so show
   // where it has got to in its boot sequence instead.
@@ -91,6 +93,16 @@ export function StatusCard() {
           tone={health?.replay === "running" ? "good" : "bad"}
         />
         <Stat label="Skip rate" value={percent(skip?.rate)} />
+        <Stat
+          label="Program cache"
+          explain="How often replay found a program already compiled rather than having to build it, over the last minute. A low rate means replay spends its time compiling, which slows a block down and leaves less room to pack the next one. Evictions are the usual cause."
+          value={percent(programCache?.hit_rate ?? null, 1)}
+          sub={
+            programCache
+              ? `${count(programCache.looked_up)} loads · ${count(programCache.evictions)} evicted`
+              : undefined
+          }
+        />
       </div>
     </Card>
   );

@@ -21,6 +21,19 @@ export interface SlotEntry {
 }
 
 /**
+ * How often replay found a program already compiled, over the last minute.
+ *
+ * The counters behind this are reset for each bank, so `looked_up` is what was
+ * seen in the window rather than since startup. Null while nothing has been
+ * looked up at all.
+ */
+export interface ProgramCache {
+  looked_up: number;
+  hit_rate: number;
+  evictions: number;
+}
+
+/**
  * What is known about a leader beyond the name its slot rows carry.
  *
  * Published only for the leaders on screen, so a leader may be missing from

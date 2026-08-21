@@ -25,8 +25,8 @@ use {
     solana_gossip::contact_info::Protocol,
     solana_runtime::bank::Bank,
     std::{
-        collections::HashMap,
-        sync::Arc,
+        collections::{HashMap, VecDeque},
+        sync::{Arc, atomic::Ordering},
         time::{Duration, Instant, SystemTime},
     },
 };
@@ -41,6 +41,52 @@ const CHART_HISTORY: usize = 1500;
 /// Window the reported socket drops accumulate over. Long enough that a burst
 /// stays visible for a while after it stops, short enough that it clears.
 const DROPS_WINDOW: Duration = Duration::from_secs(60);
+
+/// Samples the program cache hit rate is taken over, a minute of them.
+///
+/// One sample is one slot's worth of loads and often only a handful, so a rate
+/// taken from it alone swings between nothing and everything. Summed across the
+/// window it is a rate over real work rather than over the last three lookups.
+const PROGRAM_CACHE_WINDOW: usize = 60;
+
+/// How often replay found a program already compiled.
+///
+/// The counters behind this are reset for each bank, so what is reported is the
+/// window's own totals rather than anything the cache holds: `looked_up` is how
+/// many program loads were seen in the last minute, not since startup.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProgramCache {
+    /// Loads seen in the window, hits and misses together.
+    pub looked_up: u64,
+    /// Of those, the ones already compiled and in the cache, in `[0, 1]`.
+    pub hit_rate: f64,
+    /// Compiled programs dropped from the cache over the window, which is the
+    /// usual reason a hit rate falls.
+    pub evictions: u64,
+}
+
+/// The window's hit rate, or `None` while it has seen no loads at all.
+///
+/// Nothing rather than zero: a validator between blocks has looked nothing up,
+/// and a hit rate of nought reads as a cache that is failing rather than one
+/// that has not been asked.
+fn program_cache_rate(window: &VecDeque<(u64, u64, u64)>) -> Option<ProgramCache> {
+    let mut hits = 0u64;
+    let mut misses = 0u64;
+    let mut evictions = 0u64;
+    for (sample_hits, sample_misses, sample_evictions) in window {
+        hits = hits.saturating_add(*sample_hits);
+        misses = misses.saturating_add(*sample_misses);
+        evictions = evictions.saturating_add(*sample_evictions);
+    }
+
+    let looked_up = hits.saturating_add(misses);
+    (looked_up > 0).then(|| ProgramCache {
+        looked_up,
+        hit_rate: hits as f64 / looked_up as f64,
+        evictions,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Tps {
@@ -160,6 +206,10 @@ pub struct Meters {
     /// independently: a container can expose one and not the other.
     drops_unavailable: bool,
     ingest_paths: Debounced<IngestSummary>,
+
+    /// `(hits, misses, evictions)` per sample, one a second.
+    program_cache_window: VecDeque<(u64, u64, u64)>,
+    program_cache: Debounced<Option<ProgramCache>>,
 }
 
 impl Meters {
@@ -182,6 +232,8 @@ impl Meters {
             known_sockets: HashMap::new(),
             drops_unavailable: false,
             ingest_paths: Debounced::default(),
+            program_cache_window: VecDeque::with_capacity(PROGRAM_CACHE_WINDOW),
+            program_cache: Debounced::default(),
         }
     }
 
@@ -199,6 +251,7 @@ impl Meters {
             .map(|bank_forks| bank_forks.working_bank());
         if let Some(working_bank) = working_bank {
             self.collect_tps(&working_bank);
+            self.collect_program_cache(&working_bank);
         }
 
         self.collect_network();
@@ -215,6 +268,45 @@ impl Meters {
             .as_nanos() as u64;
         self.publisher
             .publish(TOPIC_SUMMARY, "uptime_nanos", &uptime);
+    }
+
+    /// Publishes how often replay found a program already compiled.
+    ///
+    /// The cache is shared across banks and its counters are reset whenever a
+    /// bank is made from a parent, so a reading is what has been looked up since
+    /// the current slot began rather than a running total. That makes the counts
+    /// themselves useless on their own — they fall back to nothing several times
+    /// a second — and the rate the only figure worth reporting. Summing a
+    /// minute of samples gives it enough work to be steady; at a sample a second
+    /// against slots of four hundred milliseconds, each one lands in a different
+    /// slot, so nothing is counted twice.
+    ///
+    /// The cache sits behind a lock the runtime writes to. Taken with `try_read`
+    /// for the same reason bank forks is: a dropped sample is cheaper than
+    /// holding up replay to draw a number.
+    fn collect_program_cache(&mut self, working_bank: &Bank) {
+        let processor = working_bank.get_transaction_processor();
+        let Ok(cache) = processor.global_program_cache.try_read() else {
+            return;
+        };
+        let sample = (
+            cache.stats.hits.load(Ordering::Relaxed),
+            cache.stats.misses.load(Ordering::Relaxed),
+            cache.stats.evictions.values().copied().sum::<u64>(),
+        );
+        drop(cache);
+
+        self.program_cache_window.push_back(sample);
+        while self.program_cache_window.len() > PROGRAM_CACHE_WINDOW {
+            self.program_cache_window.pop_front();
+        }
+
+        self.program_cache.publish(
+            &self.publisher,
+            TOPIC_SUMMARY,
+            "program_cache",
+            program_cache_rate(&self.program_cache_window),
+        );
     }
 
     fn collect_tps(&mut self, working_bank: &Bank) {
@@ -463,6 +555,38 @@ fn push_history<T: Serialize>(history: &mut Vec<T>, sample: T, publisher: &Publi
 #[cfg(test)]
 mod tests {
     use {super::*, crate::fixture::fixture, std::thread::sleep};
+
+    /// A window of `(hits, misses, evictions)` samples.
+    fn window(samples: &[(u64, u64, u64)]) -> VecDeque<(u64, u64, u64)> {
+        samples.iter().copied().collect()
+    }
+
+    #[test]
+    fn test_the_rate_is_taken_over_the_whole_window() {
+        // Three slots of a handful of loads each. Taken one at a time the rate
+        // is 100%, then 50%, then 0; over the window it is the six in nine that
+        // it actually was.
+        let rate = program_cache_rate(&window(&[(4, 0, 0), (1, 1, 0), (1, 2, 0)])).unwrap();
+        assert_eq!(rate.looked_up, 9);
+        assert!((rate.hit_rate - 6.0 / 9.0).abs() < f64::EPSILON, "{rate:?}");
+    }
+
+    #[test]
+    fn test_evictions_are_summed_alongside() {
+        // The usual reason a hit rate falls, so it is reported beside it rather
+        // than left to be inferred from the rate dropping.
+        let rate = program_cache_rate(&window(&[(10, 1, 2), (10, 1, 3)])).unwrap();
+        assert_eq!(rate.evictions, 5);
+    }
+
+    #[test]
+    fn test_nothing_looked_up_reports_nothing() {
+        // Not zero. A validator between blocks has asked the cache for nothing,
+        // and a hit rate of nought reads as a cache that is failing rather than
+        // one that has not been asked.
+        assert!(program_cache_rate(&window(&[])).is_none());
+        assert!(program_cache_rate(&window(&[(0, 0, 0), (0, 0, 4)])).is_none());
+    }
 
     #[test]
     fn test_a_tick_always_publishes_the_clock() {
