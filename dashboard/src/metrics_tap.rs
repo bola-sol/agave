@@ -28,6 +28,15 @@ use {
 /// by the accounts database with the counters reset as it reads them.
 const ACCOUNTS_DB_TIMINGS: &str = "accounts_db_store_timings";
 
+/// The two shred receivers, one per socket. Turbine delivers to the first; the
+/// second carries only what this validator had to ask another node for, which
+/// is what the repair socket is.
+const SHREDS_TURBINE: &str = "shred_fetch_receiver";
+const SHREDS_REPAIR: &str = "shred_fetch_repair_receiver";
+
+/// Packets seen, which for both of those receivers is shreds.
+const PACKETS_COUNT: &str = "packets_count";
+
 /// Running totals of the counters worth watching.
 #[derive(Debug, Default)]
 pub struct MetricsTap {
@@ -37,6 +46,12 @@ pub struct MetricsTap {
     /// Accounts dropped from the cache, which is the usual reason a hit rate
     /// falls.
     pub accounts_cache_evicts: AtomicU64,
+
+    /// Shreds that arrived on their own, and shreds this validator had to ask
+    /// for. A node the cluster is not reaching gets the second where it should
+    /// have had the first.
+    pub shreds_turbine: AtomicU64,
+    pub shreds_repair: AtomicU64,
 }
 
 /// A snapshot of the totals, for differencing between readings.
@@ -45,6 +60,8 @@ pub struct TapCounters {
     pub accounts_cache_hits: u64,
     pub accounts_cache_misses: u64,
     pub accounts_cache_evicts: u64,
+    pub shreds_turbine: u64,
+    pub shreds_repair: u64,
 }
 
 impl MetricsTap {
@@ -66,19 +83,36 @@ impl MetricsTap {
     }
 
     /// Adds what one point carries, if it is one of the few worth reading.
+    ///
+    /// A point this module does not want leaves after the match below, which is
+    /// a comparison against three names. Everything the validator measures about
+    /// itself arrives here, so that is the cost paid on every one of them.
     fn observe(&self, point: &DataPoint) {
-        if point.name != ACCOUNTS_DB_TIMINGS {
-            return;
+        match point.name {
+            ACCOUNTS_DB_TIMINGS => {
+                for (name, value) in &point.fields {
+                    let counter = match *name {
+                        "read_only_accounts_cache_hits" => &self.accounts_cache_hits,
+                        "read_only_accounts_cache_misses" => &self.accounts_cache_misses,
+                        "read_only_accounts_cache_evicts" => &self.accounts_cache_evicts,
+                        _ => continue,
+                    };
+                    add_field(counter, value);
+                }
+            }
+            SHREDS_TURBINE => self.add_packets(&self.shreds_turbine, point),
+            SHREDS_REPAIR => self.add_packets(&self.shreds_repair, point),
+            _ => (),
         }
+    }
+
+    /// Adds a shred receiver's packet count, the whole of what is wanted from
+    /// those two points.
+    fn add_packets(&self, counter: &AtomicU64, point: &DataPoint) {
         for (name, value) in &point.fields {
-            let counter = match *name {
-                "read_only_accounts_cache_hits" => &self.accounts_cache_hits,
-                "read_only_accounts_cache_misses" => &self.accounts_cache_misses,
-                "read_only_accounts_cache_evicts" => &self.accounts_cache_evicts,
-                _ => continue,
-            };
-            if let Some(delta) = field_u64(value) {
-                counter.fetch_add(delta, Ordering::Relaxed);
+            if *name == PACKETS_COUNT {
+                add_field(counter, value);
+                return;
             }
         }
     }
@@ -90,7 +124,16 @@ impl MetricsTap {
             accounts_cache_hits: self.accounts_cache_hits.load(Ordering::Relaxed),
             accounts_cache_misses: self.accounts_cache_misses.load(Ordering::Relaxed),
             accounts_cache_evicts: self.accounts_cache_evicts.load(Ordering::Relaxed),
+            shreds_turbine: self.shreds_turbine.load(Ordering::Relaxed),
+            shreds_repair: self.shreds_repair.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// Adds a field's value to a counter, if it reads as an integer.
+fn add_field(counter: &AtomicU64, value: &str) {
+    if let Some(delta) = field_u64(value) {
+        counter.fetch_add(delta, Ordering::Relaxed);
     }
 }
 
@@ -108,12 +151,16 @@ fn field_u64(value: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
-    fn point(fields: &[(&'static str, &str)]) -> DataPoint {
-        let mut point = DataPoint::new(ACCOUNTS_DB_TIMINGS);
-        for (name, value) in fields {
-            point.fields.push((name, (*value).to_string()));
+    fn named(name: &'static str, fields: &[(&'static str, &str)]) -> DataPoint {
+        let mut point = DataPoint::new(name);
+        for (field, value) in fields {
+            point.fields.push((field, (*value).to_string()));
         }
         point
+    }
+
+    fn point(fields: &[(&'static str, &str)]) -> DataPoint {
+        named(ACCOUNTS_DB_TIMINGS, fields)
     }
 
     #[test]
@@ -168,5 +215,35 @@ mod tests {
             .push(("read_only_accounts_cache_hits", "99i".to_string()));
         tap.observe(&other);
         assert_eq!(tap.counters(), TapCounters::default());
+    }
+
+    #[test]
+    fn test_shreds_are_counted_by_the_socket_they_arrived_on() {
+        // The whole of the repair signal: one receiver per socket, and the
+        // repair one carries only what this validator had to ask for.
+        let tap = MetricsTap::default();
+        tap.observe(&named(SHREDS_TURBINE, &[("packets_count", "900i")]));
+        tap.observe(&named(SHREDS_REPAIR, &[("packets_count", "12i")]));
+        tap.observe(&named(SHREDS_TURBINE, &[("packets_count", "100i")]));
+
+        let counters = tap.counters();
+        assert_eq!(counters.shreds_turbine, 1_000);
+        assert_eq!(counters.shreds_repair, 12);
+    }
+
+    #[test]
+    fn test_only_the_packet_count_is_taken_from_a_receiver() {
+        // Those points carry timings and channel depths as well, and adding
+        // those to a shred count would be nonsense rather than merely wrong.
+        let tap = MetricsTap::default();
+        tap.observe(&named(
+            SHREDS_TURBINE,
+            &[
+                ("packet_batches_count", "7i"),
+                ("packets_count", "900i"),
+                ("channel_len", "3i"),
+            ],
+        ));
+        assert_eq!(tap.counters().shreds_turbine, 900);
     }
 }

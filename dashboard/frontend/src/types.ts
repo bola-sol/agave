@@ -21,6 +21,18 @@ export interface SlotEntry {
 }
 
 /**
+ * Where this validator's shreds came from over the last five minutes.
+ *
+ * Turbine should deliver nearly all of them; repair is the fallback for what
+ * never arrived. Null while none have arrived at all.
+ */
+export interface Shreds {
+  received: number;
+  repaired: number;
+  repair_rate: number;
+}
+
+/**
  * How often an account replay needed was already in memory, over the last
  * minute.
  *

@@ -47,12 +47,33 @@ const DROPS_WINDOW: Duration = Duration::from_secs(60);
 /// match the program cache beside it.
 const ACCOUNTS_CACHE_WINDOW: usize = 60;
 
+/// Samples the shred figures are taken over. Longer than the caches: repair is
+/// bursty by nature — a moment of packet loss and a handful of requests follow —
+/// and a minute of it says more about the last burst than about the connection.
+const SHREDS_WINDOW: usize = 300;
+
 /// Samples the program cache hit rate is taken over, a minute of them.
 ///
 /// One sample is one slot's worth of loads and often only a handful, so a rate
 /// taken from it alone swings between nothing and everything. Summed across the
 /// window it is a rate over real work rather than over the last three lookups.
 const PROGRAM_CACHE_WINDOW: usize = 60;
+
+/// Where this validator's shreds came from over the window.
+///
+/// Turbine should deliver nearly all of them. Repair is what a validator falls
+/// back to for what never arrived, so a rising share of it means the cluster is
+/// not reaching this node — which is the usual state of an unstaked or badly
+/// connected one, and worth seeing before the skip rate says so.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Shreds {
+    /// Shreds received over the window, however they arrived.
+    pub received: u64,
+    /// Of those, the ones this validator had to ask another node for.
+    pub repaired: u64,
+    /// The share it had to ask for, in `[0, 1]`.
+    pub repair_rate: f64,
+}
 
 /// How often an account replay needed was already in memory.
 ///
@@ -237,6 +258,9 @@ pub struct Meters {
     last_tap: Option<TapCounters>,
     accounts_cache_window: VecDeque<(u64, u64, u64)>,
     accounts_cache: Debounced<Option<AccountsCache>>,
+    /// `(turbine, repair)` shreds per sample.
+    shreds_window: VecDeque<(u64, u64)>,
+    shreds: Debounced<Option<Shreds>>,
 }
 
 impl Meters {
@@ -266,6 +290,8 @@ impl Meters {
             last_tap: None,
             accounts_cache_window: VecDeque::with_capacity(ACCOUNTS_CACHE_WINDOW),
             accounts_cache: Debounced::default(),
+            shreds_window: VecDeque::with_capacity(SHREDS_WINDOW),
+            shreds: Debounced::default(),
         }
     }
 
@@ -288,7 +314,7 @@ impl Meters {
 
         self.collect_network();
         self.collect_ingest_paths();
-        self.collect_accounts_cache();
+        self.collect_from_metrics();
     }
 
     /// Publishes how often an account replay needed was already in memory.
@@ -298,11 +324,12 @@ impl Meters {
     /// establishes the baseline instead: counted from zero it would report every
     /// account read since the validator started as though it happened in one
     /// second.
-    fn collect_accounts_cache(&mut self) {
+    fn collect_from_metrics(&mut self) {
         let current = self.metrics_tap.counters();
         let Some(previous) = self.last_tap.replace(current) else {
             return;
         };
+        self.collect_shreds(&previous, &current);
 
         self.accounts_cache_window.push_back((
             current
@@ -328,6 +355,38 @@ impl Meters {
         });
         self.accounts_cache
             .publish(&self.publisher, TOPIC_SUMMARY, "accounts_cache", rate);
+    }
+
+    /// Publishes how much of what arrived had to be asked for.
+    fn collect_shreds(&mut self, previous: &TapCounters, current: &TapCounters) {
+        self.shreds_window.push_back((
+            current
+                .shreds_turbine
+                .saturating_sub(previous.shreds_turbine),
+            current.shreds_repair.saturating_sub(previous.shreds_repair),
+        ));
+        while self.shreds_window.len() > SHREDS_WINDOW {
+            self.shreds_window.pop_front();
+        }
+
+        let mut turbine = 0u64;
+        let mut repaired = 0u64;
+        for (sample_turbine, sample_repair) in &self.shreds_window {
+            turbine = turbine.saturating_add(*sample_turbine);
+            repaired = repaired.saturating_add(*sample_repair);
+        }
+
+        let received = turbine.saturating_add(repaired);
+        // Nothing rather than nought while no shreds have arrived at all, which
+        // is a validator that is not receiving rather than one receiving
+        // perfectly.
+        let shreds = (received > 0).then(|| Shreds {
+            received,
+            repaired,
+            repair_rate: repaired as f64 / received as f64,
+        });
+        self.shreds
+            .publish(&self.publisher, TOPIC_SUMMARY, "shreds", shreds);
     }
 
     fn collect_clock(&self) {
