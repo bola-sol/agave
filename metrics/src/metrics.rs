@@ -642,21 +642,34 @@ mod test {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
         assert!(set_datapoint_observer(Box::new(move |point| {
-            assert_ne!(point.name, "boom", "the observer is broken on purpose");
-            recorder.lock().unwrap().push(point.name);
+            // Every other test in this binary submits points through the same
+            // observer, so only this one's are recorded. Without the filter
+            // they arrive here too, and what they are named is not this test's
+            // business.
+            let Some(name) = point.name.strip_prefix("observer_test_") else {
+                return;
+            };
+            assert_ne!(name, "boom", "the observer is broken on purpose");
+            recorder.lock().unwrap().push(name);
         })));
 
-        submit(DataPoint::new("watched").to_owned(), Level::Info);
+        submit(
+            DataPoint::new("observer_test_watched").to_owned(),
+            Level::Info,
+        );
         assert_eq!(seen.lock().unwrap().as_slice(), ["watched"]);
 
         // A broken observer costs only itself. This would otherwise unwind into
         // a validator thread that was submitting a measurement, not running the
         // observer's errand.
-        submit(DataPoint::new("boom").to_owned(), Level::Info);
+        submit(DataPoint::new("observer_test_boom").to_owned(), Level::Info);
 
         // And it is still watching afterwards: the guard catches the panic
         // rather than tearing the observer down with it.
-        submit(DataPoint::new("after").to_owned(), Level::Info);
+        submit(
+            DataPoint::new("observer_test_after").to_owned(),
+            Level::Info,
+        );
         assert_eq!(seen.lock().unwrap().as_slice(), ["watched", "after"]);
 
         // The first observer keeps the cell rather than being replaced out
