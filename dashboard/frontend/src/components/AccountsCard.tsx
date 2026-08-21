@@ -7,6 +7,12 @@ import { Card, Explain, Meter, Stat } from "./primitives";
  * What the accounts database is holding, where its reads come from, and what it
  * is writing.
  *
+ * The headline is the share of reads served without a disk touch, taken across
+ * both caches. The read cache keeps a hit rate of its own and it is not that
+ * figure: the write cache is consulted first, so its rate is taken over only
+ * the reads that got past there, and shown as a headline it cannot be squared
+ * with the three-way split underneath.
+ *
  * Reads are counted in accounts and writes in bytes, which is lopsided and
  * deliberate. Agave measures the load path in accounts and never in bytes, so
  * there is nothing to build a read throughput from. The write path is measured
@@ -26,21 +32,37 @@ export function AccountsCard() {
   const disk = accounts.disk;
   const live = disk && disk.allocated > 0 ? disk.used / disk.allocated : null;
 
+  // Every load, across both caches and storage. The read cache keeps a hit rate
+  // of its own, and it is the wrong headline: the write cache is consulted
+  // first, so that rate is taken over a fraction of the reads and reports a
+  // figure the split below cannot be reconciled with. What matters is how much
+  // of everything read had to come off a disk.
+  const loads = accounts.from_write_cache + accounts.from_read_cache + accounts.from_storage;
+  const fromMemory = loads > 0 ? 1 - accounts.from_storage / loads : null;
+
   return (
     <Card title="Accounts" className="cache-body">
       <div className="stat-grid">
         <Stat
-          label="Cache hit rate"
-          explain="How often an account replay needed was already in memory, over the last minute. Reads that miss go to a storage file, which is orders of magnitude slower, so a falling rate here shows up as slower replay."
-          value={percent(accounts.hit_rate, 2)}
-          tone={accounts.hit_rate >= 0.95 ? "good" : accounts.hit_rate >= 0.8 ? undefined : "bad"}
-          sub={`${count(accounts.read)} reads · ${count(accounts.evictions)} evicted`}
+          label="Served from memory"
+          explain="Of every account replay read in the last minute, the share answered without touching a storage file. Counted across both caches, so it matches the split below it. A read that misses both goes to disk, which is orders of magnitude slower, and a falling figure here is what slow replay looks like before anything else shows it."
+          value={fromMemory === null ? "—" : percent(fromMemory, 2)}
+          tone={
+            fromMemory === null || fromMemory >= 0.98
+              ? fromMemory === null
+                ? "muted"
+                : "good"
+              : fromMemory >= 0.9
+                ? undefined
+                : "bad"
+          }
+          sub={`${count(loads)} reads · ${count(accounts.from_storage)} from disk`}
         />
         <Stat
-          label="Cache size"
-          explain="What the read cache is holding right now, and how many accounts that is. This is a level rather than a rate, read as it stands rather than summed over the window. Nothing reports the configured maximum alongside it, so it is a size and not a share."
+          label="Read cache size"
+          explain="What the read cache is holding right now, and how many accounts that is. A level rather than a rate, read as it stands rather than summed over the window. Evictions are how it makes room; none at all means it is not under pressure and raising --accounts-db-read-cache-limit would buy nothing."
           value={bytes(accounts.cache_bytes)}
-          sub={`${count(accounts.cache_entries)} accounts`}
+          sub={`${count(accounts.cache_entries)} accounts · ${count(accounts.evictions)} evicted`}
         />
       </div>
 

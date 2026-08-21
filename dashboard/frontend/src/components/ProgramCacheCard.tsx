@@ -15,6 +15,12 @@ import { Card, Explain, Meter, Stat } from "./primitives";
  * it is written only when an eviction runs, so the highest reading across the
  * window is taken rather than the latest.
  *
+ * Compiled and evicted are drawn as a pair and want reading as one. The cache
+ * counts a key it has never seen as an insertion and a key whose compiled code
+ * it threw away as a reload, and only the two together are what it built. Shown
+ * apart, the smaller half sits beside a much larger eviction count and reads as
+ * a cache losing entries it is in fact replacing.
+ *
  * Size is shown in entries rather than in bytes. This cache is a map on the
  * heap, bounded by how many entries it may hold and given no byte budget at
  * all, so entries against that limit is the only fill figure it can honestly
@@ -30,6 +36,17 @@ export function ProgramCacheCard() {
       ? cache.peak_entries / cache.entry_limit
       : null;
 
+  // Both halves of the same figure. Insertions alone counts only keys the cache
+  // had never seen, so shown on its own beside a much larger eviction count it
+  // reads as a cache collapsing when it is holding its size: the reloads make
+  // up the difference, and they belong here rather than under evictions.
+  const compiled = cache.insertions + cache.reloads;
+  const compiledBreakdown = [
+    `${count(cache.insertions)} new`,
+    `${count(cache.reloads)} reloaded`,
+    ...(cache.lost_insertions > 0 ? [`${count(cache.lost_insertions)} lost`] : []),
+  ].join(" · ");
+
   return (
     <Card title="Program Cache" className="cache-body">
       <div className="stat-grid">
@@ -41,8 +58,8 @@ export function ProgramCacheCard() {
           sub={`${count(cache.hits)} hits · ${count(cache.misses)} misses`}
         />
         <Stat
-          label="Loads"
-          explain="Every program lookup replay made in the window, hits and misses together. Small numbers are ordinary, since a block touches few distinct programs. That is why the rate is summed over a minute rather than read off a single slot."
+          label="Lookups"
+          explain="Every time replay asked the cache for a program in the window, hits and misses together. Not the same as loads: a hit is the cache answering without building anything, and only a miss turns into a compile. Small numbers are ordinary, since a block touches few distinct programs, which is why this is summed over a minute rather than read off a single slot."
           value={count(cache.looked_up)}
         />
       </div>
@@ -65,20 +82,19 @@ export function ProgramCacheCard() {
 
       <div className="stat-grid">
         <Stat
-          label="Insertions"
-          explain="Programs compiled and added to the cache in the window. Lost insertions are ones thrown away because the fork they were compiled for had gone by the time they were ready. Wasted work, but not a fault."
-          value={count(cache.insertions)}
-          sub={cache.lost_insertions > 0 ? `${count(cache.lost_insertions)} lost` : undefined}
+          label="Compiled"
+          explain="Every program the cache had to build in the window, which is the work a hit avoids. New ones are keys the cache had not seen. Reloaded ones are keys it already had and had thrown the compiled code away for, so they are the cost of an eviction coming back. Compare this against evictions beside it: a cache in steady state compiles about as many as it drops."
+          value={count(compiled)}
+          sub={compiledBreakdown}
         />
         <Stat
           label="Evictions"
-          explain="Compiled programs dropped to keep the cache within its entry limit. This is the usual reason a hit rate falls, and reloads below are what it costs: the same program compiled again the next time a block wants it."
+          explain="Compiled programs dropped to keep the cache within its entry limit. Set this against what was compiled beside it. Roughly equal figures mean a cache holding its size, and evictions running well ahead mean it is shedding programs faster than they are wanted."
           value={count(cache.evictions)}
-          sub={cache.reloads > 0 ? `${count(cache.reloads)} reloaded` : undefined}
         />
         <Stat
-          label="One-hit wonders"
-          explain="Programs compiled, used once, and then evicted. Cache space and compilation time spent for a single use. A high figure alongside a healthy hit rate is ordinary, because the network has a long tail of rarely used programs."
+          label="Used once"
+          explain="Programs compiled, used a single time, and then evicted. Compilation time and cache space spent for one transaction. A steady figure here alongside a healthy hit rate is ordinary, because the network has a long tail of programs almost nobody calls."
           value={count(cache.one_hit_wonders)}
         />
         <Stat

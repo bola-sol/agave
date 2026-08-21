@@ -40,6 +40,15 @@ export interface Shreds {
  * which carry a second's work each. Null while nothing has been read.
  */
 export interface AccountsCache {
+  /**
+   * The read cache's own lookups and hit rate, which are narrower than they
+   * look and are deliberately not the card's headline.
+   *
+   * The write cache is consulted first, so these cover only the reads that got
+   * past it. Led with, the rate cannot be squared with the three-way split that
+   * counts every load. The card derives its headline from that split instead
+   * and leaves these to whoever is reading the feed directly.
+   */
   read: number;
   hit_rate: number;
   evictions: number;
