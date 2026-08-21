@@ -8,6 +8,13 @@ import { WaterfallRows } from "./WaterfallRows";
 /**
  * Where the transactions this validator was handed actually went.
  *
+ * Named for the scheduler rather than for the TPU, which is what the equivalent
+ * on the Firedancer dashboard is called. Theirs begins at the socket and counts
+ * everything lost to signature verification and deduplication on the way; this
+ * begins where the scheduler is handed what survived all of that, so it is the
+ * last stretch of the same journey rather than the whole of it. A title
+ * claiming the TPU would invite the two to be read as the same figures.
+ *
  * The scheduler counts all of this itself and reports it once a second with its
  * counters reset as it does, so what is drawn is five minutes of work summed
  * rather than anything it is currently holding. Five minutes rather than one
@@ -29,7 +36,7 @@ export function WaterfallCard() {
   const kept = scheduledShare(waterfall);
 
   return (
-    <Card title="Transaction Waterfall" className="waterfall-body">
+    <Card title="Scheduler Waterfall" className="waterfall-body">
       <div className="waterfall-headline">
         <Explain text="Of the transactions this validator kept rather than forwarded, the share it managed to hand to a worker. The received count is a poor headline on its own — it is dominated by traffic the node was never going to execute — where this says whether it kept up with what it did take. Absent when it has held nothing recently, which is the ordinary state of a validator that has not been leader.">
           <span className="waterfall-headline-label">Scheduled of held</span>
