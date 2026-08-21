@@ -155,6 +155,9 @@ fn running() -> StartupProgressFn {
         running: true,
         fraction: None,
         replay_slots: None,
+        stake_percent: None,
+        phase_elapsed_nanos: 0,
+        phases_taken: Vec::new(),
     })
 }
 

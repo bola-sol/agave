@@ -867,6 +867,36 @@ body {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 25%, transparent);
 }
 
+/* Pushed to the right edge so the timings line up down the list and can be
+   read as a column, which is how a boot that stalled somewhere gets spotted. */
+.startup-elapsed {
+  margin-left: auto;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.startup-measure {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 10px;
+}
+
+/* The bar means a different thing under each of the two phases that has one —
+   slots replayed, or stake seen — so it is labelled rather than left bare. */
+.startup-measure-label {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.startup-measure-value {
+  font-family: ui-monospace, monospace;
+  color: var(--text-dim);
+}
+
 .startup-detail {
   color: var(--text-faint);
   font-weight: 400;

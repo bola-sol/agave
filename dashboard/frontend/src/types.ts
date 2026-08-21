@@ -304,6 +304,28 @@ export interface StartupProgress {
   running: boolean;
   /** Ledger replay progress from 0 to 1, on the phases that can measure it. */
   fraction: number | null;
+  /**
+   * Share of the cluster's stake visible in gossip, while waiting for a
+   * supermajority. Null in every other phase, and on the many validators that
+   * never wait at all.
+   */
+  stake_percent: number | null;
+  /**
+   * How long the current phase has been running, and what each finished phase
+   * took.
+   *
+   * Most of the boot sequence cannot say how far through it is — nothing counts
+   * the accounts left to index or the archive left to unpack — so how long it
+   * has been going stands in. On a boot that has stopped somewhere that is the
+   * figure actually being looked for.
+   */
+  phase_elapsed_nanos: number;
+  phases_taken: PhaseTiming[];
+}
+
+export interface PhaseTiming {
+  phase: string;
+  elapsed_nanos: number;
 }
 
 export interface Health {
