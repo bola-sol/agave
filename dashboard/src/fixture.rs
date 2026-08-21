@@ -187,13 +187,13 @@ pub fn fixture() -> Fixture {
         &genesis_config,
         Some(BankTestConfig {
             accounts_db_config: AccountsDbConfig {
-                account_indexes: AccountSecondaryIndexes {
+                account_indexes: Some(AccountSecondaryIndexes {
                     indexes: HashSet::from([AccountIndex::ProgramId]),
                     keys: Some(AccountSecondaryIndexesIncludeExclude {
                         exclude: false,
                         keys: HashSet::from([solana_sdk_ids::config::id()]),
                     }),
-                },
+                }),
                 ..BankTestConfig::default().accounts_db_config
             },
         }),
