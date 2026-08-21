@@ -200,6 +200,11 @@ mod tests {
                 accounts_cache_hits: 15,
                 accounts_cache_misses: 3,
                 accounts_cache_evicts: 1,
+                // Spelled out rather than defaulted: that a point from one
+                // source leaves another source's counters alone is part of what
+                // this is checking.
+                shreds_turbine: 0,
+                shreds_repair: 0,
             }
         );
     }
