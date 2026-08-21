@@ -17,8 +17,8 @@ use {
         collect::{CATCH_UP_SLOTS_PER_SECOND, system_time_nanos},
         context::{DashboardContext, StartupProgressFn},
         metrics_tap::{
-            ExecutedTotals, MetricsTap, QuicTotals, SchedulerTotals, SlotWaterfall, TapCounters,
-            VerifyTotals, WindowedCounters,
+            ExecutedTotals, MetricsTap, ProgramCacheTotals, QuicTotals, SchedulerTotals,
+            SlotWaterfall, TapCounters, VerifyTotals, WindowedCounters,
         },
         net_stats::{self, NetCounters},
         proto::{Debounced, Publisher, TOPIC_SUMMARY},
@@ -31,7 +31,7 @@ use {
     solana_runtime::bank::Bank,
     std::{
         collections::{HashMap, VecDeque},
-        sync::{Arc, atomic::Ordering},
+        sync::Arc,
         time::{Duration, Instant, SystemTime},
     },
 };
