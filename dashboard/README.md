@@ -176,16 +176,14 @@ be kept alongside and written from `modify_packets`, which handles tens of
 thousands of shreds a second, so it would want aggregating per slot rather than
 per shred.
 
-A TPU waterfall. The per-stage packet counters exist in the streamer, sigverify,
+A TPU waterfall. The per-stage packet counters exist in the streamer, sigverify
 and `BankingStageStats`, but they are private and only escape the process
-through `datapoint_info!`. A tee on the metrics agent's `MetricsWriter` would
-reach all of them without touching a single producer, and would work on a
-validator with no metrics configured: the agent buffers every point regardless,
-and it is the InfluxDB writer that discards them. What stands in the way is that
-the agent `datapoint_info!` submits to is a `LazyLock` with no setter, so
-installing a writer needs a hook in `solana-metrics`. Plumbing the counters out
-directly instead spans three crates, and each needs a monotonic mirror, since
-`report()` swaps the originals to zero.
+through `datapoint_info!`. `metrics_tap` already reads that stream, so nothing
+stands in the way any more; what is left is the work of mapping thirty-odd
+Firedancer rows onto Agave's counters, which do not divide the same way. Agave
+resolves address lookup tables inside `receive_and_buffer` and dedups inside
+sigverify, so several of Firedancer's stages collapse into one here, and the
+vote and non-vote paths report separately and have to be summed.
 
 Per-slot transaction detail. The fee, compute units and status of each
 transaction are written by `TransactionStatusService`, which runs only when a
