@@ -13,7 +13,7 @@ use {
         convert::Into,
         env,
         fmt::Write,
-        panic::PanicHookInfo,
+        panic::{AssertUnwindSafe, PanicHookInfo},
         sync::{Arc, Barrier, Mutex, Once, RwLock},
         thread,
         time::{Duration, Instant, UNIX_EPOCH},
@@ -437,6 +437,12 @@ static OBSERVER: std::sync::OnceLock<DataPointObserver> = std::sync::OnceLock::n
 /// validator thread doing something else, so it must be cheap and must not
 /// block. Copying what it wants into a bounded channel is the intended shape.
 ///
+/// A panic in it is caught. Where a `MetricsWriter` runs on the agent's own
+/// thread and can bring down no more than metrics reporting, this runs on a
+/// thread that was doing something the validator needs, and an observer is by
+/// definition code that was not there before. Losing the observer is the worst
+/// it can cost.
+///
 /// Returns false if an observer is already installed; there is one process and
 /// one observer, and the first wins rather than being replaced out from under
 /// whatever set it.
@@ -450,7 +456,13 @@ pub fn submit(point: DataPoint, level: log::Level) {
     // A relaxed load against an unset cell when nothing is watching, which is
     // every validator that has not asked to.
     if let Some(observe) = OBSERVER.get() {
-        observe(&point);
+        // Caught rather than allowed to unwind: this is a validator thread that
+        // was submitting a measurement, not running the observer's errand.
+        // `AssertUnwindSafe` because the point is only lent out, and whatever
+        // the observer holds is the observer's to keep consistent.
+        if std::panic::catch_unwind(AssertUnwindSafe(|| observe(&point))).is_err() {
+            warn!("metrics observer panicked; the point was still submitted");
+        }
     }
     let agent = get_singleton_agent();
     agent.submit(point, level);
@@ -624,23 +636,32 @@ mod test {
     use {super::*, test_mocks::MockMetricsWriter};
 
     #[test]
-    fn test_datapoint_observer_sees_points_and_is_set_once() {
-        // One test for both, because the cell is process-wide and once-only:
-        // split in two they would race for which got to be first.
+    fn test_datapoint_observer() {
+        // One test for all of it, because the cell is process-wide and
+        // once-only: separate tests would race for which got to install first.
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
         assert!(set_datapoint_observer(Box::new(move |point| {
+            assert_ne!(point.name, "boom", "the observer is broken on purpose");
             recorder.lock().unwrap().push(point.name);
         })));
 
         submit(DataPoint::new("watched").to_owned(), Level::Info);
         assert_eq!(seen.lock().unwrap().as_slice(), ["watched"]);
 
+        // A broken observer costs only itself. This would otherwise unwind into
+        // a validator thread that was submitting a measurement, not running the
+        // observer's errand.
+        submit(DataPoint::new("boom").to_owned(), Level::Info);
+
+        // And it is still watching afterwards: the guard catches the panic
+        // rather than tearing the observer down with it.
+        submit(DataPoint::new("after").to_owned(), Level::Info);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["watched", "after"]);
+
         // The first observer keeps the cell rather than being replaced out
         // from under whatever installed it.
         assert!(!set_datapoint_observer(Box::new(|_| {})));
-        submit(DataPoint::new("also_watched").to_owned(), Level::Info);
-        assert_eq!(seen.lock().unwrap().as_slice(), ["watched", "also_watched"]);
     }
 
     #[test]
