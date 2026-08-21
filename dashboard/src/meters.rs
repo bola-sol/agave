@@ -16,7 +16,10 @@ use {
     crate::{
         collect::{CATCH_UP_SLOTS_PER_SECOND, system_time_nanos},
         context::{DashboardContext, StartupProgressFn},
-        metrics_tap::{MetricsTap, SchedulerTotals, SlotWaterfall, TapCounters},
+        metrics_tap::{
+            ExecutedTotals, MetricsTap, QuicTotals, SchedulerTotals, SlotWaterfall, TapCounters,
+            VerifyTotals, WindowedCounters,
+        },
         net_stats::{self, NetCounters},
         proto::{Debounced, Publisher, TOPIC_SUMMARY},
         udp_drops::{self, PortCounters, PortWindow},
@@ -314,9 +317,22 @@ pub struct Meters {
     /// `(turbine, repair)` shreds per sample.
     shreds_window: VecDeque<(u64, u64)>,
     shreds: Debounced<Option<Shreds>>,
-    /// One interval's worth of the scheduler's counters per sample.
+    /// One interval's worth of each stage's counters per sample.
+    ///
+    /// Four windows rather than one, published under four keys, because the
+    /// four stages do not reconcile into a single flow: each is instrumented on
+    /// its own terms, reports on its own cadence, and hands on a population the
+    /// next does not quite receive. Drawn as four sections, each internally
+    /// consistent; run together as one chain they would imply an arithmetic
+    /// that does not hold.
     waterfall_window: VecDeque<SchedulerTotals>,
     waterfall: Debounced<Option<SchedulerTotals>>,
+    quic_window: VecDeque<QuicTotals>,
+    quic: Debounced<Option<QuicTotals>>,
+    verify_window: VecDeque<VerifyTotals>,
+    verify: Debounced<Option<VerifyTotals>>,
+    executed_window: VecDeque<ExecutedTotals>,
+    executed: Debounced<Option<ExecutedTotals>>,
     slot_waterfalls: Debounced<Vec<SlotWaterfall>>,
 }
 
@@ -353,6 +369,12 @@ impl Meters {
             shreds: Debounced::default(),
             waterfall_window: VecDeque::with_capacity(WATERFALL_WINDOW),
             waterfall: Debounced::default(),
+            quic_window: VecDeque::with_capacity(WATERFALL_WINDOW),
+            quic: Debounced::default(),
+            verify_window: VecDeque::with_capacity(WATERFALL_WINDOW),
+            verify: Debounced::default(),
+            executed_window: VecDeque::with_capacity(WATERFALL_WINDOW),
+            executed: Debounced::default(),
             slot_waterfalls: Debounced::default(),
         }
     }
@@ -392,7 +414,7 @@ impl Meters {
             return;
         };
         self.collect_shreds(&previous, &current);
-        self.collect_waterfall(&previous.scheduler, &current.scheduler);
+        self.collect_waterfall(&previous, &current);
 
         self.accounts_cache_window.push_back((
             current
@@ -459,25 +481,59 @@ impl Meters {
     /// and the window is their sum. That makes the published figures counts
     /// over the window rather than anything the scheduler is holding — a
     /// standing queue depth is not in here, and could not be got from these.
-    fn collect_waterfall(&mut self, previous: &SchedulerTotals, current: &SchedulerTotals) {
-        self.waterfall_window.push_back(current.since(previous));
-        while self.waterfall_window.len() > WATERFALL_WINDOW {
-            self.waterfall_window.pop_front();
-        }
+    fn collect_waterfall(&mut self, previous: &TapCounters, current: &TapCounters) {
+        // Nothing rather than a column of noughts, for each of the four. Every
+        // one of these points is submitted only when its stage had something to
+        // say, so an empty window is a stage nothing has been sent — which is
+        // not the same as one throwing everything away, and a panel of zeroes
+        // reads as the second.
+        let scheduler = windowed(
+            &mut self.waterfall_window,
+            current.scheduler.since(&previous.scheduler),
+            WATERFALL_WINDOW,
+        );
+        self.waterfall.publish(
+            &self.publisher,
+            TOPIC_SUMMARY,
+            "waterfall",
+            (scheduler.received > 0).then_some(scheduler),
+        );
 
-        let mut totals = SchedulerTotals::default();
-        for sample in &self.waterfall_window {
-            totals = totals.plus(sample);
-        }
+        let quic = windowed(
+            &mut self.quic_window,
+            current.quic.since(&previous.quic),
+            WATERFALL_WINDOW,
+        );
+        self.quic.publish(
+            &self.publisher,
+            TOPIC_SUMMARY,
+            "quic",
+            (quic.handed_on > 0 || quic.queue_full > 0).then_some(quic),
+        );
 
-        // Nothing rather than a column of noughts. The scheduler submits its
-        // point only when it has something to say, so a window with nothing in
-        // it is a validator nothing has been sent — which is not the same as
-        // one whose scheduler is throwing everything away, and a panel of
-        // zeroes reads as the second.
-        let waterfall = (totals.received > 0).then_some(totals);
-        self.waterfall
-            .publish(&self.publisher, TOPIC_SUMMARY, "waterfall", waterfall);
+        let verify = windowed(
+            &mut self.verify_window,
+            current.verify.since(&previous.verify),
+            WATERFALL_WINDOW,
+        );
+        self.verify.publish(
+            &self.publisher,
+            TOPIC_SUMMARY,
+            "verify",
+            (verify.received > 0).then_some(verify),
+        );
+
+        let executed = windowed(
+            &mut self.executed_window,
+            current.executed.since(&previous.executed),
+            WATERFALL_WINDOW,
+        );
+        self.executed.publish(
+            &self.publisher,
+            TOPIC_SUMMARY,
+            "executed",
+            (executed.attempted > 0).then_some(executed),
+        );
 
         // The per-slot points ride along here rather than being joined onto the
         // produced blocks before sending. Those are built on the other thread
@@ -824,6 +880,21 @@ impl Meters {
     }
 }
 
+/// Pushes one interval onto a window, forgets what fell out, and sums the rest.
+///
+/// Generic over the stage because all four want exactly this and nothing else,
+/// and four copies of a loop that drops the oldest sample is four chances to
+/// drop it from the wrong end.
+fn windowed<T: WindowedCounters>(window: &mut VecDeque<T>, sample: T, span: usize) -> T {
+    window.push_back(sample);
+    while window.len() > span {
+        window.pop_front();
+    }
+    window
+        .iter()
+        .fold(T::default(), |total, sample| total.plus(sample))
+}
+
 /// What a port's counter read when the baseline was taken.
 ///
 /// Nought before there is one, which makes the first minute of a validator's
@@ -854,6 +925,16 @@ fn push_history<T: Serialize>(history: &mut Vec<T>, sample: T, publisher: &Publi
 #[cfg(test)]
 mod tests {
     use {super::*, crate::fixture::fixture, std::thread::sleep};
+
+    /// A tap reading carrying only the scheduler, which is the stage most of
+    /// these tests are about. The other three ride in the same struct and are
+    /// left at nought so that each test moves one thing.
+    fn tap(scheduler: SchedulerTotals) -> TapCounters {
+        TapCounters {
+            scheduler,
+            ..TapCounters::default()
+        }
+    }
 
     /// A window of `(hits, misses, evictions)` samples.
     fn window(samples: &[(u64, u64, u64)]) -> VecDeque<(u64, u64, u64)> {
@@ -960,8 +1041,8 @@ mod tests {
             buffered: 65,
             ..SchedulerTotals::default()
         };
-        meters.collect_waterfall(&start, &next);
-        meters.collect_waterfall(&next, &last);
+        meters.collect_waterfall(&tap(start), &tap(next));
+        meters.collect_waterfall(&tap(next), &tap(last));
 
         let published = harness.published_key("summary", "waterfall").unwrap();
         // A hundred then a hundred and fifty, against a counter reading 1,250.
@@ -976,7 +1057,7 @@ mod tests {
         // would read as one throwing everything away, which is the opposite.
         let harness = fixture();
         let mut meters = harness.meters();
-        meters.collect_waterfall(&SchedulerTotals::default(), &SchedulerTotals::default());
+        meters.collect_waterfall(&TapCounters::default(), &TapCounters::default());
 
         let published = harness.published_key("summary", "waterfall").unwrap();
         assert!(published.contains(r#""value":null"#), "{published}");
@@ -995,7 +1076,7 @@ mod tests {
                 received: (step as u64).saturating_mul(10),
                 ..SchedulerTotals::default()
             };
-            meters.collect_waterfall(&previous, &current);
+            meters.collect_waterfall(&tap(previous), &tap(current));
             previous = current;
         }
 

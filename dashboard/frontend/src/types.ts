@@ -228,6 +228,39 @@ export interface Waterfall {
 }
 
 /**
+ * The three stages either side of the scheduler.
+ *
+ * Sent under keys of their own and drawn as separate sections rather than as one
+ * flow with the scheduler. They are instrumented independently, report on
+ * different cadences, and each hands on a population the next does not quite
+ * receive, so a single chain across them would imply an arithmetic that does not
+ * hold. Each section balances against itself and nothing else.
+ */
+export interface QuicStage {
+  handed_on: number;
+  queue_full: number;
+  disconnected: number;
+}
+
+export interface VerifyStage {
+  received: number;
+  duplicate: number;
+  below_floor: number;
+  verified: number;
+  /** Batches, not transactions. Never added to the counts beside it. */
+  evicted_batches: number;
+}
+
+export interface ExecutedStage {
+  attempted: number;
+  cost_throttled: number;
+  retryable: number;
+  expired_bank: number;
+  processed: number;
+  succeeded: number;
+}
+
+/**
  * One leader slot's waterfall, sent as its own list rather than nested on the
  * produced block it belongs to.
  *

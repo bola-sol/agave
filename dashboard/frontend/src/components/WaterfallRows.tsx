@@ -1,20 +1,19 @@
 import { count, percent } from "../format";
-import { waterfallRows } from "../waterfall";
-import type { Waterfall } from "../types";
+import type { WaterfallRow } from "../waterfall";
 import { Explain } from "./primitives";
 
 /**
  * The waterfall itself, drawn the same way wherever it appears.
  *
- * Two places want it: the live card, over a rolling window, and the expanded
- * detail of a produced block, over that one slot. They differ in what they are
- * counting and in nothing else, so the rows, the bars and the wording are one
- * component rather than two that have to be kept saying the same thing.
+ * Takes rows rather than a stage, because the places that want it now differ in
+ * more than their window: four sections of the live card, each with its own
+ * counters and its own denominator, and the expanded detail of a produced block
+ * over one slot. What they share is how a row looks, which is all of this.
  */
-export function WaterfallRows({ waterfall }: { waterfall: Waterfall }) {
+export function WaterfallRows({ rows }: { rows: WaterfallRow[] }) {
   return (
     <div className="waterfall">
-      {waterfallRows(waterfall).map((row) => (
+      {rows.map((row) => (
         <div key={row.key} className={`waterfall-row is-${row.kind}`}>
           <Explain text={row.explain} className="waterfall-label">
             {row.label}

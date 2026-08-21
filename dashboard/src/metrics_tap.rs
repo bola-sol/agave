@@ -78,6 +78,32 @@ const PACKETS_COUNT: &str = "packets_count";
 /// has set their log level to.
 const SCHEDULER_COUNTS: &str = "banking_stage_scheduler_counts";
 
+/// The QUIC listener on the TPU port, the stage before verification.
+///
+/// Only the one port. Forwards and vote have listeners of their own reporting
+/// under their own names, and neither feeds the scheduler this card follows.
+const QUIC_TPU: &str = "quic_streamer_tpu";
+
+/// Signature verification and deduplication for everything that is not a vote.
+///
+/// `tpu-vote-verifier` is the same point for votes and is deliberately left
+/// alone: votes take a different path out of here and never reach the scheduler
+/// below, so adding them would inflate the top of the card against a bottom
+/// that could never account for them.
+const TPU_VERIFIER: &str = "tpu-verifier";
+
+/// The worker threads, which is where a scheduled transaction is executed.
+///
+/// One point per worker, all under this name and distinguished by an `id` tag.
+/// Nothing here reads the tag: accumulating every one of them into the same
+/// counters is what gives the figure for the stage as a whole.
+///
+/// Submitted at trace level, where everything else this reads is info. That
+/// costs nothing, because the level is only consulted by the agent that writes
+/// points onward — [`solana_metrics::submit`] calls the observer before it, so
+/// a point nobody would ever collect still arrives here.
+const WORKER_COUNTS: &str = "banking_stage_worker_counts";
+
 /// The same twenty-one counters again, covering one leader slot rather than one
 /// second, and carrying the slot they belong to as a field.
 ///
@@ -95,6 +121,59 @@ const SLOT: &str = "slot";
 /// Leader slots kept. Matched to the produced block panel's own retention, so
 /// every block it can show has its waterfall for as long as it is shown.
 const SLOT_WATERFALLS: usize = 64;
+
+/// What the QUIC listener did with the transactions it pulled off the wire.
+///
+/// The narrowest of the four stages. QUIC keeps no count of what arrived, only
+/// of what it managed to hand on and what it had to throw away, so the total
+/// offered is the sum of the three rather than a figure of its own.
+#[derive(Debug, Default)]
+pub struct QuicCounters {
+    /// Handed on towards verification.
+    pub handed_on: AtomicU64,
+    /// Thrown away because the queue towards verification was full. The one
+    /// row here that means this validator could not keep up.
+    pub queue_full: AtomicU64,
+    /// Thrown away because that queue had gone.
+    pub disconnected: AtomicU64,
+}
+
+/// What signature verification and deduplication did with what QUIC handed on.
+#[derive(Debug, Default)]
+pub struct VerifyCounters {
+    /// Everything that arrived, votes excluded.
+    pub received: AtomicU64,
+    /// Seen before. The network sends the same transaction more than once as a
+    /// matter of course, so this is ordinary rather than a fault.
+    pub duplicate: AtomicU64,
+    /// Dropped for paying too little, when a priority floor is configured.
+    pub below_floor: AtomicU64,
+    /// Passed verification.
+    pub verified: AtomicU64,
+    /// Batches — not transactions — dropped because the queue onward to the
+    /// scheduler was full. Kept apart from everything else here for that
+    /// reason: it cannot be added to or subtracted from a count of packets.
+    pub evicted_batches: AtomicU64,
+}
+
+/// What the worker threads did with what the scheduler gave them.
+#[derive(Debug, Default)]
+pub struct ExecutedCounters {
+    /// Transactions the workers took up.
+    pub attempted: AtomicU64,
+    /// Held back by the cost model rather than executed: the block had no room
+    /// left for them.
+    pub cost_throttled: AtomicU64,
+    /// Handed back to be tried again.
+    pub retryable: AtomicU64,
+    /// Handed back because the bank they were for had gone.
+    pub expired_bank: AtomicU64,
+    /// Executed and committed to a block.
+    pub processed: AtomicU64,
+    /// Of those, the ones whose result was success. The rest landed in the
+    /// block having failed, which still costs their fee.
+    pub succeeded: AtomicU64,
+}
 
 /// Running totals of the counters worth watching.
 #[derive(Debug, Default)]
@@ -128,6 +207,18 @@ pub struct MetricsTap {
     /// them addable to a drop count in the first place.
     pub packets_gossip: AtomicU64,
     pub packets_tpu_vote: AtomicU64,
+
+    /// The three stages either side of the scheduler, which together with it
+    /// make the whole path a transaction takes through this validator.
+    ///
+    /// Four separate sets rather than one, and the panel draws them as four
+    /// sections rather than one flow, because they do not reconcile: each is
+    /// instrumented on its own terms, reports on its own cadence, and counts a
+    /// population the next one does not quite receive. Summed into a single
+    /// chain they would look authoritative and be quietly wrong.
+    pub quic: QuicCounters,
+    pub verify: VerifyCounters,
+    pub executed: ExecutedCounters,
 
     /// Where the transactions handed to the banking stage ended up.
     pub scheduler: SchedulerCounters,
@@ -229,6 +320,32 @@ pub struct SchedulerCounters {
 /// scheduler's, and twenty-one lines of assigning one to the other would be
 /// twenty-one chances to cross a pair over silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct QuicTotals {
+    pub handed_on: u64,
+    pub queue_full: u64,
+    pub disconnected: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct VerifyTotals {
+    pub received: u64,
+    pub duplicate: u64,
+    pub below_floor: u64,
+    pub verified: u64,
+    pub evicted_batches: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ExecutedTotals {
+    pub attempted: u64,
+    pub cost_throttled: u64,
+    pub retryable: u64,
+    pub expired_bank: u64,
+    pub processed: u64,
+    pub succeeded: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct SchedulerTotals {
     pub received: u64,
     pub not_held: u64,
@@ -264,6 +381,9 @@ pub struct TapCounters {
     pub packets_gossip: u64,
     pub packets_tpu_vote: u64,
     pub scheduler: SchedulerTotals,
+    pub quic: QuicTotals,
+    pub verify: VerifyTotals,
+    pub executed: ExecutedTotals,
 }
 
 impl MetricsTap {
@@ -287,7 +407,7 @@ impl MetricsTap {
     /// Adds what one point carries, if it is one of the few worth reading.
     ///
     /// A point this module does not want leaves after the match below, which is
-    /// a comparison against six names. Everything the validator measures about
+    /// a comparison against ten names. Everything the validator measures about
     /// itself arrives here, so that is the cost paid on every one of them.
     fn observe(&self, point: &DataPoint) {
         match point.name {
@@ -308,6 +428,9 @@ impl MetricsTap {
             TPU_VOTE_RECEIVER => self.add_packets(&self.packets_tpu_vote, point),
             SCHEDULER_COUNTS => self.scheduler.add_point(point),
             SCHEDULER_SLOT_COUNTS => self.remember_slot(point),
+            QUIC_TPU => self.quic.add_point(point),
+            TPU_VERIFIER => self.verify.add_point(point),
+            WORKER_COUNTS => self.executed.add_point(point),
             _ => (),
         }
     }
@@ -388,6 +511,91 @@ impl MetricsTap {
             packets_gossip: self.packets_gossip.load(Ordering::Relaxed),
             packets_tpu_vote: self.packets_tpu_vote.load(Ordering::Relaxed),
             scheduler: self.scheduler.totals(),
+            quic: self.quic.totals(),
+            verify: self.verify.totals(),
+            executed: self.executed.totals(),
+        }
+    }
+}
+
+impl QuicCounters {
+    fn add_point(&self, point: &DataPoint) {
+        for (name, value) in &point.fields {
+            let counter = match *name {
+                "total_packets_sent_to_consumer" => &self.handed_on,
+                "total_handle_chunk_to_packet_send_full_err" => &self.queue_full,
+                "total_handle_chunk_to_packet_send_disconnected_err" => &self.disconnected,
+                // The rest of that point is connections, streams and stream
+                // throttling: gauges and connection-level counts that say
+                // nothing about how many transactions got through.
+                _ => continue,
+            };
+            add_field(counter, value);
+        }
+    }
+
+    fn totals(&self) -> QuicTotals {
+        QuicTotals {
+            handed_on: self.handed_on.load(Ordering::Relaxed),
+            queue_full: self.queue_full.load(Ordering::Relaxed),
+            disconnected: self.disconnected.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl VerifyCounters {
+    fn add_point(&self, point: &DataPoint) {
+        for (name, value) in &point.fields {
+            let counter = match *name {
+                "total_packets" => &self.received,
+                "total_dedup" => &self.duplicate,
+                "total_dropped_below_priority_floor" => &self.below_floor,
+                "total_valid_packets" => &self.verified,
+                "eviction_drops" => &self.evicted_batches,
+                // Timings, batch counts, and the deduper's saturation flag.
+                _ => continue,
+            };
+            add_field(counter, value);
+        }
+    }
+
+    fn totals(&self) -> VerifyTotals {
+        VerifyTotals {
+            received: self.received.load(Ordering::Relaxed),
+            duplicate: self.duplicate.load(Ordering::Relaxed),
+            below_floor: self.below_floor.load(Ordering::Relaxed),
+            verified: self.verified.load(Ordering::Relaxed),
+            evicted_batches: self.evicted_batches.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl ExecutedCounters {
+    fn add_point(&self, point: &DataPoint) {
+        for (name, value) in &point.fields {
+            let counter = match *name {
+                "transactions_attempted_processing_count" => &self.attempted,
+                "cost_model_throttled_transactions_count" => &self.cost_throttled,
+                "retryable_transaction_count" => &self.retryable,
+                "retryable_expired_bank_count" => &self.expired_bank,
+                "processed_transactions_count" => &self.processed,
+                "processed_with_successful_result_count" => &self.succeeded,
+                // `max_queue_len` is a gauge and `num_messages_processed`
+                // counts batches rather than transactions.
+                _ => continue,
+            };
+            add_field(counter, value);
+        }
+    }
+
+    fn totals(&self) -> ExecutedTotals {
+        ExecutedTotals {
+            attempted: self.attempted.load(Ordering::Relaxed),
+            cost_throttled: self.cost_throttled.load(Ordering::Relaxed),
+            retryable: self.retryable.load(Ordering::Relaxed),
+            expired_bank: self.expired_bank.load(Ordering::Relaxed),
+            processed: self.processed.load(Ordering::Relaxed),
+            succeeded: self.succeeded.load(Ordering::Relaxed),
         }
     }
 }
@@ -463,68 +671,92 @@ impl SchedulerCounters {
     }
 }
 
-impl SchedulerTotals {
-    /// This reading less the one before it, which is the work of one interval.
-    ///
-    /// Saturating throughout. The totals only climb, so a lower reading than
-    /// the last means the tap was installed mid-flight or a counter was reset
-    /// under it, and nought is the right answer to that rather than a number
-    /// near `u64::MAX`.
-    pub fn since(&self, previous: &Self) -> Self {
-        let step = |current: u64, before: u64| current.saturating_sub(before);
-        Self {
-            received: step(self.received, previous.received),
-            not_held: step(self.not_held, previous.not_held),
-            check_queue_full: step(self.check_queue_full, previous.check_queue_full),
-            unparsable: step(self.unparsable, previous.unparsable),
-            bad_locks: step(self.bad_locks, previous.bad_locks),
-            compute_budget: step(self.compute_budget, previous.compute_budget),
-            too_old: step(self.too_old, previous.too_old),
-            already_processed: step(self.already_processed, previous.already_processed),
-            fee_payer: step(self.fee_payer, previous.fee_payer),
-            filtered: step(self.filtered, previous.filtered),
-            nonce_conflict: step(self.nonce_conflict, previous.nonce_conflict),
-            buffered: step(self.buffered, previous.buffered),
-            queue_full: step(self.queue_full, previous.queue_full),
-            nonce_evicted: step(self.nonce_evicted, previous.nonce_evicted),
-            cleared: step(self.cleared, previous.cleared),
-            cleaned: step(self.cleaned, previous.cleaned),
-            scheduled: step(self.scheduled, previous.scheduled),
-            blocked_conflicts: step(self.blocked_conflicts, previous.blocked_conflicts),
-            blocked_threads: step(self.blocked_threads, previous.blocked_threads),
-            finished: step(self.finished, previous.finished),
-            retried: step(self.retried, previous.retried),
-        }
-    }
-
+/// Counters that only ever climb, so a window of them is a difference summed.
+///
+/// A trait rather than four sets of inherent methods so the windowing itself
+/// can be written once, in the collector, instead of once per stage.
+pub trait WindowedCounters: Copy + Default {
+    /// This reading less the one before it, which is one interval's work.
+    fn since(&self, previous: &Self) -> Self;
     /// This reading added to another, for summing a window of them.
-    pub fn plus(&self, other: &Self) -> Self {
-        let sum = |a: u64, b: u64| a.saturating_add(b);
-        Self {
-            received: sum(self.received, other.received),
-            not_held: sum(self.not_held, other.not_held),
-            check_queue_full: sum(self.check_queue_full, other.check_queue_full),
-            unparsable: sum(self.unparsable, other.unparsable),
-            bad_locks: sum(self.bad_locks, other.bad_locks),
-            compute_budget: sum(self.compute_budget, other.compute_budget),
-            too_old: sum(self.too_old, other.too_old),
-            already_processed: sum(self.already_processed, other.already_processed),
-            fee_payer: sum(self.fee_payer, other.fee_payer),
-            filtered: sum(self.filtered, other.filtered),
-            nonce_conflict: sum(self.nonce_conflict, other.nonce_conflict),
-            buffered: sum(self.buffered, other.buffered),
-            queue_full: sum(self.queue_full, other.queue_full),
-            nonce_evicted: sum(self.nonce_evicted, other.nonce_evicted),
-            cleared: sum(self.cleared, other.cleared),
-            cleaned: sum(self.cleaned, other.cleaned),
-            scheduled: sum(self.scheduled, other.scheduled),
-            blocked_conflicts: sum(self.blocked_conflicts, other.blocked_conflicts),
-            blocked_threads: sum(self.blocked_threads, other.blocked_threads),
-            finished: sum(self.finished, other.finished),
-            retried: sum(self.retried, other.retried),
-        }
-    }
+    fn plus(&self, other: &Self) -> Self;
 }
+
+/// Differencing and summing for a set of counters that only ever climb.
+///
+/// Written once rather than once per stage. Every one of these types needs the
+/// same two operations across every one of its fields, and a field left out of
+/// either is silently wrong in the worst way available: it reads as nought for
+/// ever rather than failing, so the row it feeds looks measured and says
+/// nothing. Listing the fields once removes the chance.
+macro_rules! counter_arithmetic {
+    ($totals:ident { $($field:ident),* $(,)? }) => {
+        impl WindowedCounters for $totals {
+            /// Saturating throughout. The totals only climb, so a lower reading
+            /// than the last means the tap was installed mid-flight or a counter
+            /// was reset under it, and nought is the right answer to that rather
+            /// than a number near `u64::MAX`.
+            fn since(&self, previous: &Self) -> Self {
+                Self {
+                    $($field: self.$field.saturating_sub(previous.$field),)*
+                }
+            }
+
+            fn plus(&self, other: &Self) -> Self {
+                Self {
+                    $($field: self.$field.saturating_add(other.$field),)*
+                }
+            }
+        }
+    };
+}
+
+counter_arithmetic!(QuicTotals {
+    handed_on,
+    queue_full,
+    disconnected,
+});
+
+counter_arithmetic!(VerifyTotals {
+    received,
+    duplicate,
+    below_floor,
+    verified,
+    evicted_batches,
+});
+
+counter_arithmetic!(ExecutedTotals {
+    attempted,
+    cost_throttled,
+    retryable,
+    expired_bank,
+    processed,
+    succeeded,
+});
+
+counter_arithmetic!(SchedulerTotals {
+    received,
+    not_held,
+    check_queue_full,
+    unparsable,
+    bad_locks,
+    compute_budget,
+    too_old,
+    already_processed,
+    fee_payer,
+    filtered,
+    nonce_conflict,
+    buffered,
+    queue_full,
+    nonce_evicted,
+    cleared,
+    cleaned,
+    scheduled,
+    blocked_conflicts,
+    blocked_threads,
+    finished,
+    retried,
+});
 
 /// Adds a field's value to a counter, if it reads as an integer.
 fn add_field(counter: &AtomicU64, value: &str) {
@@ -873,6 +1105,68 @@ mod tests {
         let held = tap.slot_waterfalls();
         assert_eq!(held.len(), SLOT_WATERFALLS);
         assert_eq!(held[0].slot, 10);
+    }
+
+    #[test]
+    fn test_the_verify_stage_accounts_for_every_packet_it_was_given() {
+        // There is no counter for a failed signature. It is what is left once
+        // the duplicates, the underpaying and the verified are taken off, and
+        // that subtraction is only exact because sigverify discards at one step
+        // and returns — a packet is deduplicated, or dropped below the floor,
+        // or verified, or bad, and never two of them.
+        let tap = MetricsTap::default();
+        tap.observe(&named(
+            TPU_VERIFIER,
+            &[
+                ("total_packets", "1000i"),
+                ("total_dedup", "300i"),
+                ("total_dropped_below_priority_floor", "50i"),
+                ("total_valid_packets", "620i"),
+                ("total_verify_time_us", "4200i"),
+            ],
+        ));
+
+        let verify = tap.counters().verify;
+        assert_eq!(verify.received, 1_000);
+        let accounted = verify
+            .duplicate
+            .saturating_add(verify.below_floor)
+            .saturating_add(verify.verified);
+        assert_eq!(verify.received.saturating_sub(accounted), 30);
+    }
+
+    #[test]
+    fn test_every_worker_adds_into_the_same_execution_totals() {
+        // One point per worker thread, told apart only by a tag nothing here
+        // reads. Summing them is what gives the figure for the stage, so a tap
+        // that kept them apart or took the last would report one worker's share
+        // of the work as all of it.
+        let tap = MetricsTap::default();
+        for _ in 0..4 {
+            tap.observe(&named(
+                WORKER_COUNTS,
+                &[
+                    ("transactions_attempted_processing_count", "100i"),
+                    ("processed_transactions_count", "90i"),
+                    ("processed_with_successful_result_count", "80i"),
+                ],
+            ));
+        }
+
+        let executed = tap.counters().executed;
+        assert_eq!(executed.attempted, 400);
+        assert_eq!(executed.processed, 360);
+        assert_eq!(executed.succeeded, 320);
+    }
+
+    #[test]
+    fn test_the_vote_verifier_is_not_counted_with_the_rest() {
+        // Votes leave sigverify by a different door and never reach the
+        // scheduler, so counting them at the top would inflate a total the
+        // stages below could never account for.
+        let tap = MetricsTap::default();
+        tap.observe(&named("tpu-vote-verifier", &[("total_packets", "5000i")]));
+        assert_eq!(tap.counters().verify.received, 0);
     }
 
     #[test]

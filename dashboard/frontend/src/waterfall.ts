@@ -5,7 +5,7 @@
  * as the turn folding and the bar scale.
  */
 
-import type { Waterfall } from "./types";
+import type { ExecutedStage, QuicStage, VerifyStage, Waterfall } from "./types";
 
 /** What a row is doing in the list, which is what decides how it is drawn. */
 export type RowKind =
@@ -225,4 +225,171 @@ export function scheduledShare(w: Waterfall): number | null {
   // queue draining faster than it fills genuinely reports more scheduled than
   // buffered, and a figure above 100% reads as a bug rather than as a drain.
   return Math.min(1, w.scheduled / w.buffered);
+}
+
+/**
+ * Building the rows for a stage, against a denominator of its own.
+ *
+ * Every section is drawn against what *it* was given rather than against a
+ * figure from the section above. That is the whole reason these are four
+ * sections and not one flow: what QUIC hands on is not what verify receives, and
+ * a bar drawn against the wrong stage's total would be a quiet lie.
+ */
+function rowsOf(
+  total: number,
+  rows: Array<[key: string, label: string, kind: RowKind, count: number, explain: string]>,
+): WaterfallRow[] {
+  return rows.map(([key, label, kind, count, explain]) => ({
+    key,
+    label,
+    kind,
+    count,
+    share: total > 0 ? count / total : 0,
+    explain,
+  }));
+}
+
+/** What the QUIC listener on the TPU port did with what it pulled off the wire. */
+export function quicRows(q: QuicStage): WaterfallRow[] {
+  // QUIC keeps no count of what arrived, only of what it got rid of and how, so
+  // the total offered is the sum of the outcomes rather than a figure of its own.
+  const offered = q.handed_on + q.queue_full + q.disconnected;
+  return rowsOf(offered, [
+    [
+      "quic_offered",
+      "Off the wire",
+      "stage",
+      offered,
+      "Transactions pulled out of QUIC streams on the TPU port. QUIC counts no total of its own, so this is the three outcomes below added together — every transaction it finished reading either went on or was thrown away.",
+    ],
+    [
+      "quic_queue_full",
+      "fetch queue full",
+      "loss",
+      q.queue_full,
+      "Read successfully and then dropped, because the queue towards signature verification had no room. This is the row that means the validator could not keep up with what was being sent to it.",
+    ],
+    [
+      "quic_disconnected",
+      "queue gone",
+      "loss",
+      q.disconnected,
+      "Dropped because the queue onward had been closed, which happens while the validator is shutting down.",
+    ],
+    [
+      "quic_handed_on",
+      "Handed on",
+      "stage",
+      q.handed_on,
+      "Passed to signature verification. This is the section below's input, though not exactly its received count: the two are measured either side of the fetch stage's own buffering.",
+    ],
+  ]);
+}
+
+/** What signature verification and deduplication did with it. */
+export function verifyRows(v: VerifyStage): WaterfallRow[] {
+  // No counter exists for a failed signature. Sigverify discards at one step
+  // and returns, so a packet is deduplicated, or dropped below the floor, or
+  // verified, or bad — never two — and what is left over is exactly the bad.
+  const bad = Math.max(0, v.received - v.duplicate - v.below_floor - v.verified);
+  return rowsOf(v.received, [
+    [
+      "verify_received",
+      "Received",
+      "stage",
+      v.received,
+      "Transactions arriving at signature verification, votes excluded. Votes are verified separately and never reach the scheduler below, so they are left out here rather than inflating a total the rest of the card could not account for.",
+    ],
+    [
+      "verify_duplicate",
+      "duplicate",
+      "loss",
+      v.duplicate,
+      "Seen already. Senders and forwarding validators both retry, so a substantial share here is ordinary rather than a fault.",
+    ],
+    [
+      "verify_below_floor",
+      "below priority floor",
+      "loss",
+      v.below_floor,
+      "Dropped for offering too little, when a priority floor is configured. Nought on a validator that has not set one.",
+    ],
+    [
+      "verify_bad",
+      "bad signature",
+      "loss",
+      bad,
+      "Failed signature verification. There is no counter for this: it is what is left of the received count once the duplicates, the underpaying and the verified are taken off. Sigverify stops at the first thing that discards a packet, so nothing is counted twice and the remainder is exact.",
+    ],
+    [
+      "verify_verified",
+      "Verified",
+      "stage",
+      v.verified,
+      "Passed, and went on towards the scheduler.",
+    ],
+    [
+      "verify_evicted",
+      "batches dropped, queue full",
+      "note",
+      v.evicted_batches,
+      "Counted in batches rather than transactions, which is why it sits apart from the figures above and is not subtracted from them. Verified work thrown away because the queue onward to the scheduler was full — real loss, in a unit that cannot be added to the rest.",
+    ],
+  ]);
+}
+
+/** What the worker threads did with what the scheduler gave them. */
+export function executedRows(e: ExecutedStage): WaterfallRow[] {
+  const failed = Math.max(0, e.processed - e.succeeded);
+  return rowsOf(e.attempted, [
+    [
+      "exec_attempted",
+      "Attempted",
+      "stage",
+      e.attempted,
+      "Transactions the worker threads took up. Summed across every worker: each reports separately, and the stage is all of them together.",
+    ],
+    [
+      "exec_cost_throttled",
+      "no room in the block",
+      "loss",
+      e.cost_throttled,
+      "Held back by the cost model rather than executed, because the block had no capacity left for them. On a full block this is expected; it means the validator filled the space it had.",
+    ],
+    [
+      "exec_retryable",
+      "sent back to retry",
+      "note",
+      e.retryable,
+      "Returned to be tried again rather than committed. Not lost — it goes back to the queue.",
+    ],
+    [
+      "exec_expired_bank",
+      "bank had gone",
+      "note",
+      e.expired_bank,
+      "Returned because the slot they were meant for had ended. Ordinary at the end of a stretch of leader slots.",
+    ],
+    [
+      "exec_processed",
+      "Committed",
+      "stage",
+      e.processed,
+      "Executed and written into a block.",
+    ],
+    [
+      "exec_failed",
+      "failed, but still in the block",
+      "loss",
+      failed,
+      "Executed, returned an error, and landed in the block anyway — which is how Solana works, and the sender still pays the fee. Derived as committed minus succeeded.",
+    ],
+    [
+      "exec_succeeded",
+      "Succeeded",
+      "stage",
+      e.succeeded,
+      "Executed and returned success.",
+    ],
+  ]);
 }

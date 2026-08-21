@@ -1475,6 +1475,33 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* Each section restarts its bars at full against a total of its own, so it
+   needs a rule and a name above it. Without them the card reads as one cascade
+   that keeps climbing back to a hundred percent. */
+.waterfall-section + .waterfall-section {
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.waterfall-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.waterfall-section-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+
+.waterfall-section-note {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
 /* The same rows again inside an expanded produced block, one slot's worth
    rather than a rolling window. Separated from the figures above it by a rule
    rather than a heading alone, because the two are counting different things:

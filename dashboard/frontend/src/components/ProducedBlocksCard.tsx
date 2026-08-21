@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { blockTime, count, percent, sol } from "../format";
 import type { ProducedBlock, SlotWaterfall } from "../types";
 import { useStore } from "../useStore";
+import { waterfallRows } from "../waterfall";
 import { Copyable } from "./Copyable";
 import { Card, Explain, Meter } from "./primitives";
 import { WaterfallRows } from "./WaterfallRows";
@@ -141,7 +142,7 @@ function SlotWaterfallDetail({ waterfall }: { waterfall: SlotWaterfall }) {
       <Explain text="Every transaction the banking stage was handed during this slot, and what became of it. The indented rows are the ones that got no further, and why. Received is exactly buffered plus those first reasons; the later stages do not add up the same way, because the queue holds transactions across slots and some of what was scheduled here arrived before this slot began.">
         <span className="produced-waterfall-title">Scheduler</span>
       </Explain>
-      <WaterfallRows waterfall={waterfall} />
+      <WaterfallRows rows={waterfallRows(waterfall)} />
     </div>
   );
 }

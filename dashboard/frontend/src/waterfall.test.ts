@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Waterfall } from "./types";
-import { scheduledShare, waterfallRows } from "./waterfall";
+import type { ExecutedStage, VerifyStage, Waterfall } from "./types";
+import { executedRows, quicRows, scheduledShare, verifyRows, waterfallRows } from "./waterfall";
 
 /** A window in which nothing happened, to be overridden a field at a time. */
 function quiet(over: Partial<Waterfall> = {}): Waterfall {
@@ -138,5 +138,104 @@ describe("scheduledShare", () => {
     // draining faster than it fills genuinely reports it. Over 100% reads as a
     // bug in the page rather than as a queue draining.
     expect(scheduledShare(quiet({ buffered: 10, scheduled: 40 }))).toBe(1);
+  });
+});
+
+/** Finds one row by key, so a test names what it is asserting on. */
+function rowOf(rows: ReturnType<typeof waterfallRows>, key: string) {
+  const row = rows.find((r) => r.key === key);
+  if (!row) throw new Error(`no row ${key}`);
+  return row;
+}
+
+describe("verifyRows", () => {
+  const stage = (over: Partial<VerifyStage> = {}): VerifyStage => ({
+    received: 0,
+    duplicate: 0,
+    below_floor: 0,
+    verified: 0,
+    evicted_batches: 0,
+    ...over,
+  });
+
+  it("derives bad signatures from what the other outcomes leave over", () => {
+    // There is no counter for it. Sigverify stops at the first thing that
+    // discards a packet, so each one is deduplicated, or below the floor, or
+    // verified, or bad, and the remainder is exactly the bad ones.
+    const rows = verifyRows(
+      stage({ received: 1000, duplicate: 300, below_floor: 50, verified: 620 }),
+    );
+    expect(rowOf(rows, "verify_bad").count).toBe(30);
+  });
+
+  it("never reports a negative count when the parts do not line up", () => {
+    // The four figures are swapped to zero as they are reported and the tap
+    // accumulates whatever it is given, so a point arriving mid-reset can put
+    // the parts above the total. A negative row would be nonsense on screen.
+    const rows = verifyRows(stage({ received: 100, duplicate: 90, verified: 40 }));
+    expect(rowOf(rows, "verify_bad").count).toBe(0);
+  });
+
+  it("keeps the batch figure out of the transaction arithmetic", () => {
+    // It counts batches. Subtracting it from a packet count, or adding it in,
+    // would be mixing two units.
+    const rows = verifyRows(
+      stage({ received: 100, duplicate: 0, verified: 100, evicted_batches: 7 }),
+    );
+    expect(rowOf(rows, "verify_bad").count).toBe(0);
+    expect(rowOf(rows, "verify_evicted").count).toBe(7);
+    expect(rowOf(rows, "verify_evicted").kind).toBe("note");
+  });
+});
+
+describe("quicRows", () => {
+  it("makes the total from the outcomes, having no count of its own", () => {
+    const rows = quicRows({ handed_on: 900, queue_full: 80, disconnected: 20 });
+    expect(rowOf(rows, "quic_offered").count).toBe(1000);
+    expect(rowOf(rows, "quic_offered").share).toBe(1);
+    expect(rowOf(rows, "quic_queue_full").share).toBeCloseTo(0.08, 10);
+  });
+});
+
+describe("executedRows", () => {
+  const stage = (over: Partial<ExecutedStage> = {}): ExecutedStage => ({
+    attempted: 0,
+    cost_throttled: 0,
+    retryable: 0,
+    expired_bank: 0,
+    processed: 0,
+    succeeded: 0,
+    ...over,
+  });
+
+  it("derives the failures from committed less succeeded", () => {
+    // A transaction that returns an error still lands in the block and still
+    // pays, so this is a real row rather than a loss to be hidden.
+    const rows = executedRows(stage({ attempted: 100, processed: 90, succeeded: 80 }));
+    expect(rowOf(rows, "exec_failed").count).toBe(10);
+  });
+
+  it("does not go negative if succeeded outruns committed across a reset", () => {
+    const rows = executedRows(stage({ attempted: 10, processed: 5, succeeded: 9 }));
+    expect(rowOf(rows, "exec_failed").count).toBe(0);
+  });
+});
+
+describe("each section is drawn against its own total", () => {
+  it("does not measure one stage against another's denominator", () => {
+    // The whole reason these are four sections. QUIC handing on nine hundred
+    // and verify receiving a thousand is ordinary — they are measured either
+    // side of the fetch stage's buffering — and the bars must not imply that
+    // verify received more than everything.
+    const quic = quicRows({ handed_on: 900, queue_full: 0, disconnected: 0 });
+    const verify = verifyRows({
+      received: 1000,
+      duplicate: 0,
+      below_floor: 0,
+      verified: 1000,
+      evicted_batches: 0,
+    });
+    expect(rowOf(quic, "quic_handed_on").share).toBe(1);
+    expect(rowOf(verify, "verify_received").share).toBe(1);
   });
 });
