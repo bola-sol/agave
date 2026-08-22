@@ -74,19 +74,23 @@ the domain in the site block is the name to allow, and nothing else is needed.
 
 ### What it costs the validator
 
-The expensive sampling, meaning the cluster-wide validator list and the
-per-slot account sweep behind validator names, only runs while at least one viewer is
+The expensive sampling, meaning the cluster-wide validator list and the per-slot
+account sweep behind validator names, only runs while at least one viewer is
 connected. With nobody watching, the collector does slot bookkeeping and little
-else. The one-off scan that maps identities to names waits until the validator
-has caught up before it runs, so it does not compete with the replay burst that
-follows startup.
+else.
+
+The one-off read that maps identities to names runs once, when the collector
+attaches. It asks the secondary index which accounts the config program owns and
+reads only those, so it costs about what any other account load costs, and it is
+skipped entirely on a validator whose index does not cover that program. See
+[Validator names](#validator-names).
 
 ## Architecture
 
 ```
 core/src/validator.rs ──► DashboardService
                             ├── collector thread  (samples state, diffs, publishes)
-                            ├── info loader       (validator-name scan, once caught up)
+                            ├── info loader       (validator names, read once at attach)
                             └── server thread     (HTTP + websocket on one port)
 ```
 
