@@ -761,7 +761,11 @@ impl QuicCounters {
     fn add_point(&self, point: &DataPoint) {
         for (name, value) in &point.fields {
             let counter = match *name {
-                "total_packets_sent_to_consumer" => &self.handed_on,
+                // Named for the counter, not for the field it is reported
+                // under: the struct calls this `total_packets_sent_to_consumer`
+                // and the point calls it this. Matching the struct's name reads
+                // nought for ever and takes the whole section with it.
+                "packets_sent_to_consumer" => &self.handed_on,
                 "total_handle_chunk_to_packet_send_full_err" => &self.queue_full,
                 "total_handle_chunk_to_packet_send_disconnected_err" => &self.disconnected,
                 // The rest of that point is connections, streams and stream
@@ -1376,6 +1380,28 @@ mod tests {
         let held = tap.slot_waterfalls();
         assert_eq!(held.len(), SLOT_WATERFALLS);
         assert_eq!(held[0].slot, 10);
+    }
+
+    #[test]
+    fn test_the_quic_fields_are_the_ones_the_point_carries() {
+        // Two of these are named after the counter behind them and one is not,
+        // which is not guessable and was wrong once. A field name taken from
+        // the struct rather than from the wire matches nothing, reads nought
+        // for ever, and takes its whole section down with it.
+        let tap = MetricsTap::default();
+        tap.observe(&named(
+            QUIC_TPU,
+            &[
+                ("packets_sent_to_consumer", "900i"),
+                ("total_handle_chunk_to_packet_send_full_err", "8i"),
+                ("total_handle_chunk_to_packet_send_disconnected_err", "1i"),
+            ],
+        ));
+
+        let quic = tap.counters().quic;
+        assert_eq!(quic.handed_on, 900);
+        assert_eq!(quic.queue_full, 8);
+        assert_eq!(quic.disconnected, 1);
     }
 
     #[test]
