@@ -10,9 +10,9 @@ import { Header } from "./components/Header";
 import { AccountsCard } from "./components/AccountsCard";
 import { IngestCard } from "./components/IngestCard";
 import { NetworkCard } from "./components/NetworkCard";
-import { ProducedBlocksCard } from "./components/ProducedBlocksCard";
 import { ProgramCacheCard } from "./components/ProgramCacheCard";
 import { SchedulePage } from "./components/SchedulePage";
+import { SlotDetailsPage } from "./components/SlotDetailsPage";
 import { Sidebar } from "./components/Sidebar";
 import { VersionsCard } from "./components/VersionsCard";
 import { WaterfallCard } from "./components/WaterfallCard";
@@ -40,9 +40,10 @@ export function App() {
     document.title = label ? `${TITLE} | ${label}` : TITLE;
   }, [name, identity]);
 
-  // The schedule lists the same slots in more detail, so the rail beside it
-  // would be the same thing twice. Its collapsed state is remembered rather
-  // than reset, so returning to the overview finds it as it was left.
+  // Only the overview keeps the slot rail. The schedule lists the same slots in
+  // more detail, so the rail beside it would be the same thing twice, and the
+  // block detail wants the width more than it wants the context. The collapsed
+  // state is remembered rather than reset, so coming back finds it as it was.
   const rail = page === "overview";
   const classes = ["app"];
   if (rail && collapsed) classes.push("is-collapsed");
@@ -68,7 +69,9 @@ export function App() {
           </div>
         )}
         <Nav page={page} onSelect={setPage} />
-        {page === "overview" ? <Overview /> : <SchedulePage />}
+        {page === "overview" && <Overview />}
+        {page === "slots" && <SlotDetailsPage />}
+        {page === "schedule" && <SchedulePage />}
       </main>
     </div>
   );
@@ -102,13 +105,13 @@ function Overview() {
           count what reached the host, this counts what became of it once the
           banking stage had it. */}
       <WaterfallCard />
-      <ProducedBlocksCard />
     </>
   );
 }
 
 const PAGES: { page: Page; label: string }[] = [
   { page: "overview", label: "Overview" },
+  { page: "slots", label: "Slot details" },
   { page: "schedule", label: "Schedule" },
 ];
 

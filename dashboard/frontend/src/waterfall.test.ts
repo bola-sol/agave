@@ -239,3 +239,31 @@ describe("each section is drawn against its own total", () => {
     expect(rowOf(verify, "verify_received").share).toBe(1);
   });
 });
+
+describe("a stage fed from the queue", () => {
+  it("caps its bar and reports the overflow rather than exceeding the total", () => {
+    // Routine over a single slot. The scheduler's queue holds transactions
+    // across slots, so a slot can dispatch more than arrived in it by taking
+    // the difference from what was already waiting. Twelve received and
+    // thirteen scheduled is the case that was reported as a broken figure.
+    const rows = waterfallRows(quiet({ received: 12, buffered: 12, scheduled: 13, finished: 13 }));
+
+    const scheduled = rowOf(rows, "scheduled");
+    expect(scheduled.count).toBe(13);
+    expect(scheduled.share).toBe(1);
+    expect(scheduled.over).toBe(true);
+  });
+
+  it("leaves a stage inside its total alone", () => {
+    const rows = waterfallRows(quiet({ received: 100, buffered: 40 }));
+    const buffered = rowOf(rows, "buffered");
+    expect(buffered.share).toBeCloseTo(0.4, 10);
+    expect(buffered.over).toBe(false);
+  });
+
+  it("reports nothing rather than dividing when the stage saw no traffic", () => {
+    const rows = waterfallRows(quiet());
+    expect(rowOf(rows, "received").share).toBe(0);
+    expect(rowOf(rows, "received").over).toBe(false);
+  });
+});

@@ -4,18 +4,23 @@ import type { ProducedBlock, SlotWaterfall } from "../types";
 import { useStore } from "../useStore";
 import { waterfallRows } from "../waterfall";
 import { Copyable } from "./Copyable";
-import { Card, Explain, Meter } from "./primitives";
+import { Explain, Meter } from "./primitives";
 import { WaterfallRows } from "./WaterfallRows";
 
 /**
- * Detail for the blocks this validator produced.
+ * Every block this validator produced, and what went into each one.
  *
- * Everything here is read while the block's bank is still in bank forks, since
- * the cost tracker and the collected fees go with the bank when it is dropped
- * after rooting. The panel is therefore a record of what was captured, not
- * something that can be recomputed for an arbitrary past slot.
+ * All of it is read while the block's bank is still in bank forks, since the
+ * cost tracker and the collected fees go with the bank when it is dropped after
+ * rooting. This is a record of what was captured as each block froze, not
+ * something that can be recomputed for an arbitrary past slot, which is why the
+ * list ends where the dashboard started rather than where the ledger does.
+ *
+ * A page rather than a card because a row opens into several hundred pixels of
+ * detail. Squeezed into the overview it scrolled that through a six-row window,
+ * and the waterfall inside it was most of what had to be scrolled past.
  */
-export function ProducedBlocksCard() {
+export function SlotDetailsPage() {
   const store = useStore();
   const blocks = store.get<ProducedBlock[]>("summary", "produced_blocks");
   const waterfalls = store.get<SlotWaterfall[]>("summary", "slot_waterfalls");
@@ -29,17 +34,22 @@ export function ProducedBlocksCard() {
     [waterfalls],
   );
 
-  if (!blocks || blocks.length === 0) return null;
+  if (!blocks || blocks.length === 0) {
+    return (
+      <section className="slot-details">
+        <div className="sidebar-empty">
+          nothing produced yet. Blocks appear here as this validator leads.
+        </div>
+      </section>
+    );
+  }
 
   // Newest first: a validator wants its last block, not its oldest.
   const newest = [...blocks].reverse();
 
   return (
-    <Card title="Produced Blocks" className="produced-body">
-      {/* The list grows while a block is open. Its detail is far taller than
-          the six-row window this scrolls in normally, and the waterfall inside
-          it is most of that. */}
-      <div className={`produced${open === null ? "" : " is-expanded"}`}>
+    <section className="slot-details">
+      <div className="produced">
         {newest.map((block) => (
           <BlockRow
             key={block.slot}
@@ -51,9 +61,10 @@ export function ProducedBlocksCard() {
         ))}
       </div>
       <div className="card-footnote">
-        Captured as each block froze. {count(blocks.length)} kept.
+        Captured as each block froze. {count(blocks.length)} kept, oldest first
+        to fall off.
       </div>
-    </Card>
+    </section>
   );
 }
 
@@ -76,6 +87,9 @@ function BlockRow({
         <span className="produced-slot">{count(block.slot)}</span>
         <span className="produced-txns">{count(block.transactions)} txns</span>
         <span className="produced-fill">{percent(filled, 1)} full</span>
+        {/* Base and priority together, which is what the block earned. The
+            detail below splits them; the row wants one figure. */}
+        <span className="produced-fees">{sol(block.total_fees, 5)} SOL</span>
         <span className="produced-ms">
           {block.duration_nanos === null
             ? "—"

@@ -7,6 +7,21 @@
 
 import type { ExecutedStage, QuicStage, VerifyStage, Waterfall } from "./types";
 
+/**
+ * A count as a share of the stage's total, capped at the whole of it.
+ *
+ * Capped rather than allowed past a hundred percent, and the overflow reported
+ * rather than hidden. A stage fed from the queue can genuinely exceed the total
+ * it is drawn against, most visibly over a single slot, and a bar longer than
+ * its own track or a figure above a hundred percent reads as a bug rather than
+ * as the queue draining.
+ */
+function against(total: number, count: number): { share: number; over: boolean } {
+  if (total <= 0) return { share: 0, over: false };
+  const share = count / total;
+  return { share: Math.min(1, share), over: share > 1 };
+}
+
 /** What a row is doing in the list, which is what decides how it is drawn. */
 export type RowKind =
   /** A point every transaction passes through: received, buffered, scheduled. */
@@ -23,6 +38,18 @@ export interface WaterfallRow {
   count: number;
   /** Of everything received, in `[0, 1]`. The bar's length. */
   share: number;
+  /**
+   * Whether the count is larger than the total it is drawn against, which makes
+   * `share` a cap rather than a measurement.
+   *
+   * This is ordinary rather than a fault, and routine over a single slot. The
+   * scheduler's queue holds transactions across slots, so a slot can dispatch
+   * more than arrived in it by taking the difference from what was already
+   * waiting. There is no denominator that fixes it: the work simply did not all
+   * arrive in the window being measured. The row shows its count and no
+   * percentage, rather than one over a hundred that reads as a broken figure.
+   */
+  over: boolean;
   explain: string;
 }
 
@@ -39,14 +66,13 @@ export function waterfallRows(w: Waterfall): WaterfallRow[] {
   // Everything is drawn against what arrived, so the bars are comparable down
   // the whole card rather than each stage being renormalised against the one
   // above it. Guarded because the card is drawn from the first sample.
-  const of = (count: number) => (w.received > 0 ? count / w.received : 0);
   const row = (
     key: string,
     label: string,
     kind: RowKind,
     count: number,
     explain: string,
-  ): WaterfallRow => ({ key, label, kind, count, share: of(count), explain });
+  ): WaterfallRow => ({ key, label, kind, count, ...against(w.received, count), explain });
 
   return [
     row(
@@ -244,7 +270,7 @@ function rowsOf(
     label,
     kind,
     count,
-    share: total > 0 ? count / total : 0,
+    ...against(total, count),
     explain,
   }));
 }

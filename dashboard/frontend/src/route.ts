@@ -11,9 +11,12 @@
 
 import { useEffect, useState } from "react";
 
-export type Page = "overview" | "schedule";
+export type Page = "overview" | "slots" | "schedule";
 
-const PAGES: Page[] = ["overview", "schedule"];
+/** In the order the nav lists them, which is the order they are worked through:
+ *  what the validator is doing now, the blocks it produced, then what is
+ *  coming. */
+const PAGES: Page[] = ["overview", "slots", "schedule"];
 
 /** The page a hash names, defaulting to the overview for anything unknown. */
 export function readPage(hash: string): Page {

@@ -5,6 +5,7 @@ describe("readPage", () => {
   it("reads a page out of the hash, with or without the slash", () => {
     expect(readPage("#/schedule")).toBe("schedule");
     expect(readPage("#schedule")).toBe("schedule");
+    expect(readPage("#/slots")).toBe("slots");
   });
 
   it("falls back to the overview rather than showing nothing", () => {
@@ -18,7 +19,7 @@ describe("readPage", () => {
 
 describe("pageHash", () => {
   it("round-trips every page", () => {
-    for (const page of ["overview", "schedule"] as const) {
+    for (const page of ["overview", "slots", "schedule"] as const) {
       expect(readPage(pageHash(page))).toBe(page);
     }
   });

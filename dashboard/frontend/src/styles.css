@@ -1259,35 +1259,24 @@ body {
 
 /* ---- produced blocks ---- */
 
-.produced-body {
+/* Scrolls with the page rather than inside a window of its own. On the overview
+   this was a card capped at six rows, which meant reading several hundred
+   pixels of opened detail through a slot that size. A page has the room. */
+.slot-details {
   display: flex;
   flex-direction: column;
+  gap: 12px;
 }
 
 .produced {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  /* Six rows and a bit, so a long run of leader slots scrolls rather than
-     stretching the card past the others in its row. */
-  max-height: 260px;
-  overflow-y: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--border) transparent;
-}
-
-/* Shut, this list is a short scroller of one-line rows and six of them is
-   plenty. Open, one of those rows carries several hundred pixels of detail, and
-   reading that through a two-hundred-and-sixty-pixel window is worse than a
-   taller card. Grows to hold it, and capped against the viewport so it can
-   never be taller than the screen it is being read on. */
-.produced.is-expanded {
-  max-height: min(780px, 78vh);
 }
 
 .produced-head {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 6em 5.5em 5em;
+  grid-template-columns: minmax(0, 1fr) 6em 5.5em 8em 5em;
   align-items: baseline;
   gap: 8px;
   width: 100%;
@@ -1324,9 +1313,18 @@ body {
 
 .produced-txns,
 .produced-fill,
+.produced-fees,
 .produced-ms {
   text-align: right;
   font-size: 11.5px;
+}
+
+/* The one figure in the row that is money rather than a measurement, so it is
+   given the same monospace treatment as the slot number it belongs to and can
+   be scanned down the column. */
+.produced-fees {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
 }
 
 .produced-detail {

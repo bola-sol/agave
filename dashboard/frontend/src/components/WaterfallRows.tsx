@@ -28,7 +28,13 @@ export function WaterfallRows({ rows }: { rows: WaterfallRow[] }) {
               style={{ width: `${row.count > 0 ? Math.max(1, row.share * 100) : 0}%` }}
             />
           </span>
-          <span className="waterfall-share">{row.count > 0 ? percent(row.share, 1) : ""}</span>
+          {/* No percentage on a row whose count runs past the total it is drawn
+              against. The bar is already capped, and a figure over a hundred
+              percent beside it reads as a broken number rather than as the
+              queue handing on work that arrived before this window. */}
+          <span className="waterfall-share">
+            {row.count > 0 && !row.over ? percent(row.share, 1) : ""}
+          </span>
         </div>
       ))}
     </div>
