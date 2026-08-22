@@ -691,8 +691,15 @@ impl AccountsCounters {
                 "num_loaded_from_write_cache" => &self.loaded_from_write_cache,
                 "num_loaded_from_read_cache" => &self.loaded_from_read_cache,
                 "num_loaded_from_index_storage" => &self.loaded_from_storage,
-                "num_accounts_stored" => &self.stored_accounts,
-                "account_bytes_stored" => &self.stored_bytes,
+                // Two spellings each, because this point renamed its fields
+                // between validator versions: what 4.3 calls stored, 4.2 calls
+                // flushed. Both are matched so this file is the same on either
+                // branch, and the name that does not exist simply never
+                // arrives. Only the flush point is read for these, so the
+                // identically named field on the shrink stats is not picked up
+                // by accident.
+                "num_accounts_stored" | "num_accounts_flushed" => &self.stored_accounts,
+                "account_bytes_stored" | "account_bytes_flushed" => &self.stored_bytes,
                 _ => continue,
             };
             add_field(counter, value);
@@ -1380,6 +1387,27 @@ mod tests {
         let held = tap.slot_waterfalls();
         assert_eq!(held.len(), SLOT_WATERFALLS);
         assert_eq!(held[0].slot, 10);
+    }
+
+    #[test]
+    fn test_the_flush_point_is_read_under_either_spelling() {
+        // The field was renamed between validator versions and this crate is
+        // carried across both, so a single spelling would leave the whole
+        // written-to-storage section reading nought on one of them.
+        for (accounts, bytes) in [
+            ("num_accounts_stored", "account_bytes_stored"),
+            ("num_accounts_flushed", "account_bytes_flushed"),
+        ] {
+            let tap = MetricsTap::default();
+            tap.observe(&named(
+                ACCOUNTS_FLUSH,
+                &[(accounts, "500i"), (bytes, "64000i")],
+            ));
+
+            let read = tap.counters().accounts;
+            assert_eq!(read.stored_accounts, 500, "{accounts}");
+            assert_eq!(read.stored_bytes, 64_000, "{bytes}");
+        }
     }
 
     #[test]
