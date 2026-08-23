@@ -337,7 +337,10 @@ pub struct ReplayWindow {
 /// whose log filter is quiet enough to keep this point from arriving at all.
 fn replay_window(slots: &[ReplaySlotTimes]) -> Option<ReplayWindow> {
     let count = u64::try_from(slots.len()).ok().filter(|n| *n > 0)?;
-    let mean = |total: u64| total / count;
+    // Checked rather than plain division. The filter above already rules the
+    // divisor out of being nought, but the workspace denies bare arithmetic and
+    // a guard three lines up is not something the lint can see.
+    let mean = |total: u64| total.checked_div(count).unwrap_or_default();
     let sum = |pick: fn(&ReplaySlotTimes) -> u64| {
         slots
             .iter()

@@ -1661,7 +1661,7 @@ mod tests {
     #[test]
     fn test_only_the_newest_replayed_slots_are_kept() {
         let tap = MetricsTap::default();
-        for micros in 0..REPLAY_SLOTS + 10 {
+        for micros in 0..REPLAY_SLOTS.saturating_add(10) {
             tap.observe(&replay_point(&[("execute_us", &format!("{micros}i"))]));
         }
 
