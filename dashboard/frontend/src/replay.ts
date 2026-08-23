@@ -45,7 +45,8 @@ function rowsOf(
  * What replay's own thread spent on the average slot.
  *
  * Three spans measured one after another, so they are disjoint and their sum is
- * a real duration — the one to hold against how long a slot lasts. This is the
+ * a real duration, and it is the one to hold against how long a slot lasts.
+ * This is the
  * serial bottleneck: however many cores a node has, if this exceeds the slot
  * time it falls behind.
  *
@@ -76,7 +77,7 @@ export function serialRows(r: ReplayWindow): ReplayRow[] {
       "Completing the bank",
       "phase",
       r.completing,
-      "Waiting for the unified scheduler to finish executing, then freezing the bank. Near nothing while execution keeps up, because by the time replay asks, the scheduler has long since finished. It is the row that grows first if it stops keeping up.",
+      "Waiting for the unified scheduler to finish executing, then freezing the bank. Near nothing while execution keeps up, because by the time replay asks, the scheduler has long since finished. It is the row that grows first if the scheduler starts falling behind.",
     ],
   ]);
 }
@@ -112,7 +113,7 @@ export function verifyRows(r: ReplayWindow): ReplayRow[] {
       "Dispatching to the scheduler",
       "phase",
       r.dispatch,
-      "Turning verified entries into tasks and handing them to the unified scheduler. Not execution — that happens afterwards, on the worker threads, and is counted below.",
+      "Turning verified entries into tasks and handing them to the unified scheduler. This is not execution. That happens afterwards on the worker threads, and is counted below.",
     ],
   ]);
 }
@@ -121,7 +122,7 @@ export function verifyRows(r: ReplayWindow): ReplayRow[] {
  * Where the thread time went, across every worker.
  *
  * Accumulated per thread and summed, so this is CPU time rather than wall
- * clock and will normally exceed the slot it describes — that is what running
+ * clock and will normally exceed the slot it describes, which is what running
  * on many cores looks like. The phases are sequential within a thread, so
  * unlike the verification figures above these partition cleanly and their total
  * is a real quantity: what one slot costs the machine.
@@ -183,7 +184,7 @@ export function cpuRows(r: ReplayWindow): ReplayRow[] {
       "of which, compiling",
       "part",
       r.compiling,
-      "Reading a program's ELF, verifying its bytecode and compiling it, because it was not in the cache. This is the cost the hit rate on the program cache panel does not show — and it arrives in bursts, so the peak beside it is worth more than the average.",
+      "Reading a program's ELF, verifying its bytecode and compiling it, because it was not in the cache. The hit rate on the program cache panel cannot show you this. It arrives in bursts, so the peak beside it says more than the average.",
     ],
     [
       "checking",

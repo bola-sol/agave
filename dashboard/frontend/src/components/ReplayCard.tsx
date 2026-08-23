@@ -12,7 +12,7 @@ import { Card, Explain, Stat } from "./primitives";
  * this page watches transactions arriving; this watches the node keep up with
  * everyone else's blocks, which is the half that decides whether it skips.
  *
- * Two resources, and they fail differently. Replay's own thread is serial — if
+ * Two resources, and they fail differently. Replay's own thread is serial: if
  * one slot's worth of work there exceeds one slot of time, no number of cores
  * will help. The thread time across the workers is capacity, and is measured
  * in cores rather than in percent because that is what it buys.
@@ -45,7 +45,7 @@ export function ReplayCard() {
         <Stat
           label="Replay thread"
           value={micros(serial)}
-          explain="Time replay's own thread spent on the average slot: reading the block, verifying it, dispatching it, and completing the bank. These run one after another, so this is a real duration. It is the serial limit — if it approaches the slot time, the node falls behind however many cores it has."
+          explain="Time replay's own thread spent on the average slot: reading the block, verifying it, dispatching it, and completing the bank. These run one after another, so this is a real duration. It is also the serial limit. If it approaches the slot time, the node falls behind however many cores it has."
         />
         <Stat
           label="Of slot time"
@@ -56,12 +56,12 @@ export function ReplayCard() {
           label="CPU per slot"
           value={micros(cpu)}
           sub={cores === null ? undefined : `${decimal(cores, 2)} cores`}
-          explain="Thread time one slot costs across every worker, and what that comes to in cores held busy. Exceeding the slot time is ordinary and is what running on many cores looks like; the trend is what matters, not the number."
+          explain="Thread time one slot costs across every worker, and what that comes to in cores held busy. Exceeding the slot time is ordinary, and is what running on many cores looks like. Watch which way it moves over days rather than reading much into any one figure."
         />
         <Stat
           label="Worst slot"
           value={micros(replay.serial_peak)}
-          explain="The worst single slot in the window, taken from each slot's own total rather than by adding up each figure's separate worst — those land on different slots and would describe one that never happened."
+          explain="The worst single slot in the window, taken from each slot's own total. Adding up each figure's separate worst would describe a slot that never happened, because those maxima land on different slots."
         />
       </div>
 
@@ -69,21 +69,21 @@ export function ReplayCard() {
         title="Time spent on this slot"
         total={micros(serial)}
         rows={serialRows(replay)}
-        explain="Replay's own thread, split into the three spans it spends there. Measured one after another, so these add up. Wall clock from first sight of the slot is far longer, but replay works several slots at once and votes and chooses forks in between, so what fills that gap belongs to no one slot."
+        explain="Replay's own thread, split into the three spans it spends there. Measured one after another, so these add up. Wall clock from first sight of the slot is far longer, but replay works several slots at once and votes and chooses forks in between, so nothing in that gap can be charged to this slot in particular."
       />
 
       <Section
         title="Verifying effort"
         note="relative only"
         rows={verifyRows(replay)}
-        explain="Which part of verification costs more. These are sums of asynchronous jobs that overlap one another and each run across many threads, so together they come to several times the window they happened in and cannot be split out of it. Each is measured the same way as the others, which is what makes comparing them sound and comparing them to the figures above unsound."
+        explain="Which part of verification costs more. These are sums of asynchronous jobs that overlap one another and each run across many threads, so together they come to several times the window they happened in and cannot be split out of it. Each is measured the same way as the others, so comparing them to each other is sound. Comparing them to the figures above is not."
       />
 
       <Section
         title="Execution, CPU time across threads"
         total={micros(cpu)}
         rows={cpuRows(replay)}
-        explain="Thread time accumulated across the worker threads, so this is CPU rather than wall clock and normally exceeds the slot. The phases are sequential within a thread, so unlike the verification figures these partition cleanly and their total is what one slot costs the machine."
+        explain="Thread time accumulated across the worker threads, so this is CPU rather than wall clock and normally exceeds the slot. The phases are sequential within a thread, so unlike the verification figures these partition cleanly and their total is the CPU one slot costs."
       />
 
       <div className="card-footnote">
