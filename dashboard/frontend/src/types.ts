@@ -334,6 +334,31 @@ export interface ExecutedStage {
   expired_bank: number;
   processed: number;
   succeeded: number;
+
+  /**
+   * Why a transaction the workers took up never reached the block, from the
+   * error counters the same worker reports beside the counts above.
+   *
+   * Only the reasons that end a transaction are here. The ones that hand it
+   * back — account in use, and the four cost-limit errors — are already drawn
+   * as retries, and an instruction error is a transaction that did reach the
+   * block having failed, which is drawn as that. Counting any of them again
+   * here would be counting the same transaction twice.
+   *
+   * These do not sum to the whole of the loss: the long tail of rarer errors is
+   * gathered into a derived row rather than given one each.
+   */
+  too_many_locks: number;
+  account_missing: number;
+  fee_payer_broke: number;
+  fee_payer_invalid: number;
+  blockhash_missing: number;
+  blockhash_old: number;
+  already_processed: number;
+  bad_compute_budget: number;
+  account_data_too_large: number;
+  program_not_executable: number;
+  program_restricted: number;
 }
 
 /**
