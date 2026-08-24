@@ -30,7 +30,7 @@ use {
         collections::VecDeque,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
     },
 };
@@ -361,6 +361,15 @@ pub struct MetricsTap {
     /// this reads without locking anything — and held only long enough to push
     /// a struct of counts or to copy the queue out.
     slot_waterfalls: Mutex<VecDeque<SlotWaterfall>>,
+
+    /// Which scheduler sent the interval counts above, from the same tag the
+    /// per-slot points carry.
+    ///
+    /// Only one scheduler reports the interval point — a build running two
+    /// gates that report on whichever of them is enabled — so unlike the
+    /// per-slot points there is nothing here to choose between. What there is
+    /// to say is which one it was, because it decides what `received` counts.
+    scheduler_is_bam: AtomicBool,
 
     /// The last few hundred replayed slots, timed.
     ///
@@ -717,7 +726,13 @@ impl MetricsTap {
             SHREDS_REPAIR => self.add_packets(&self.shreds_repair, point),
             GOSSIP_RECEIVER => self.add_packets(&self.packets_gossip, point),
             TPU_VOTE_RECEIVER => self.add_packets(&self.packets_tpu_vote, point),
-            SCHEDULER_COUNTS => self.scheduler.add_point(point),
+            SCHEDULER_COUNTS => {
+                self.scheduler_is_bam.store(
+                    scheduler_source(point) == SchedulerSource::Bam,
+                    Ordering::Relaxed,
+                );
+                self.scheduler.add_point(point)
+            }
             SCHEDULER_SLOT_COUNTS => self.remember_slot(point),
             REPLAY_SLOT_STATS => self.remember_replay(point),
             ACCOUNTS_LOADS | ACCOUNTS_STORES | ACCOUNTS_FLUSH => self.accounts.add_point(point),
@@ -886,6 +901,15 @@ impl MetricsTap {
             .lock()
             .map(|slots| slots.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Which scheduler the interval counts last came from.
+    pub fn scheduler_source(&self) -> SchedulerSource {
+        if self.scheduler_is_bam.load(Ordering::Relaxed) {
+            SchedulerSource::Bam
+        } else {
+            SchedulerSource::Scheduler
+        }
     }
 
     /// The leader slots held, oldest first.
@@ -1766,6 +1790,34 @@ mod tests {
             assert_eq!(held[0].counts.finished, 735, "arrival order {order:?}");
             assert_eq!(held[0].source, SchedulerSource::Bam);
         }
+    }
+
+    #[test]
+    fn test_the_interval_counts_say_which_scheduler_sent_them() {
+        // Only one scheduler reports this point, so there is nothing to choose
+        // between — but which one it was decides whether `received` is packets
+        // or batches, and the live card cannot draw itself without knowing.
+        let tap = MetricsTap::default();
+        assert_eq!(
+            tap.scheduler_source(),
+            SchedulerSource::Scheduler,
+            "a validator running one scheduler, before any point arrives"
+        );
+
+        let mut bam = named(SCHEDULER_COUNTS, &[("num_received", "5i")]);
+        bam.tags.push((SCHEDULER_ID, "10000".to_string()));
+        tap.observe(&bam);
+        assert_eq!(tap.scheduler_source(), SchedulerSource::Bam);
+
+        // And back, as it goes when BAM drops and the validator takes over.
+        let mut own = named(SCHEDULER_COUNTS, &[("num_received", "5i")]);
+        own.tags.push((SCHEDULER_ID, "0".to_string()));
+        tap.observe(&own);
+        assert_eq!(tap.scheduler_source(), SchedulerSource::Scheduler);
+
+        // Untagged, as every stock validator sends it.
+        tap.observe(&named(SCHEDULER_COUNTS, &[("num_received", "5i")]));
+        assert_eq!(tap.scheduler_source(), SchedulerSource::Scheduler);
     }
 
     #[test]

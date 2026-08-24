@@ -173,6 +173,23 @@ describe("a slot BAM built", () => {
     expect(notHeld.share).toBe(0);
   });
 
+  it("changes nothing at all for a validator not running BAM", () => {
+    // The whole BAM branch hangs off one field. A stock validator never sends
+    // it, and a jito validator sends "scheduler" whenever BAM is not the one
+    // building — so the ordinary reading has to survive both spellings
+    // untouched, row for row.
+    const numbers = { received: 1000, not_held: 5, buffered: 700, finished: 500 };
+    const absent = waterfallRows(quiet(numbers));
+    const named = waterfallRows(quiet({ ...numbers, source: "scheduler" }));
+    expect(named).toEqual(absent);
+
+    // And it is the same reading it always was: every row a share of received.
+    expect(absent.find((r) => r.key === "received")!.label).toBe("Received");
+    expect(absent.find((r) => r.key === "not_held")!.label).toBe("forwarding, not held");
+    expect(absent.every((r) => r.kind !== "count" || r.key === "verify_evicted")).toBe(true);
+    expect(absent.find((r) => r.key === "buffered")!.share).toBeCloseTo(0.7, 5);
+  });
+
   it("leaves a slot the validator built alone", () => {
     // Same numbers, no source: the ordinary reading, drawn against received.
     const rows = waterfallRows(
