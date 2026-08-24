@@ -124,6 +124,8 @@ describe("a slot BAM built", () => {
     return quiet({
       source: "bam",
       received: 40,
+      // Fed by a different check on this path: batches past their own slot.
+      not_held: 5,
       unparsable: 3,
       buffered: 700,
       scheduled: 738,
@@ -159,12 +161,30 @@ describe("a slot BAM built", () => {
     expect(received.over).toBe(false);
   });
 
+  it("does not call a late batch a forwarded transaction", () => {
+    // Same counter, different check, different unit, different meaning. On
+    // this path it holds batches BAM sent that had already missed the slot
+    // they named — the one figure on a BAM slot worth acting on, and the last
+    // thing that should read as ordinary forwarding.
+    const notHeld = waterfallRows(bamSlot()).find((r) => r.key === "not_held")!;
+    expect(notHeld.label).toBe("batches too late to schedule");
+    expect(notHeld.kind).toBe("count");
+    expect(notHeld.count).toBe(5);
+    expect(notHeld.share).toBe(0);
+  });
+
   it("leaves a slot the validator built alone", () => {
     // Same numbers, no source: the ordinary reading, drawn against received.
-    const rows = waterfallRows(quiet({ received: 1000, buffered: 700, finished: 500 }));
+    const rows = waterfallRows(
+      quiet({ received: 1000, not_held: 5, buffered: 700, finished: 500 }),
+    );
     const received = rows.find((r) => r.key === "received")!;
     expect(received.label).toBe("Received");
     expect(received.kind).toBe("stage");
+    const notHeld = rows.find((r) => r.key === "not_held")!;
+    expect(notHeld.label).toBe("forwarding, not held");
+    expect(notHeld.kind).toBe("loss");
+    expect(notHeld.share).toBeCloseTo(5 / 1000, 5);
     expect(rows.find((r) => r.key === "finished")!.share).toBeCloseTo(0.5, 5);
   });
 });

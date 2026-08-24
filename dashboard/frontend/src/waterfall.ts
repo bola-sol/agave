@@ -93,6 +93,12 @@ export function waterfallRows(w: Waterfall): WaterfallRow[] {
   // losses rather than above them, so those rows can run past it; they show
   // their count and no percentage when they do, which is the same treatment a
   // slot that dispatched more than arrived in it already gets.
+  //
+  // Two rows are in batches, not one. BAM counts what it rejected before
+  // parsing per batch, in `prevalidate_batches`, and everything it rejected
+  // after parsing per transaction, in `parse_batch`. So the first loss row is
+  // in the same unit as the figure above it and a different one from every
+  // loss below it, and it is counting something else entirely besides.
   const batches = w.source === "bam";
   const total = batches ? w.buffered : w.received;
 
@@ -126,13 +132,27 @@ export function waterfallRows(w: Waterfall): WaterfallRow[] {
 
     // Lost at the door. These and `buffered` account for every one of the
     // above exactly — it is an identity the validator's own tests assert.
-    row(
-      "not_held",
-      "forwarding, not held",
-      "loss",
-      w.not_held,
-      "Not this validator's to execute. A node that is not near its leader slot forwards transactions to the one that is rather than buffering them, so on most validators most of the time this is nearly the whole of the traffic. It is the ordinary state of a healthy node, not a fault.",
-    ),
+    //
+    // Except on a BAM slot, where the same counter is fed by a different check
+    // and holds something unrelated: batches BAM sent that were already past
+    // the slot they named, or that arrived empty. Labelling that as forwarding
+    // would be plainly wrong, and it is the one figure on a BAM slot worth
+    // acting on — work the marketplace offered that the slot could not take.
+    batches
+      ? row(
+          "not_held",
+          "batches too late to schedule",
+          "count",
+          w.not_held,
+          "Batches BAM sent that this validator could not use: they named a slot that had already passed by the time they arrived, or they came with no packets in them. Counted in batches, like the figure above it and unlike every row below it, so it is not a share of them. This is the number to watch on a BAM slot — it is work that was offered and missed.",
+        )
+      : row(
+          "not_held",
+          "forwarding, not held",
+          "loss",
+          w.not_held,
+          "Not this validator's to execute. A node that is not near its leader slot forwards transactions to the one that is rather than buffering them, so on most validators most of the time this is nearly the whole of the traffic. It is the ordinary state of a healthy node, not a fault.",
+        ),
     row(
       "check_queue_full",
       "check queue full",
