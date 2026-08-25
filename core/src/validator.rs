@@ -1212,6 +1212,11 @@ impl Validator {
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         // Updated by Votor and shared with RPC health and block creation.
         let highest_finalized = Arc::new(RwLock::new(None));
+        // The dashboard reads it as well, to say how far replay trails the
+        // cluster. Cloned here rather than where it is used, because the handle
+        // itself is moved into the TPU below and the dashboard is assembled
+        // after that.
+        let dashboard_highest_finalized = highest_finalized.clone();
 
         let max_slots = Arc::new(MaxSlots::default());
 
@@ -1878,13 +1883,10 @@ impl Validator {
                 // this node's, so it keeps moving while replay is catching up,
                 // which is what makes it the one honest yardstick for how far
                 // behind this validator has fallen.
-                cluster_tip: {
-                    let highest_finalized = highest_finalized.clone();
-                    Arc::new(move || {
-                        let cert = highest_finalized.read().ok()?;
-                        cert.as_ref().map(|cert| cert.block().slot)
-                    })
-                },
+                cluster_tip: Arc::new(move || {
+                    let cert = dashboard_highest_finalized.read().ok()?;
+                    cert.as_ref().map(|cert| cert.block().slot)
+                }),
             };
             dashboard_service
                 .attach(context, exit.clone())
