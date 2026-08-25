@@ -1,5 +1,12 @@
-import { useState, type ReactNode } from "react";
-import { accountsGloss, programGloss, rateTone, servedFromMemory } from "../caches";
+import { useEffect, useState, type ReactNode } from "react";
+import {
+  accountsGloss,
+  programGloss,
+  rateTone,
+  readOpenSections,
+  servedFromMemory,
+  writeOpenSections,
+} from "../caches";
 import { bytes, count, percent } from "../format";
 import type { AccountsCache, ProgramCache } from "../types";
 import { useStore } from "../useStore";
@@ -15,19 +22,28 @@ import { Card, Explain, Meter, Stat } from "./primitives";
  * tallest, and the accounts panel is half again the height of the program cache
  * one, so the shorter of the two sat over a block of nothing.
  *
- * Either section folds to its heading. Open is the default and the state is not
- * remembered: this is meant to be left on a screen, and a reload should bring
- * back a panel showing its figures rather than whatever the last person to walk
- * past decided to put away.
+ * Either section folds to its heading, and both start folded. The two headings
+ * are what the panel is for at a glance: a dot, a rate and four figures each,
+ * saying whether the thing is healthy without asking anyone to read a grid. The
+ * figures under them are for when the answer is no.
+ *
+ * Which sections are open is remembered per host, on the same reasoning as the
+ * sidebar collapse: someone who opened one to watch it wants it open on the
+ * next reload rather than having to open it again.
  */
 export function CachesCard() {
   const store = useStore();
   const programs = store.get<ProgramCache | null>("summary", "program_cache");
   const accounts = store.get<AccountsCache | null>("summary", "accounts_cache");
-  const [folded, setFolded] = useState<Record<string, boolean>>({});
+  // Read once at the first render. Unlike the theme there is nothing to stamp
+  // before the bundle runs: a section that starts closed is what an unstyled
+  // page shows anyway, so there is no flash to head off.
+  const [open, setOpen] = useState<string[]>(readOpenSections);
+  useEffect(() => writeOpenSections(open), [open]);
   if (!programs && !accounts) return null;
 
-  const fold = (key: string) => setFolded((was) => ({ ...was, [key]: !was[key] }));
+  const fold = (key: string) =>
+    setOpen((was) => (was.includes(key) ? was.filter((k) => k !== key) : [...was, key]));
 
   return (
     <Card title="Caches and storage" aside="one-minute counters · reset every bank">
@@ -37,7 +53,7 @@ export function CachesCard() {
             name="Program cache"
             rate={programs.hit_rate}
             gloss={programGloss(programs)}
-            open={!folded.programs}
+            open={open.includes("programs")}
             onFold={() => fold("programs")}
             explain="How often replay found a program already compiled rather than having to build it, over the last minute. A low rate means replay spends its time compiling, which slows a block down and leaves less room to pack the next one. Evictions are the usual cause."
           >
@@ -49,7 +65,7 @@ export function CachesCard() {
             name="Accounts"
             rate={servedFromMemory(accounts).rate}
             gloss={accountsGloss(accounts)}
-            open={!folded.accounts}
+            open={open.includes("accounts")}
             onFold={() => fold("accounts")}
             explain="Of every account replay read in the last minute, the share answered without touching a storage file. Counted across both caches, so it matches the split below it. A read that misses both goes to disk, which is orders of magnitude slower, and a falling figure here is what slow replay looks like before anything else shows it."
           >

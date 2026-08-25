@@ -8,6 +8,37 @@
 import { bytes, count } from "./format";
 import type { AccountsCache, ProgramCache } from "./types";
 
+export const CACHES_STORAGE_KEY = "agave-dashboard-caches";
+
+/**
+ * Which sections the viewer last left unfolded.
+ *
+ * Both start folded, so the panel opens as two lines saying whether each
+ * subsystem is healthy and nothing else. Whoever wants the figures under one of
+ * them wants them on the next reload too, which is the same reasoning the
+ * sidebar collapse is remembered under, and the same mechanism.
+ *
+ * Names rather than a count or a pair of flags, so a section added or removed
+ * later cannot silently unfold the wrong one.
+ */
+export function readOpenSections(): string[] {
+  try {
+    const stored = window.localStorage.getItem(CACHES_STORAGE_KEY);
+    return stored ? stored.split(",").filter(Boolean) : [];
+  } catch {
+    // Private browsing and some embedded webviews refuse storage outright.
+    return [];
+  }
+}
+
+export function writeOpenSections(open: string[]): void {
+  try {
+    window.localStorage.setItem(CACHES_STORAGE_KEY, open.join(","));
+  } catch {
+    // Not being able to remember the choice is not a reason to refuse it.
+  }
+}
+
 /** How a rate is coloured, matching the tones the rest of the page uses. */
 export type RateTone = "good" | "warn" | "bad" | "muted";
 

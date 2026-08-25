@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest";
-import { accountsGloss, programGloss, rateTone, servedFromMemory } from "./caches";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  accountsGloss,
+  CACHES_STORAGE_KEY,
+  programGloss,
+  rateTone,
+  readOpenSections,
+  servedFromMemory,
+  writeOpenSections,
+} from "./caches";
 import type { AccountsCache, ProgramCache } from "./types";
 
 /** A mainnet-shaped program cache minute, to be overridden a field at a time. */
@@ -125,5 +133,59 @@ describe("accountsGloss", () => {
 
   it("does not divide by a window that has not opened", () => {
     expect(accountsGloss(accounts({ window_seconds: 0 }))).toContain("0 B/s written");
+  });
+});
+
+function storage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => void values.set(key, value),
+    removeItem: (key: string) => void values.delete(key),
+    clear: () => values.clear(),
+    key: () => null,
+    length: 0,
+  } as unknown as Storage;
+}
+
+describe("which sections are open", () => {
+  beforeEach(() => {
+    vi.stubGlobal("window", { localStorage: storage() });
+  });
+
+  it("starts with both folded when nothing has been chosen", () => {
+    expect(readOpenSections()).toEqual([]);
+  });
+
+  it("remembers a section across a reload", () => {
+    writeOpenSections(["accounts"]);
+    expect(readOpenSections()).toEqual(["accounts"]);
+  });
+
+  it("remembers both, and remembers folding them again", () => {
+    writeOpenSections(["programs", "accounts"]);
+    expect(readOpenSections()).toEqual(["programs", "accounts"]);
+    writeOpenSections([]);
+    expect(readOpenSections()).toEqual([]);
+  });
+
+  it("reads nothing out of an empty entry rather than one nameless section", () => {
+    // Folding the last open section writes an empty string, which split() turns
+    // into an array holding one empty name.
+    window.localStorage.setItem(CACHES_STORAGE_KEY, "");
+    expect(readOpenSections()).toEqual([]);
+  });
+
+  it("survives storage being refused", () => {
+    // Private browsing and some embedded webviews throw on access rather than
+    // returning null, which would otherwise take the whole panel down at
+    // render.
+    vi.stubGlobal("window", {
+      get localStorage(): Storage {
+        throw new Error("denied");
+      },
+    });
+    expect(() => writeOpenSections(["programs"])).not.toThrow();
+    expect(readOpenSections()).toEqual([]);
   });
 });
