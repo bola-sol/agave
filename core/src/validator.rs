@@ -1873,6 +1873,18 @@ impl Validator {
                 // `start_time` is an `Instant`; the dashboard reports an
                 // absolute uptime, so translate it to wall-clock.
                 start_time: SystemTime::now() - start_time.elapsed(),
+                // The same certificate the RPC health check measures against.
+                // A finalization certificate is the cluster's work rather than
+                // this node's, so it keeps moving while replay is catching up,
+                // which is what makes it the one honest yardstick for how far
+                // behind this validator has fallen.
+                cluster_tip: {
+                    let highest_finalized = highest_finalized.clone();
+                    Arc::new(move || {
+                        let cert = highest_finalized.read().ok()?;
+                        cert.as_ref().map(|cert| cert.block().slot)
+                    })
+                },
             };
             dashboard_service
                 .attach(context, exit.clone())
