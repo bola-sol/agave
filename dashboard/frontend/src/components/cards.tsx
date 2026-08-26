@@ -266,7 +266,7 @@ export function TransactionsCard() {
       <div className="tps-readout">
         <div className="tps-total">
           <div className="tps-total-label">
-            <Explain text="Every transaction the cluster is confirming per second, votes included. Votes are most of it on a healthy cluster, which is why they are drawn as the base of each column rather than mixed in.">
+            <Explain text="Every transaction the cluster is confirming per second, votes included. Votes are consensus traffic rather than user traffic, so they are drawn as the base of each column rather than mixed in with it: how much of the total each accounts for depends on the cluster and on what is being asked of it, and separating them lets either be read without the other moving it.">
               Total TPS
             </Explain>
           </div>
