@@ -2769,8 +2769,14 @@ body {
     display: none;
   }
 
+  /* Both are two-column grids above this width. The network card is not in
+     this list any more: its body is a flex column at every width, and its rows
+     do their own rearranging below. */
   .transactions-body,
-  .validators-body,
+  .validators-body {
+    grid-template-columns: 1fr;
+  }
+
   /* The sparkline gives up its width first: the two figures are what gets
      read, and the line is the shape behind them. */
   .net-row {
