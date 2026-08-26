@@ -1378,6 +1378,11 @@ body {
   flex-direction: column;
 }
 
+/* The rows share whatever height the card is given. This one sits in a grid
+   row beside the socket card, which is much the taller of the two, so the card
+   is stretched to match it whatever its own content needs. Left alone the
+   surplus was a block of nothing under the second row; spent on the lines it
+   makes a minute of throughput readable instead. */
 .net-row {
   display: grid;
   grid-template-columns: minmax(140px, auto) minmax(120px, 1fr) minmax(92px, auto);
@@ -1385,6 +1390,8 @@ body {
   gap: 4px 18px;
   padding: 11px 0;
   border-top: 1px solid var(--border);
+  flex: 1;
+  min-height: 0;
 }
 
 .net-row:first-child {
@@ -1430,8 +1437,16 @@ body {
 .net-spark {
   grid-column: 2;
   grid-row: 1 / 3;
+  align-self: stretch;
   min-width: 0;
-  height: 38px;
+  /* A range rather than a fixed height. The row grows when the card is
+     stretched to match a taller neighbour, and the line grows with it, but only
+     so far: the viewBox is drawn without preserving its ratio, so past about
+     this height the wash under the line becomes a slab with a jagged top and
+     stops reading as a minute of anything. Surplus past the cap becomes room
+     around the rows instead. */
+  min-height: 38px;
+  max-height: 72px;
 }
 
 .net-spark svg {
