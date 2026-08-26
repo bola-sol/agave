@@ -100,7 +100,14 @@ export function slotsFor(width: number): number {
  * rather than a panel that has failed.
  */
 export function columnsFor<T>(samples: T[], slots: number): Array<T | null> {
-  const stride = Math.max(1, Math.ceil(samples.length / slots));
+  // Rounded down, not up. The window deliberately carries one sample past its
+  // left edge so a line can leave the view continuously, which means a full
+  // minute arrives here as sixty-one samples against sixty columns. Rounded up
+  // that is a stride of two, so every other column goes dark and the grid
+  // halves and un-halves as samples arrive. Rounded down it is a stride of one
+  // and the oldest sample is simply left out, which costs a second of history
+  // and nothing else.
+  const stride = Math.max(1, Math.floor(samples.length / slots));
   const kept: T[] = [];
   for (let index = samples.length - 1; index >= 0 && kept.length < slots; index -= stride) {
     kept.unshift(samples[index]);

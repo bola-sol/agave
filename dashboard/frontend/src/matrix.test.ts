@@ -81,6 +81,19 @@ describe("the grid's columns", () => {
     expect(slotsFor(0)).toBe(1);
   });
 
+  it("does not halve the grid when the window carries one sample too many", () => {
+    // `windowed` keeps one sample past the left edge on purpose, so a full
+    // minute arrives as sixty-one samples against sixty columns. Rounding the
+    // stride up makes that a stride of two, and the grid visibly halves and
+    // un-halves every time a sample lands.
+    const over = Array.from({ length: 61 }, (_unused, index) => index);
+    const columns = columnsFor(over, 60);
+    expect(columns).toHaveLength(60);
+    expect(columns.filter((column) => column === null)).toHaveLength(0);
+    expect(columns[columns.length - 1]).toBe(60);
+    expect(columns[0]).toBe(1);
+  });
+
   it("thins to fit and keeps the newest sample last", () => {
     // Counted forward instead, the newest is dropped whenever the stride does
     // not divide evenly and the leading edge stops moving.
