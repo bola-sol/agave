@@ -1371,43 +1371,138 @@ body {
   gap: 12px;
 }
 
+/* A row per direction, stacked rather than side by side, so each gets its own
+   line of the last minute. The scale is shared across both: see NetworkCard. */
 .network-body {
-  display: grid;
-  grid-template-columns: minmax(160px, 200px) minmax(0, 1fr);
-  gap: 24px;
-  align-items: center;
+  display: flex;
+  flex-direction: column;
 }
 
-/* Ties each figure to its line, so the chart reads without checking numbers. */
-.swatch {
-  display: inline-block;
+.net-row {
+  display: grid;
+  grid-template-columns: minmax(140px, auto) minmax(120px, 1fr) minmax(92px, auto);
+  align-items: center;
+  gap: 4px 18px;
+  padding: 11px 0;
+  border-top: 1px solid var(--border);
+}
+
+.net-row:first-child {
+  border-top: 0;
+  padding-top: 4px;
+}
+
+.net-label {
+  grid-column: 1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.net-swatch {
   width: 8px;
   height: 2px;
-  margin-right: 6px;
-  vertical-align: middle;
   border-radius: 1px;
+  flex: none;
 }
 
-.swatch-ingress {
+.net-value {
+  grid-column: 1;
+  font-family: ui-monospace, monospace;
+  font-size: 24px;
+  font-weight: 500;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+
+.net-value small {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-faint);
+}
+
+/* Spans the label and the value, so the line is as tall as the pair beside it
+   rather than sitting against one of them. */
+.net-spark {
+  grid-column: 2;
+  grid-row: 1 / 3;
+  min-width: 0;
+  height: 38px;
+}
+
+.net-spark svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.net-collecting {
+  display: block;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  line-height: 38px;
+}
+
+.net-meta {
+  grid-column: 3;
+  grid-row: 1 / 3;
+  text-align: right;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.net-meta b {
+  display: block;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+
+.net-meta em {
+  font-style: normal;
+}
+
+/* The two directions keep the colours they have always had here. Both are drawn
+   the same way: a line over a wash of the same hue. Given a fill on one and not
+   the other, two halves of one measurement read as different kinds of thing. */
+.net-swatch.is-ingress,
+.net-line.is-ingress {
   background: var(--level-optimistically_confirmed);
-}
-
-.swatch-egress {
-  background: var(--warn);
-}
-
-.chart-ingress,
-.chart-egress {
-  fill: none;
-  stroke-width: 1.5;
-}
-
-.chart-ingress {
   stroke: var(--level-optimistically_confirmed);
 }
 
-.chart-egress {
+.net-swatch.is-egress,
+.net-line.is-egress {
+  background: var(--warn);
   stroke: var(--warn);
+}
+
+.net-line {
+  fill: none;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
+.net-fill {
+  stroke: none;
+}
+
+/* The wash under each line is set by eye rather than by one number, because
+   the two hues do not carry equally on this ground: amber at the teal's share
+   reads as the loudest thing on the card, which is a lot of weight for the
+   direction that is merely larger. */
+.net-fill.is-ingress {
+  fill: color-mix(in srgb, var(--level-optimistically_confirmed) 15%, transparent);
+}
+
+.net-fill.is-egress {
+  fill: color-mix(in srgb, var(--warn) 9%, transparent);
 }
 
 .chart {
@@ -2676,8 +2771,44 @@ body {
 
   .transactions-body,
   .validators-body,
-  .network-body {
-    grid-template-columns: 1fr;
+  /* The sparkline gives up its width first: the two figures are what gets
+     read, and the line is the shape behind them. */
+  .net-row {
+    grid-template-columns: minmax(0, 1fr) minmax(96px, auto);
+    gap: 2px 12px;
+  }
+
+  .net-label {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .net-value {
+    grid-column: 1;
+    grid-row: 2;
+    font-size: 20px;
+  }
+
+  .net-meta {
+    grid-column: 2;
+    grid-row: 1;
+    line-height: 1.4;
+  }
+
+  /* Both on one line here, so they need something between them. */
+  .net-meta b {
+    display: inline;
+  }
+
+  .net-meta b::after {
+    content: " · ";
+    color: var(--border);
+  }
+
+  .net-spark {
+    grid-column: 2;
+    grid-row: 2;
+    height: 30px;
   }
 }
 
