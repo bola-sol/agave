@@ -349,7 +349,19 @@ export interface QuicPort {
   refused_full: number;
   handshake_timeout: number;
   handshake_error: number;
+  /** Cleared the handshake and the rate limiters' second look. A checkpoint. */
+  handshook: number;
+  /**
+   * Refused a place in the connection table, under four overlapping names.
+   *
+   * One refusal can raise two of these — the unstaked path runs through the
+   * same insert that raises `add_failed` — so they are never added together.
+   * `refusedTable` in `tpuPath.ts` is where they are reconciled.
+   */
   add_failed: number;
+  add_failed_staked: number;
+  add_failed_unstaked: number;
+  add_failed_banned: number;
   admitted_staked: number;
   admitted_unstaked: number;
 

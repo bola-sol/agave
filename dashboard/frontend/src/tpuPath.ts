@@ -93,6 +93,34 @@ export interface PathSection {
 export const LOSSES_SHOWN = 6;
 export const LOSSES_SHOWN_NARROW = 3;
 
+/** How many names the listener refuses a connection under. */
+const REFUSAL_NAMES = 4;
+
+/**
+ * The connections refused a place in the table, under four overlapping names.
+ *
+ * The listener does not partition this. A staked peer that spills into the
+ * unstaked table and is turned away there raises three counters; an unstaked
+ * peer turned away raises two, because the path runs through the same insert
+ * that raises `add_failed`; a banned peer on the vote port raises one that no
+ * other path touches. Adding them would report a port refusing several times
+ * the connections it refused.
+ *
+ * So take the larger of the two readings. `add_failed` is raised only on
+ * connections that were refused, and the other three are mutually exclusive
+ * with each other, so each is a lower bound on the true figure and the larger
+ * is the tighter one. It can still undercount — a refusal that raises only a
+ * name in the smaller group when the other group is larger — and what it
+ * undercounts by falls into the unaccounted row below it rather than
+ * disappearing.
+ */
+export function refusedTable(q: QuicPort): number {
+  return Math.max(
+    q.add_failed,
+    q.add_failed_staked + q.add_failed_unstaked + q.add_failed_banned,
+  );
+}
+
 function shareOf(total: number, count: number): number {
   if (total <= 0) return 0;
   return Math.min(1, count / total);
@@ -109,7 +137,9 @@ function shareOf(total: number, count: number): number {
  */
 function sorted(
   total: number,
-  rows: Array<[key: string, label: string, count: number, warn: boolean, explain: string]>,
+  rows: Array<
+    [key: string, label: string, count: number, warn: boolean, explain: string]
+  >,
 ): { losses: PathLoss[]; zeros: number } {
   const losses = rows
     .filter(([, , count]) => count > 0)
@@ -132,12 +162,43 @@ function sorted(
  * checks each gate in turn and moves on when one closes, so an attempt is shed
  * once, fails its handshake, or is admitted. Not exactly, though. A connection
  * can meet the rate limiter again after its handshake, which charges it to a
- * gate it has already passed, and an accept that fails outright is counted
- * nowhere. So the segments can total slightly more or slightly less than the
- * offer, which is why the bar is drawn against the offer and clipped rather
- * than against the sum of its own parts.
+ * gate it has already passed, so the segments can total slightly more than the
+ * offer. That is why the bar is drawn against the offer and clipped rather than
+ * against the sum of its own parts.
+ *
+ * They can also total less, and that gap is now a row rather than a silence.
+ * The listener drops a connection without counting it in two places — an
+ * `accept()` that errors before the handshake, and a QoS that declines by
+ * returning nothing after it — and both are silent upstream, no counter and
+ * only a debug log. The handshake count is what separates them: everything
+ * unaccounted for above it died at the first, everything below it at the
+ * second. Neither says which peer or why, and nothing here can; what they say
+ * is which half of the listener to go and read.
  */
-export function doorSection(q: QuicPort, kernelDrops: number | null): PathSection {
+export function doorSection(
+  q: QuicPort,
+  kernelDrops: number | null,
+): PathSection {
+  const admitted = q.admitted_staked + q.admitted_unstaked;
+  const refused = refusedTable(q);
+  // Everything the listener counts, taken off the offer. The two rate limits
+  // are charged either side of the handshake and share one counter each, so
+  // where they fired cannot be known — but that is exactly why they can be
+  // subtracted here: whichever side they fired on, they are off the offer by
+  // the time the handshake is counted, and the split cancels.
+  const beforeHandshake = Math.max(
+    0,
+    q.offered -
+      (q.shed_all +
+        q.shed_address +
+        q.refused_full +
+        q.handshake_timeout +
+        q.handshake_error +
+        q.handshook),
+  );
+  const afterHandshake = Math.max(0, q.handshook - refused - admitted);
+  const derivedAtZero =
+    (beforeHandshake > 0 ? 0 : 1) + (afterHandshake > 0 ? 0 : 1);
   const { losses, zeros } = sorted(q.offered, [
     [
       "door_shed_address",
@@ -177,23 +238,59 @@ export function doorSection(q: QuicPort, kernelDrops: number | null): PathSectio
     [
       "door_add_failed",
       "refused after handshake",
-      q.add_failed,
+      refused,
       false,
-      "Handshook successfully and then refused a place in the connection table, because the table was being pruned or the peer was banned. Rare, and worth asking about if it is not.",
+      "Handshook successfully and then refused a place in the connection table, because the table it belonged in was full or the peer was banned. The listener counts this under four names that overlap, so this is the larger of the two readings rather than their sum; the breakdown is below.",
+    ],
+    [
+      "door_unaccounted_pre",
+      "unaccounted, before handshake",
+      beforeHandshake,
+      false,
+      "Offered, and then neither shed at a gate nor carried as far as a handshake. There is one branch of the listener that does this — an accept that returns an error — and it increments no counter at all, so this figure is what is left when everything the listener does count is taken off the offer. It is a measurement of the listener's silence, not of a peer's behaviour.",
+    ],
+    [
+      "door_unaccounted_post",
+      "unaccounted, after handshake",
+      afterHandshake,
+      false,
+      "Completed a handshake and then vanished: not refused a table place, not admitted. The admission control returns nothing in three places without recording anything, and one of them is an unstaked peer arriving at the vote port, which is the design working rather than a fault. Worked out by subtraction for the same reason as the row above, and it cannot say which of the three.",
     ],
   ]);
+
+  const names: Array<[key: string, label: string, count: number]> = [
+    ["door_add_failed_unstaked", "unstaked table full", q.add_failed_unstaked],
+    ["door_add_failed_staked", "staked table full", q.add_failed_staked],
+    ["door_add_failed_banned", "peer banned", q.add_failed_banned],
+    ["door_add_failed_insert", "table insert failed", q.add_failed],
+  ];
+  const detail = names
+    .map(([key, label, count]) => ({
+      key,
+      label,
+      count,
+      share: shareOf(refused, count),
+      warn: false,
+      explain:
+        "One of the names the listener refuses a connection under, as a share of the refusals above. These overlap rather than partition: the unstaked path runs through the same insert that raises the last of them, so a single refusal there appears twice in this list. They are listed as they are counted instead of being added up, because adding them would say a port refused twice what it did.",
+    }))
+    .filter((reason) => reason.count > 0);
 
   return {
     key: "door",
     title: "At the door",
     note: "connections offered",
     explain:
-      "Connections, not transactions. Most of what the TPU port turns away it turns away here, before a byte has been read, and a transaction lost at this stage was never seen by anything downstream. The gates are checked in order and the listener moves on at the first one that closes, so a connection is counted at one of them and not several.",
+      "Connections, not transactions. Most of what the TPU port turns away it turns away here, before a byte has been read, and a transaction lost at this stage was never seen by anything downstream. The gates are checked in order and the listener moves on at the first one that closes, so a connection is usually counted at one of them and not several. Two things break that, and this section shows them rather than smoothing them over: the refusal at the connection table is counted under four overlapping names, and two branches of the listener drop a connection without counting it at all, which is what the unaccounted rows are.",
     total: q.offered,
-    through: { label: "admitted", count: q.admitted_staked + q.admitted_unstaked },
+    through: { label: "admitted", count: admitted },
     losses,
-    detail: [],
-    zeros,
+    detail,
+    // The two unaccounted rows are worked out rather than counted, so a nought
+    // in one of them says the listener accounted for everything — not that a
+    // counter sat still. This tally is about counters, so they come back out of
+    // it, and the four refusal names go in.
+    zeros: zeros - derivedAtZero + (REFUSAL_NAMES - detail.length),
     aside:
       kernelDrops === null
         ? null
