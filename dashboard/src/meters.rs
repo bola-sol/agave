@@ -27,7 +27,7 @@ use {
         udp_drops::{self, PortCounters, PortWindow},
     },
     serde::Serialize,
-    solana_clock::Slot,
+    solana_clock::{Epoch, Slot},
     solana_gossip::contact_info::Protocol,
     solana_program_runtime::loaded_programs::MAX_LOADED_ENTRY_COUNT,
     solana_runtime::bank::Bank,
@@ -428,6 +428,90 @@ pub struct WaterfallWindow {
     pub source: SchedulerSource,
 }
 
+/// What the two per-epoch sections of the TPU path card cover.
+///
+/// Sent in slots rather than as a fraction, so that the panel can phrase it and
+/// the meter does not have to guess how. Two figures rather than one: an epoch
+/// is only counted whole where the validator was up for the whole of it, and a
+/// restart part way through leaves totals that are honest about a shorter span
+/// than the heading over them. Saying so is the difference between a quiet
+/// epoch and one that was only watched for its last hour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct EpochSpan {
+    pub epoch: Epoch,
+    /// Slots of this epoch that have happened.
+    pub elapsed_slots: u64,
+    /// Slots of this epoch the totals were actually summed over, which is
+    /// fewer than `elapsed_slots` where counting began part way in.
+    pub counted_slots: u64,
+    pub slots_in_epoch: u64,
+}
+
+/// Where the chain is in its epoch, taken from a bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EpochPosition {
+    epoch: Epoch,
+    slot: Slot,
+    start_slot: Slot,
+    slots_in_epoch: u64,
+}
+
+/// Verify and Executed, summed from the start of the epoch.
+///
+/// One structure holding both rather than an accumulator each, because they
+/// share an epoch and a starting slot and are added to on the same tick. Split
+/// in two they would carry two copies of the same span, which is two chances
+/// for the panel to be told different things about what it is drawing.
+#[derive(Debug, Clone, Copy, Default)]
+struct LeaderTotals {
+    /// The epoch these cover. `None` until the first sample lands.
+    epoch: Option<Epoch>,
+    /// The slot the summing began at: the epoch's first slot where the
+    /// validator has been up for all of it, and later where it has not.
+    from_slot: Slot,
+    verify: VerifyTotals,
+    executed: ExecutedTotals,
+}
+
+impl LeaderTotals {
+    /// Adds one interval's work, starting over where the epoch has turned.
+    fn add(&mut self, at: EpochPosition, verify: VerifyTotals, executed: ExecutedTotals) {
+        if self.epoch != Some(at.epoch) {
+            self.epoch = Some(at.epoch);
+            self.from_slot = at.slot;
+            self.verify = VerifyTotals::default();
+            self.executed = ExecutedTotals::default();
+        }
+        self.verify = self.verify.plus(&verify);
+        self.executed = self.executed.plus(&executed);
+    }
+
+    /// What the totals cover, as of the position they were last added at.
+    ///
+    /// Inclusive of the slot itself at both ends, so the first tick of an epoch
+    /// reports one slot counted rather than none. `from_slot` is clamped up to
+    /// the epoch's first slot: it is set from a bank, and a bank read that
+    /// arrives before the one that turned the epoch over would otherwise report
+    /// more slots counted than have happened.
+    fn span(&self, at: EpochPosition) -> EpochSpan {
+        let from_slot = self.from_slot.max(at.start_slot);
+        EpochSpan {
+            epoch: at.epoch,
+            elapsed_slots: at
+                .slot
+                .saturating_sub(at.start_slot)
+                .saturating_add(1)
+                .min(at.slots_in_epoch),
+            counted_slots: at
+                .slot
+                .saturating_sub(from_slot)
+                .saturating_add(1)
+                .min(at.slots_in_epoch),
+            slots_in_epoch: at.slots_in_epoch,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ReplayWindow {
     /// Slots behind the figures, so the panel can name what it is showing
@@ -751,9 +835,20 @@ pub struct Meters {
     quic_forwards_window: VecDeque<QuicTotals>,
     quic_vote_window: VecDeque<QuicTotals>,
     quic_paths: Debounced<Option<QuicPaths>>,
-    verify_window: VecDeque<VerifyTotals>,
+    /// Where the chain had got to in its epoch, as of the last tick that could
+    /// take bank forks.
+    ///
+    /// Held rather than read where it is used: the totals below are summed in
+    /// the metrics pass, which has no bank to hand. Kept across a tick that
+    /// could not read one, because a missed read is a missing sample and not a
+    /// new epoch, and starting the totals over for it would empty them for no
+    /// reason.
+    epoch_now: Option<EpochPosition>,
+    /// The two stages that only run while this validator is leader, gathered
+    /// over the epoch rather than over the window the sections above use.
+    leader_totals: LeaderTotals,
+    epoch_span: Debounced<Option<EpochSpan>>,
     verify: Debounced<Option<VerifyTotals>>,
-    executed_window: VecDeque<ExecutedTotals>,
     executed: Debounced<Option<ExecutedTotals>>,
     slot_waterfalls: Debounced<Vec<SlotWaterfall>>,
     slot_costs: Debounced<Vec<SlotCost>>,
@@ -805,9 +900,10 @@ impl Meters {
             quic_forwards_window: VecDeque::with_capacity(WATERFALL_WINDOW),
             quic_vote_window: VecDeque::with_capacity(WATERFALL_WINDOW),
             quic_paths: Debounced::default(),
-            verify_window: VecDeque::with_capacity(WATERFALL_WINDOW),
+            epoch_now: None,
+            leader_totals: LeaderTotals::default(),
+            epoch_span: Debounced::default(),
             verify: Debounced::default(),
-            executed_window: VecDeque::with_capacity(WATERFALL_WINDOW),
             executed: Debounced::default(),
             slot_waterfalls: Debounced::default(),
             slot_costs: Debounced::default(),
@@ -829,6 +925,7 @@ impl Meters {
             .map(|bank_forks| bank_forks.working_bank());
         if let Some(working_bank) = working_bank {
             self.collect_tps(&working_bank);
+            self.note_epoch(&working_bank);
         }
 
         self.collect_network();
@@ -1070,29 +1167,63 @@ impl Meters {
             }),
         );
 
-        let verify = windowed(
-            &mut self.verify_window,
-            current.verify.since(&previous.verify),
-            WATERFALL_WINDOW,
-        );
-        self.verify.publish(
-            &self.publisher,
-            TOPIC_SUMMARY,
-            "verify",
-            (verify.received > 0).then_some(verify),
-        );
+        // The last two stages are counted over the epoch, where every section
+        // above them is counted over the window.
+        //
+        // Both only run while this validator is leader, and a rolling window
+        // measures neither of them. Five minutes of a stage that fires for a
+        // handful of slots every few hours is not a rate: it is a reading of
+        // whether a leader slot happened to fall inside the last five minutes,
+        // and on all but the largest validators the answer is no. An epoch is
+        // the span the work is actually scheduled over — the leader schedule is
+        // drawn per epoch and the stake behind it is fixed for one — so it is
+        // the span the totals are kept over.
+        //
+        // Safe to keep for two days because every field of both is a difference
+        // between readings that the reporter itself resets: nothing here is a
+        // running total that could be counted twice, and nothing is a level
+        // that could be added up into nonsense. A single cumulative field among
+        // them would be harmless over five minutes and wildly wrong over an
+        // epoch.
+        //
+        // Nothing published until a bank has been read, because a total with no
+        // epoch against it cannot be labelled and an unlabelled one is worse
+        // than none: it would carry a restart's worth of counting under a
+        // heading claiming an epoch's.
+        if let Some(at) = self.epoch_now {
+            self.leader_totals.add(
+                at,
+                current.verify.since(&previous.verify),
+                current.executed.since(&previous.executed),
+            );
+            let LeaderTotals {
+                verify, executed, ..
+            } = self.leader_totals;
+            let span = self.leader_totals.span(at);
 
-        let executed = windowed(
-            &mut self.executed_window,
-            current.executed.since(&previous.executed),
-            WATERFALL_WINDOW,
-        );
-        self.executed.publish(
-            &self.publisher,
-            TOPIC_SUMMARY,
-            "executed",
-            (executed.attempted > 0).then_some(executed),
-        );
+            // One span for both sections rather than one each. They are summed
+            // on the same tick and started over on the same tick, so they
+            // always cover the same slots, and two copies of one fact are two
+            // chances to disagree about it.
+            self.epoch_span.publish(
+                &self.publisher,
+                TOPIC_SUMMARY,
+                "epoch_span",
+                (verify.received > 0 || executed.attempted > 0).then_some(span),
+            );
+            self.verify.publish(
+                &self.publisher,
+                TOPIC_SUMMARY,
+                "verify",
+                (verify.received > 0).then_some(verify),
+            );
+            self.executed.publish(
+                &self.publisher,
+                TOPIC_SUMMARY,
+                "executed",
+                (executed.attempted > 0).then_some(executed),
+            );
+        }
 
         // The per-slot points ride along here rather than being joined onto the
         // produced blocks before sending. Those are built on the other thread
@@ -1199,6 +1330,25 @@ impl Meters {
         });
         self.program_cache
             .publish(&self.publisher, TOPIC_SUMMARY, "program_cache", cache);
+    }
+
+    /// Remembers where the chain is in its epoch, for the per-epoch totals.
+    ///
+    /// Taken from the working bank rather than the root, and so a little ahead
+    /// of what has been rooted. That is the right end to read: the counters
+    /// being summed are reported as the work happens, not as it is finalised,
+    /// so a span measured against the root would claim to cover less than the
+    /// figures in it actually do.
+    fn note_epoch(&mut self, working_bank: &Bank) {
+        let schedule = working_bank.epoch_schedule();
+        let slot = working_bank.slot();
+        let epoch = schedule.get_epoch(slot);
+        self.epoch_now = Some(EpochPosition {
+            epoch,
+            slot,
+            start_slot: schedule.get_first_slot_in_epoch(epoch),
+            slots_in_epoch: schedule.get_slots_in_epoch(epoch),
+        });
     }
 
     fn collect_tps(&mut self, working_bank: &Bank) {
@@ -1912,6 +2062,156 @@ mod tests {
         assert!(published.contains(r#""source":"scheduler""#), "{published}");
         // 145 against a previous reading of 30: the one sample, not the four.
         assert!(published.contains(r#""received":115"#), "{published}");
+    }
+
+    /// Where the chain is, a given number of slots into a 432,000-slot epoch.
+    fn at(epoch: Epoch, slots_in: u64) -> EpochPosition {
+        let start_slot = epoch.saturating_mul(432_000);
+        EpochPosition {
+            epoch,
+            slot: start_slot.saturating_add(slots_in),
+            start_slot,
+            slots_in_epoch: 432_000,
+        }
+    }
+
+    fn verified(received: u64) -> VerifyTotals {
+        VerifyTotals {
+            received,
+            verified: received,
+            ..VerifyTotals::default()
+        }
+    }
+
+    fn attempted(attempted: u64) -> ExecutedTotals {
+        ExecutedTotals {
+            attempted,
+            succeeded: attempted,
+            ..ExecutedTotals::default()
+        }
+    }
+
+    #[test]
+    fn test_the_leader_totals_add_every_sample_of_the_epoch_rather_than_a_window() {
+        // The whole point of the change. A stage that fires for a few slots
+        // every few hours has nothing to say about the last five minutes, so
+        // the samples are kept for as long as the schedule that produced them.
+        let mut totals = LeaderTotals::default();
+        totals.add(at(842, 10), verified(100), attempted(40));
+        totals.add(at(842, 20), verified(0), attempted(0));
+        totals.add(at(842, 30), verified(70), attempted(25));
+
+        assert_eq!(totals.verify.received, 170);
+        assert_eq!(totals.executed.attempted, 65);
+        // The quiet sample in the middle neither cleared anything nor aged the
+        // first one out, which is what a window would have done to it.
+        assert_eq!(totals.executed.succeeded, 65);
+    }
+
+    #[test]
+    fn test_the_leader_totals_start_over_when_the_epoch_turns() {
+        // Not carried across, because the leader schedule and the stake behind
+        // it are both drawn per epoch: a total spanning two of them is a total
+        // of two different schedules.
+        let mut totals = LeaderTotals::default();
+        totals.add(at(842, 400_000), verified(900), attempted(300));
+        totals.add(at(843, 3), verified(11), attempted(4));
+
+        assert_eq!(totals.epoch, Some(843));
+        assert_eq!(totals.verify.received, 11);
+        assert_eq!(totals.executed.attempted, 4);
+        // And the span starts again with it, rather than reporting the new
+        // epoch as covered from wherever the last one began.
+        assert_eq!(totals.span(at(843, 3)).counted_slots, 1);
+    }
+
+    #[test]
+    fn test_the_span_says_how_much_of_the_epoch_was_actually_counted() {
+        // A validator restarted part way through an epoch has totals that are
+        // honest about a shorter span than the heading over them. Without this
+        // pair of figures a quiet epoch and one watched for its last hour read
+        // exactly alike.
+        let mut totals = LeaderTotals::default();
+        totals.add(at(842, 300_000), verified(5), attempted(2));
+        let span = totals.span(at(842, 320_000));
+
+        assert_eq!(span.elapsed_slots, 320_001);
+        assert_eq!(span.counted_slots, 20_001);
+        assert_eq!(span.slots_in_epoch, 432_000);
+    }
+
+    #[test]
+    fn test_the_counted_span_never_runs_past_the_epoch_it_is_counted_against() {
+        // The position comes from a bank, and a bank read can land either side
+        // of the one that turned the epoch over. Counting from a slot before
+        // this epoch began would report more of it covered than has happened.
+        let totals = LeaderTotals {
+            epoch: Some(842),
+            from_slot: 842u64.saturating_mul(432_000).saturating_sub(50),
+            ..LeaderTotals::default()
+        };
+        let span = totals.span(at(842, 10));
+
+        assert_eq!(span.counted_slots, 11);
+        assert!(span.counted_slots <= span.elapsed_slots);
+    }
+
+    #[test]
+    fn test_the_two_leader_stages_are_published_against_the_epoch_they_ran_in() {
+        let harness = fixture();
+        let mut meters = harness.meters();
+        meters.epoch_now = Some(at(842, 216_000));
+
+        let previous = TapCounters::default();
+        let current = TapCounters {
+            verify: verified(4_000),
+            executed: attempted(1_500),
+            ..TapCounters::default()
+        };
+        meters.collect_waterfall(&previous, &current);
+
+        let span = harness.published_key("summary", "epoch_span").unwrap();
+        assert!(span.contains(r#""epoch":842"#), "{span}");
+        assert!(span.contains(r#""slots_in_epoch":432000"#), "{span}");
+        let verify = harness.published_key("summary", "verify").unwrap();
+        assert!(verify.contains(r#""received":4000"#), "{verify}");
+        let executed = harness.published_key("summary", "executed").unwrap();
+        assert!(executed.contains(r#""attempted":1500"#), "{executed}");
+    }
+
+    #[test]
+    fn test_nothing_is_published_for_a_stage_until_a_bank_has_said_which_epoch() {
+        // A total with no epoch against it cannot be labelled, and one drawn
+        // under a heading it was not counted for is worse than none at all.
+        let harness = fixture();
+        let mut meters = harness.meters();
+        assert!(meters.epoch_now.is_none());
+
+        let current = TapCounters {
+            verify: verified(900),
+            ..TapCounters::default()
+        };
+        meters.collect_waterfall(&TapCounters::default(), &current);
+
+        assert!(harness.published_key("summary", "verify").is_none());
+        assert!(harness.published_key("summary", "epoch_span").is_none());
+    }
+
+    #[test]
+    fn test_the_epoch_position_is_read_from_the_bank_the_validator_is_building_on() {
+        // The working bank, not the root. The counters being summed are
+        // reported as the work happens rather than as it is finalised, so a
+        // span measured against the root would claim to cover less of the
+        // epoch than the figures in it already do.
+        let harness = fixture();
+        let mut meters = harness.meters();
+        let bank = harness.advance_to(64);
+        meters.note_epoch(&bank);
+
+        let position = meters.epoch_now.unwrap();
+        assert_eq!(position.slot, 64);
+        assert_eq!(position.epoch, bank.epoch_schedule().get_epoch(64));
+        assert!(position.start_slot <= 64);
     }
 
     #[test]

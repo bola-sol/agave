@@ -1,4 +1,5 @@
-import type { ExecutedStage, QuicPort, VerifyStage } from "./types";
+import { percent } from "./format";
+import type { EpochSpan, ExecutedStage, QuicPort, VerifyStage } from "./types";
 import { executedRows, verifyRows, type WaterfallRow } from "./waterfall";
 
 /**
@@ -460,7 +461,7 @@ export function verifySection(v: VerifyStage): PathSection {
     title: "Verify",
     note: "signatures and duplicates",
     explain:
-      "Signature verification and deduplication, for everything that is not a vote. Votes are verified by a separate stage and leave by a different door, so they are left out here rather than inflating a total the section below could never account for.",
+      "Signature verification and deduplication, for everything that is not a vote. Votes are verified by a separate stage and leave by a different door, so they are left out here rather than inflating a total the section below could never account for. Counted over the epoch, like the section under it and unlike the three above it: this stage only has work while the validator is at or near a leader slot, so a window of it measures the schedule rather than the stage.",
     total: v.received,
     through: { label: "verified", count: v.verified },
     losses,
@@ -561,7 +562,7 @@ export function executedSection(e: ExecutedStage): PathSection {
     title: "Executed",
     note: "taken up by workers",
     explain:
-      "The worker threads, added together rather than shown one by one. This is the only section here that needs the validator to have been leader recently, so between slots it is absent rather than drawn as a column of noughts.",
+      "The worker threads, added together rather than shown one by one. Counted over the epoch: the workers only run while this validator is leader, so five minutes of them would report whether a leader slot happened to fall inside the last five minutes rather than anything about how the slots went. Absent until the first leader slot of an epoch, which is a stage with nothing yet to say rather than one throwing everything away.",
     total: attempted,
     through: { label: "succeeded", count: pick(rows, "exec_succeeded") },
     losses,
@@ -580,6 +581,34 @@ export function executedSection(e: ExecutedStage): PathSection {
  * Null before anything has been offered, which is a port nothing is using
  * rather than a port refusing everything.
  */
+/**
+ * Slots of an epoch that may go uncounted before the gap is worth saying.
+ *
+ * The totals start over on the first tick that reads a bank in the new epoch,
+ * a second or two after it actually turned. Counted strictly, that would put a
+ * caveat on every epoch the validator sat through in full, and a caveat that
+ * is always there is one nobody reads when it matters.
+ */
+const EPOCH_START_SLACK = 32;
+
+/**
+ * What the per-epoch sections are counted over, as a line of text.
+ *
+ * Two clauses, and the second only where it is true. How far into the epoch we
+ * are says what a total this size means; where counting began says whether it
+ * is the epoch's total at all. A restart takes the second away from the first,
+ * and without it a validator that came up an hour ago reads as one that spent
+ * the epoch idle.
+ */
+export function epochSpanLabel(span: EpochSpan): string {
+  if (span.slots_in_epoch <= 0) return `Epoch ${span.epoch}`;
+  const elapsed = percent(span.elapsed_slots / span.slots_in_epoch, 0);
+  const missed = span.elapsed_slots - span.counted_slots;
+  if (missed <= EPOCH_START_SLACK) return `Epoch ${span.epoch}, ${elapsed} elapsed`;
+  const from = percent(missed / span.slots_in_epoch, 0);
+  return `Epoch ${span.epoch}, ${elapsed} elapsed · counted from ${from}`;
+}
+
 export function admittedShare(q: QuicPort): number | null {
   if (q.offered <= 0) return null;
   return Math.min(1, (q.admitted_staked + q.admitted_unstaked) / q.offered);

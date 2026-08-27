@@ -1983,6 +1983,33 @@ body {
   color: var(--text-faint);
 }
 
+/* The two stages counted over the epoch, bracketed off from the sections
+   counted over the window.
+   Bracketed down the left rather than ruled off above, because a rule with the
+   span written on it reads as governing everything below it and what follows
+   this is the port list, which is back on the window. A left rule says where
+   the different span starts and, more to the point, where it stops. */
+.path-epoch {
+  margin-top: 11px;
+  padding: 11px 0 3px 11px;
+  border-left: 1px solid var(--border);
+}
+
+/* The bracket is the boundary, so the first section inside it must not draw a
+   rule of its own a dozen pixels under the caption. */
+.path-epoch .path-section:first-of-type {
+  margin-top: 0;
+  padding-top: 9px;
+}
+
+/* Set as a caption and not as a heading. It sits directly above a section
+   title, and at the titles' own size, case and colour the two read as one
+   heading of two lines rather than as a label and the thing it labels. */
+.path-span {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
 .path-section {
   padding-top: 12px;
   margin-top: 11px;

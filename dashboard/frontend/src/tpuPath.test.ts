@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   admittedShare,
   doorSection,
+  epochSpanLabel,
   executedSection,
   listenerSection,
   portNamed,
@@ -12,7 +13,7 @@ import {
   verifySection,
   type PathLoss,
 } from "./tpuPath";
-import type { ExecutedStage, QuicPort } from "./types";
+import type { EpochSpan, ExecutedStage, QuicPort } from "./types";
 
 /** A port with nothing happening on it, to be overridden a field at a time. */
 function quiet(over: Partial<QuicPort> = {}): QuicPort {
@@ -453,5 +454,42 @@ describe("each section is drawn against its own total", () => {
     });
     expect(listener.through.count / listener.total).toBe(1);
     expect(verify.through.count / verify.total).toBe(1);
+  });
+});
+
+describe("the span the per-epoch sections are counted over", () => {
+  const span = (over: Partial<EpochSpan> = {}): EpochSpan => ({
+    epoch: 842,
+    elapsed_slots: 264_000,
+    counted_slots: 264_000,
+    slots_in_epoch: 432_000,
+    ...over,
+  });
+
+  it("says how far into the epoch the figures reach", () => {
+    expect(epochSpanLabel(span())).toBe("Epoch 842, 61% elapsed");
+  });
+
+  it("says where counting began where the validator came up part way in", () => {
+    // Without this a node that started an hour ago and one that sat idle all
+    // epoch read exactly alike, and the second is a fault.
+    expect(epochSpanLabel(span({ counted_slots: 21_600 }))).toBe(
+      "Epoch 842, 61% elapsed · counted from 56%",
+    );
+  });
+
+  it("does not caveat an epoch that was only missed by the tick that noticed it", () => {
+    // The totals start over on the first tick that reads a bank in the new
+    // epoch, a second or two after it turned. A caveat that is always there is
+    // one nobody reads when it matters.
+    expect(epochSpanLabel(span({ counted_slots: 263_995 }))).toBe(
+      "Epoch 842, 61% elapsed",
+    );
+  });
+
+  it("names the epoch and nothing else where the schedule gives no length", () => {
+    // Nought slots in an epoch is not a state the chain reaches, but it is one
+    // a division would turn into an infinity printed as a percentage.
+    expect(epochSpanLabel(span({ slots_in_epoch: 0 }))).toBe("Epoch 842");
   });
 });

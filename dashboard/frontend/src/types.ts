@@ -408,6 +408,25 @@ export interface QuicPaths {
   tpu_offhost: boolean;
 }
 
+/**
+ * What the two per-epoch sections of the TPU path card cover.
+ *
+ * In slots rather than as a fraction, so the wording is the panel's own. Two
+ * figures rather than one because an epoch is only counted whole where the
+ * validator was up for the whole of it: `counted_slots` short of
+ * `elapsed_slots` is a restart part way through, and saying so is the
+ * difference between a quiet epoch and one that was only watched for its last
+ * hour.
+ */
+export interface EpochSpan {
+  epoch: number;
+  /** Slots of this epoch that have happened. */
+  elapsed_slots: number;
+  /** Slots of this epoch the totals were actually summed over. */
+  counted_slots: number;
+  slots_in_epoch: number;
+}
+
 export interface VerifyStage {
   received: number;
   duplicate: number;

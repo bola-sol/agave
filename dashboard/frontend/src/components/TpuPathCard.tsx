@@ -10,6 +10,7 @@ import { useNarrow } from "../narrow";
 import {
   admittedShare,
   doorSection,
+  epochSpanLabel,
   executedSection,
   listenerSection,
   LOSSES_SHOWN,
@@ -24,7 +25,13 @@ import {
   type PathLoss,
   type PathSection,
 } from "../tpuPath";
-import type { ExecutedStage, QuicPaths, QuicPort, VerifyStage } from "../types";
+import type {
+  EpochSpan,
+  ExecutedStage,
+  QuicPaths,
+  QuicPort,
+  VerifyStage,
+} from "../types";
 import { useStore } from "../useStore";
 import { Card, Explain } from "./primitives";
 
@@ -48,6 +55,16 @@ import { Card, Explain } from "./primitives";
  * cadences. A single chain across them would look authoritative and be quietly
  * wrong, so each restarts at its own hundred percent under its own heading.
  *
+ * The last two are counted over a different span as well as against a different
+ * total. Both only run while this validator is leader, and five minutes of a
+ * stage that fires for a handful of slots every few hours reports whether a
+ * leader slot happened to fall inside the window rather than anything about the
+ * stage. They are summed over the epoch instead, which is the span the leader
+ * schedule is drawn over and the stake behind it is fixed for. The two are
+ * bracketed together under one caption that says so, rather than each carrying
+ * a label of its own: they are summed on the same tick over the same slots, and
+ * two copies of that fact are two chances to disagree about it.
+ *
  * What the scheduler did with what arrived is not here. It is per leader slot
  * and it is on the slot page, joined to the block it produced, which is where a
  * figure that only exists during leader slots belongs.
@@ -57,6 +74,7 @@ export function TpuPathCard() {
   const paths = store.get<QuicPaths | null>("summary", "quic_paths");
   const verify = store.get<VerifyStage | null>("summary", "verify");
   const executed = store.get<ExecutedStage | null>("summary", "executed");
+  const span = store.get<EpochSpan | null>("summary", "epoch_span");
   const [open, setOpen] = useState(readOpenPorts);
   useEffect(() => writeOpenPorts(open), [open]);
 
@@ -66,10 +84,15 @@ export function TpuPathCard() {
   // whatever it was given and do not depend on how it arrived. Both are absent
   // rather than nought where nothing happened, so a stage that has been quiet
   // costs no height.
-  const stages = [
-    ...(verify ? [verifySection(verify)] : []),
-    ...(executed ? [executedSection(executed)] : []),
-  ];
+  const stages = (
+    <EpochStages
+      span={span ?? null}
+      sections={[
+        ...(verify ? [verifySection(verify)] : []),
+        ...(executed ? [executedSection(executed)] : []),
+      ]}
+    />
+  );
 
   const ports = (
     <PortList
@@ -92,7 +115,6 @@ export function TpuPathCard() {
     doorSection(tpu, tpu.kernel_drops),
     streamSection(tpu),
     listenerSection(tpu),
-    ...stages,
   ];
 
   return (
@@ -128,16 +150,61 @@ export function TpuPathCard() {
         <Section key={section.key} section={section} />
       ))}
 
+      {stages}
+
       {ports}
 
       <div className="card-footnote">
-        Five minutes of the QUIC listener's own counters. Each section is drawn
-        against its own total; the sections do not add up against each other,
-        because nothing counts a transaction across all of them. What the
-        scheduler then did with a leader slot's traffic is on that slot's own
-        page.
+        Five minutes of the QUIC listener's own counters, except Verify and
+        Executed, which are this epoch's. Each section is drawn against its own
+        total; the sections do not add up against each other, because nothing
+        counts a transaction across all of them. What the scheduler then did
+        with a leader slot's traffic is on that slot's own page.
       </div>
     </Card>
+  );
+}
+
+/**
+ * The two stages counted over the epoch, bracketed under one caption.
+ *
+ * Bracketed rather than run in with the rest because the sections above are
+ * counted over five minutes and the port list below comes back to them. A rule
+ * with the span written on it would read as governing everything under it,
+ * which here would be wrong twice over.
+ *
+ * The caption is set as a caption and not as a heading. It sits directly above
+ * a section title, and given the titles' own size, case and colour the two read
+ * as one heading of two lines rather than as a label and the thing labelled.
+ *
+ * Nothing at all where neither stage reported, which before the first leader
+ * slot of an epoch is the honest state: a span named over no figures says the
+ * stages threw everything away.
+ */
+function EpochStages({
+  span,
+  sections,
+}: {
+  span: EpochSpan | null;
+  sections: PathSection[];
+}) {
+  if (sections.length === 0) return null;
+
+  return (
+    <div className="path-epoch">
+      <div className="path-span">
+        <Explain text="What the sections in this box are counted over, which is not what the sections outside it are counted over. Both of these stages only run while this validator is leader, and a five-minute window measures neither: on all but the largest validators it reports whether a leader slot happened to fall inside the last five minutes, and almost always one did not. An epoch is the span the leader schedule is drawn over and the stake behind it is fixed for, so it is the span these are kept over. Where the heading says counted from part way in, this validator was restarted during the epoch and the totals begin there rather than at its first slot.">
+          {/* Published alongside the two stages, so it is only missing if one
+              of them arrived without it. Named rather than left blank in that
+              case: an epoch total under no heading reads as a windowed one. */}
+          {span ? epochSpanLabel(span) : "This epoch"}
+        </Explain>
+      </div>
+
+      {sections.map((section) => (
+        <Section key={section.key} section={section} />
+      ))}
+    </div>
   );
 }
 
@@ -174,7 +241,7 @@ function Elsewhere({
   ports,
 }: {
   paths: QuicPaths;
-  stages: PathSection[];
+  stages: ReactNode;
   ports: ReactNode;
 }) {
   // Summed across the ports rather than taken from the TPU port, which is not
@@ -201,16 +268,15 @@ function Elsewhere({
         reaches this host directly.
       </div>
 
-      {stages.map((section) => (
-        <Section key={section.key} section={section} />
-      ))}
+      {stages}
 
       {ports}
 
       <div className="card-footnote">
-        Five minutes of this host's own listeners and workers. Each section is
-        drawn against its own total; the sections do not add up against each
-        other, because nothing counts a transaction across all of them. What the
+        This epoch's totals from this host's own workers, with the ports at the
+        foot on the same five minutes as everywhere else. Each section is drawn
+        against its own total; the sections do not add up against each other,
+        because nothing counts a transaction across all of them. What the
         scheduler then did with a leader slot's traffic is on that slot's own
         page.
       </div>
