@@ -403,6 +403,16 @@ body {
   font-weight: 500;
 }
 
+/* The bubble inherits the figure's size and weight otherwise, which makes a
+   forty-four character key into a headline. */
+.header-stat-detail .explain-bubble {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 400;
+}
+
 .connection {
   display: flex;
   align-items: center;
@@ -1000,6 +1010,29 @@ body {
   white-space: normal;
   box-shadow: 0 4px 14px rgb(0 0 0 / 35%);
   pointer-events: none;
+}
+
+/* Reachable, for the bubbles that hold something to copy. */
+.explain-bubble.is-interactive {
+  pointer-events: auto;
+}
+
+/* The bubble sits six pixels clear of its trigger, and a pointer crossing that
+   gap is over neither, which fires the leave and closes the thing being reached
+   for. This bridges it. Only on the interactive ones: for a bubble that takes no
+   pointer events there is nothing to reach and the gap costs nothing. */
+.explain-bubble.is-interactive::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -7px;
+  height: 7px;
+}
+
+.explain-bubble.is-interactive.is-above::before {
+  top: auto;
+  bottom: -7px;
 }
 
 /* Opens upwards when there is no room below. Hanging off the foot of the page
