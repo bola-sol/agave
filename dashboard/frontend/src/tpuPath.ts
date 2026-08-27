@@ -58,7 +58,22 @@ export interface PathAside {
 
 export interface PathSection {
   key: string;
+  /**
+   * What the section counts, in the words the counter itself would use.
+   *
+   * Named for the quantity rather than for the place in the pipeline it sits.
+   * The three QUIC sections were once "at the door", "once connected" and "out
+   * of the listener", which read as an order of events and told an operator
+   * nothing they could match against a metric or a log line. The stage names
+   * that survive that test keep them: verify and executed are what those
+   * subsystems are actually called.
+   */
   title: string;
+  /**
+   * What the total is scoped to, which is the one thing the head cannot
+   * otherwise say. No section is drawn against the one above it, and the notes
+   * read down the card as the chain of denominators that makes that true.
+   */
   note: string;
   explain: string;
   /** What the bar is drawn against. */
@@ -278,8 +293,8 @@ export function doorSection(
 
   return {
     key: "door",
-    title: "At the door",
-    note: "connections offered",
+    title: "Connections offered",
+    note: "to this port",
     explain:
       "Connections, not transactions. Most of what the TPU port turns away it turns away here, before a byte has been read, and a transaction lost at this stage was never seen by anything downstream. The gates are checked in order and the listener moves on at the first one that closes, so a connection is usually counted at one of them and not several. Two things break that, and this section shows them rather than smoothing them over: the refusal at the connection table is counted under four overlapping names, and two branches of the listener drop a connection without counting it at all, which is what the unaccounted rows are.",
     total: q.offered,
@@ -348,8 +363,8 @@ export function streamSection(q: QuicPort): PathSection {
 
   return {
     key: "streams",
-    title: "Once connected",
-    note: "streams opened",
+    title: "Streams opened",
+    note: "on admitted connections",
     explain:
       "What the admitted connections sent, and what the stream limits did with it. A transaction is sent as a stream of its own, so this is the first section counting things rather than the peers sending them.",
     total: q.streams,
@@ -388,8 +403,8 @@ export function listenerSection(q: QuicPort): PathSection {
 
   return {
     key: "listener",
-    title: "Out of the listener",
-    note: "transactions read",
+    title: "Transactions read",
+    note: "out of those streams",
     explain:
       "Transactions the listener finished assembling out of its streams, and what became of them. Not a count of packets, and not comparable with the datagram figures on the socket card: one transaction arrives across however many datagrams it needs. The total is the outcomes added together, because the listener keeps no count of what it finished reading.",
     total: read,

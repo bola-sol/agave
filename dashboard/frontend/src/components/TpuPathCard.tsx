@@ -152,9 +152,8 @@ function others(paths: QuicPaths): QuicPort[] {
  * Which is what a relayer or a block-assembly proxy does: it overwrites the
  * address in gossip, so the cluster connects to it and this host's own TPU
  * listener is offered almost nothing. Every figure the three port sections
- * would draw is then a true nought, and three empty bars under a heading
- * reading "at the door" is a fair description of a door nobody uses being read
- * as a door nobody can get through.
+ * would draw is then a true nought, and three empty bars under "connections
+ * offered" say a port nobody uses is a port nobody could get through.
  *
  * So the ports fold to a line each and the stages keep the card. Those two
  * count what the scheduler was handed however it arrived, which on this
