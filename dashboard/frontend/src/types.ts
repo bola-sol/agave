@@ -384,6 +384,16 @@ export interface QuicPaths {
   /** What the counts above actually span, which is short until it has filled. */
   window_seconds: number;
   ports: QuicPort[];
+  /**
+   * Whether the TPU address this validator advertises is a socket on this host.
+   *
+   * It is not, behind a relayer or a block-assembly proxy: those overwrite the
+   * advertised address, so the cluster connects to them and this host's own
+   * listener sees almost nothing. True says the address is answered somewhere
+   * else and never by what, because the validator cannot tell which of them it
+   * is and a guess printed as fact is worse than the silence.
+   */
+  tpu_offhost: boolean;
 }
 
 export interface VerifyStage {

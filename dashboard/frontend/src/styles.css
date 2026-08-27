@@ -1927,6 +1927,31 @@ body {
   flex-direction: column;
 }
 
+/* Said once, at the top, where the advertised TPU address is answered off this
+   host and the ports below it therefore have almost nothing to report.
+
+   Slate rather than amber, and bordered rather than filled. A validator behind
+   a relayer or a proxy is configured, not broken, and the one thing this must
+   not do is read as a fault: the operator put it there. The colour is the same
+   neutral the vote series carries on the transactions matrix, chosen there for
+   the same reason — a constant background that is neither good nor bad. */
+.path-notice {
+  padding: 9px 12px;
+  margin-bottom: 11px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--vote);
+  border-radius: 5px;
+  background: var(--panel-raised);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.path-notice b {
+  color: var(--text);
+  font-weight: 600;
+}
+
 /* The two figures worth reading at a glance, kept out of the sections so they
    are not two rows among forty. */
 .path-headline {

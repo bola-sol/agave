@@ -382,6 +382,19 @@ pub struct QuicPort {
 pub struct QuicPaths {
     pub window_seconds: f64,
     pub ports: Vec<QuicPort>,
+    /// Whether the TPU address this validator advertises in gossip is a socket
+    /// on this host.
+    ///
+    /// It is not, on a validator fronted by a relayer or a block-assembly
+    /// proxy: those overwrite the advertised address so the cluster connects to
+    /// them instead, and the listener below then reports almost nothing. That
+    /// reading is correct and reads as a fault without this, since a TPU port
+    /// nobody is offering anything to looks identical to one nobody can reach.
+    ///
+    /// Says only that the address is answered elsewhere, never by what. The
+    /// dashboard cannot tell a relayer from a proxy from anything else that
+    /// might front the port, and naming one would be a guess printed as fact.
+    pub tpu_offhost: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -973,14 +986,37 @@ impl Meters {
         // and no more: a validator with no vote endpoint advertised should show
         // two rows, not a third reading nought.
         //
-        // Present as soon as any port has been offered anything, which on a
-        // validator with an open TPU port is immediately and permanently. The
-        // stages further down go quiet between leader slots, and a panel that
-        // left the grid whenever they did would be one an operator with few
-        // slots could rarely open at all.
+        // Present as soon as any port has taken a connection at any point in
+        // this process's life. The stages further down go quiet between leader
+        // slots, and a panel that left the grid whenever they did would be one
+        // an operator with few slots could rarely open at all.
+        //
+        // The test was once the window rather than the lifetime, on the
+        // reasoning that an open TPU port is offered something continuously.
+        // That holds on a validator answering its own TPU and fails on one
+        // whose advertised address belongs to a proxy: there the only inbound
+        // QUIC is vote traffic during a leader window, so every port sits at
+        // nought between them and the card left the grid for the half hour in
+        // between — the same disappearing act this card was built to end.
+        //
+        // Lifetime rather than window because the two say different things. A
+        // window at nought is a quiet five minutes. A lifetime at nought is a
+        // port nothing has ever used, which on a validator logging below
+        // `solana=info` is every port, since `datapoint_info!` never fires and
+        // the tap sees nothing at all. Publishing noughts for that would report
+        // a clean floor under a door nobody is watching.
         // Read before the windows are borrowed below, so the two do not have to
         // be disjoint.
         let kernel_drops = self.quic_kernel_drops.clone();
+        // Whether the advertised TPU port is bound here, read off the same join
+        // that fetched the kernel's drops: that pass is the one place each
+        // advertised port is looked up in the socket table, and a port missing
+        // from it is a port this host is not listening on.
+        //
+        // Only answerable while that table can be read. Once `drops_unavailable`
+        // latches every port looks absent, and the honest answer is then that we
+        // cannot tell rather than that the TPU has been handed away.
+        let tpu_offhost = !self.drops_unavailable && !kernel_drops.contains_key("tpu");
         let ports: Vec<QuicPort> = [
             (
                 "tpu",
@@ -1013,7 +1049,13 @@ impl Meters {
             kernel_drops: kernel_drops.get(name).copied(),
         })
         .collect();
-        let offered = ports.iter().any(|port| port.counts.offered > 0);
+        // The cumulative figures rather than the windowed ones in `ports`.
+        // `offered` is the one counter the tap stores as the listener reports
+        // it instead of accumulating, so this is the count since the port
+        // opened and it never falls back to nought once past it.
+        let ever_offered = current.quic.offered > 0
+            || current.quic_forwards.offered > 0
+            || current.quic_vote.offered > 0;
         // Every port's window is pushed on the same tick and trimmed to the
         // same length, so any one of them says how much time the figures cover.
         let window_seconds = (self.quic_window.len() as f64) * METER_INTERVAL.as_secs_f64();
@@ -1021,9 +1063,10 @@ impl Meters {
             &self.publisher,
             TOPIC_SUMMARY,
             "quic_paths",
-            offered.then_some(QuicPaths {
+            ever_offered.then_some(QuicPaths {
                 window_seconds,
                 ports,
+                tpu_offhost,
             }),
         );
 
@@ -1599,6 +1642,19 @@ mod tests {
         }
     }
 
+    /// A tap reading where the TPU port has taken `offered` connections since
+    /// it opened. Cumulative, not an interval: it is the one QUIC counter the
+    /// tap stores as reported rather than accumulating.
+    fn quic_tap(offered: u64) -> TapCounters {
+        TapCounters {
+            quic: QuicTotals {
+                offered,
+                ..QuicTotals::default()
+            },
+            ..TapCounters::default()
+        }
+    }
+
     /// A window of `(hits, misses, evictions)` samples.
     fn window(samples: &[(u64, u64, u64)]) -> VecDeque<(u64, u64, u64)> {
         samples.iter().copied().collect()
@@ -1856,6 +1912,71 @@ mod tests {
         assert!(published.contains(r#""source":"scheduler""#), "{published}");
         // 145 against a previous reading of 30: the one sample, not the four.
         assert!(published.contains(r#""received":115"#), "{published}");
+    }
+
+    #[test]
+    fn test_the_path_card_stays_once_a_port_has_ever_been_used() {
+        // The same reading twice, so every windowed figure comes out at nought
+        // while the cumulative offer stands. That is the quiet half hour
+        // between leader groups on a validator whose TPU is answered
+        // elsewhere, and the panel used to leave the grid for the whole of it.
+        let harness = fixture();
+        let mut meters = harness.meters();
+        let used = quic_tap(40);
+        meters.collect_waterfall(&used, &used);
+
+        let published = harness.published_key("summary", "quic_paths").unwrap();
+        assert!(!published.contains(r#""value":null"#), "{published}");
+        assert!(published.contains(r#""offered":0"#), "{published}");
+    }
+
+    #[test]
+    fn test_no_path_card_where_no_port_has_ever_been_offered_anything() {
+        // Which is also what a validator logging below `solana=info` looks
+        // like: `datapoint_info!` never fires, the tap sees nothing, and every
+        // counter reads nought. A card of noughts there would report a clean
+        // floor under a door nobody is watching.
+        let harness = fixture();
+        let mut meters = harness.meters();
+        meters.collect_waterfall(&TapCounters::default(), &TapCounters::default());
+
+        let published = harness.published_key("summary", "quic_paths").unwrap();
+        assert!(published.contains(r#""value":null"#), "{published}");
+    }
+
+    #[test]
+    fn test_an_advertised_tpu_bound_elsewhere_is_said_to_be() {
+        // A relayer or a block-assembly proxy overwrites the advertised
+        // address, so the socket join finds no such port here and the listener
+        // reports next to nothing. Both readings are right, and together they
+        // look like a broken TPU rather than an absent one.
+        let harness = fixture();
+        let mut meters = harness.meters();
+        let used = quic_tap(1);
+        meters.collect_waterfall(&used, &used);
+        let published = harness.published_key("summary", "quic_paths").unwrap();
+        assert!(published.contains(r#""tpu_offhost":true"#), "{published}");
+
+        // Found among this host's own sockets, and the claim is dropped.
+        meters.quic_kernel_drops.insert("tpu", 0);
+        meters.collect_waterfall(&used, &used);
+        let published = harness.published_key("summary", "quic_paths").unwrap();
+        assert!(published.contains(r#""tpu_offhost":false"#), "{published}");
+    }
+
+    #[test]
+    fn test_a_host_whose_sockets_cannot_be_read_is_not_told_its_tpu_moved() {
+        // Every advertised port looks absent once the socket table is
+        // unreadable. The honest answer to that is that we cannot tell, not
+        // that the TPU has been handed away.
+        let harness = fixture();
+        let mut meters = harness.meters();
+        meters.drops_unavailable = true;
+        let used = quic_tap(1);
+        meters.collect_waterfall(&used, &used);
+
+        let published = harness.published_key("summary", "quic_paths").unwrap();
+        assert!(published.contains(r#""tpu_offhost":false"#), "{published}");
     }
 
     #[test]

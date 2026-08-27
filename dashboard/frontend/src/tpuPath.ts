@@ -486,6 +486,25 @@ export function portNamed(ports: QuicPort[], name: string): QuicPort | null {
 }
 
 /**
+ * The ports in the order they are worth reading, busiest first.
+ *
+ * Only used where the TPU address is answered off this host. There the card
+ * has no leading port to build sections from, and the fixed order it is sent
+ * in would put the two ports nothing arrives on above the one that carries all
+ * the traffic this host still sees, which on most such validators is the vote
+ * port.
+ *
+ * Sorted on the window rather than on the lifetime figure. The question a
+ * folded row answers is what has been happening lately, and a port that was
+ * busy an hour ago should not outrank one that is busy now. Ties keep the
+ * order they were sent in, which is stable across ticks, so a row does not
+ * swap places with its neighbour while it is being read.
+ */
+export function portsBusiestFirst(ports: QuicPort[]): QuicPort[] {
+  return [...ports].sort((a, b) => b.offered - a.offered);
+}
+
+/**
  * Which of the quieter ports the reader last left unfolded, remembered per host.
  *
  * The same key shape and the same reasoning as the caches panel and the sidebar

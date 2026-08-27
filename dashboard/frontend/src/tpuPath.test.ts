@@ -5,6 +5,7 @@ import {
   executedSection,
   listenerSection,
   portNamed,
+  portsBusiestFirst,
   stakedShare,
   streamSection,
   verifySection,
@@ -251,6 +252,43 @@ describe("picking a port out of the list", () => {
     const ports = [quiet({ name: "tpu" }), quiet({ name: "tpu forwards" })];
     expect(portNamed(ports, "tpu forwards")?.name).toBe("tpu forwards");
     expect(portNamed(ports, "tpu vote quic")).toBeNull();
+  });
+});
+
+describe("ordering the folded ports", () => {
+  it("puts the busiest first, whichever port that turns out to be", () => {
+    // Behind a relayer the TPU port is the quiet one and the vote port carries
+    // everything this host still sees. Sent in a fixed order, that would bury
+    // the only row with anything on it under two rows of nought.
+    const ports = [
+      quiet({ name: "tpu", offered: 1 }),
+      quiet({ name: "tpu forwards", offered: 1 }),
+      quiet({ name: "tpu vote quic", offered: 296 }),
+    ];
+    expect(portsBusiestFirst(ports).map((port) => port.name)).toEqual([
+      "tpu vote quic",
+      "tpu",
+      "tpu forwards",
+    ]);
+  });
+
+  it("leaves ties in the order they were sent, so rows do not swap while read", () => {
+    const ports = [
+      quiet({ name: "tpu", offered: 4 }),
+      quiet({ name: "tpu forwards", offered: 4 }),
+      quiet({ name: "tpu vote quic", offered: 4 }),
+    ];
+    expect(portsBusiestFirst(ports).map((port) => port.name)).toEqual([
+      "tpu",
+      "tpu forwards",
+      "tpu vote quic",
+    ]);
+  });
+
+  it("does not reorder the list it was given", () => {
+    const ports = [quiet({ name: "tpu", offered: 1 }), quiet({ name: "tpu vote quic", offered: 9 })];
+    portsBusiestFirst(ports);
+    expect(ports.map((port) => port.name)).toEqual(["tpu", "tpu vote quic"]);
   });
 });
 
