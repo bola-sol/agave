@@ -67,6 +67,9 @@ export class Store {
    * changes, which is the only way an answer here can change.
    */
   private leaderCache = new Map<number, LeaderRef>();
+  /** Us, rebuilt only when one of the three values it is made of changes. */
+  private ours: LeaderRef = NO_LEADER;
+  private oursFrom = "";
 
   private listeners = new Set<() => void>();
   private frame: number | null = null;
@@ -169,7 +172,14 @@ export class Store {
    * have, resolves to a key with no name or to nothing at all, and the callers
    * fall back in that order.
    */
-  leaderOf(slot: number): LeaderRef {
+  leaderOf(slot: number, mine = false): LeaderRef {
+    // Ours takes no lookup, and must not depend on one. Both sources have a
+    // reach, and our own slots are kept well past both: five hundred of them is
+    // about eleven hours, which is far outside the peer table's window and
+    // crosses an epoch boundary often enough that the turn array cannot answer
+    // for them either. The validator tells us who we are directly.
+    if (mine) return this.ourLeader();
+
     const cached = this.leaderCache.get(slot);
     if (cached) return cached;
 
@@ -179,6 +189,27 @@ export class Store {
       key === null ? NO_LEADER : { key, name: peer?.name ?? null, icon: peer?.icon ?? null };
     this.leaderCache.set(slot, leader);
     return leader;
+  }
+
+  /**
+   * This validator, from what it publishes about itself.
+   *
+   * The same three values the header is drawn from, so a turn of ours is
+   * labelled exactly as the header labels us rather than by a second route that
+   * can disagree with it.
+   */
+  private ourLeader(): LeaderRef {
+    const key = (this.values.get("summary.identity_key") as string | undefined) ?? null;
+    const name = (this.values.get("summary.identity_name") as string | undefined) ?? null;
+    const icon = (this.values.get("summary.identity_icon") as string | undefined) ?? null;
+    // Rebuilt on change rather than per call: the rows that draw a leader are
+    // memoised on their props, and a fresh object each render would defeat it.
+    const stamp = `${key} ${name} ${icon}`;
+    if (this.oursFrom !== stamp) {
+      this.oursFrom = stamp;
+      this.ours = { key, name, icon };
+    }
+    return this.ours;
   }
 
   /**

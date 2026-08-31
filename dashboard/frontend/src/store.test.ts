@@ -99,6 +99,56 @@ describe("slots", () => {
     expect(ours.map((entry) => entry.slot)).toEqual([1, 2, 3, 4]);
   });
 
+  it("names a slot of ours from what the validator says about itself", () => {
+    // Not from the turn array or the peer table. Both have a reach and our own
+    // slots are kept past both: five hundred of them is about eleven hours,
+    // outside the peer table's window and often across an epoch boundary, which
+    // is where the turn array stops. Live, that showed our own turns as a bare
+    // key, or as unknown once the boundary was behind them.
+    const store = new Store();
+    store.apply(envelope("summary", "identity_key", "OURKEY"));
+    store.apply(envelope("summary", "identity_name", "Lantern"));
+    store.apply(envelope("summary", "identity_icon", "https://l/i.png"));
+
+    const ours = store.leaderOf(443_227_896, true);
+    expect(ours).toEqual({ key: "OURKEY", name: "Lantern", icon: "https://l/i.png" });
+  });
+
+  it("gives the same object back for ours until one of its parts changes", () => {
+    // The rows that draw a leader are memoised on their props, so a fresh
+    // object every render would rebuild the whole list on each meter sample.
+    const store = new Store();
+    store.apply(envelope("summary", "identity_key", "OURKEY"));
+    const first = store.leaderOf(1, true);
+    expect(store.leaderOf(2, true)).toBe(first);
+
+    store.apply(envelope("summary", "identity_name", "Lantern"));
+    expect(store.leaderOf(1, true)).not.toBe(first);
+    expect(store.leaderOf(1, true).name).toBe("Lantern");
+  });
+
+  it("still looks a slot that is not ours up the long way", () => {
+    const store = new Store();
+    store.apply(envelope("summary", "identity_key", "OURKEY"));
+    store.apply(
+      envelope("epoch", "new", {
+        epoch: 1,
+        start_slot: 100,
+        end_slot: 115,
+        slots_in_epoch: 16,
+        my_leader_slots: [],
+        leaders: ["THEIRKEY"],
+        turns: [0, 0, 0, 0],
+        block_cost_limit: 0,
+        account_cost_limit: 0,
+      }),
+    );
+    expect(store.leaderOf(104, false).key).toBe("THEIRKEY");
+    // And a slot outside the epoch the page holds still names nobody, which is
+    // the honest answer rather than a confident wrong one.
+    expect(store.leaderOf(99, false).key).toBeNull();
+  });
+
   it("answers a request with the reply carrying its id", async () => {
     const store = new Store();
     const sent: string[] = [];
