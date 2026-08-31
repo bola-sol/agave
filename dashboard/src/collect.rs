@@ -24,6 +24,7 @@ use {
     },
     serde::Serialize,
     solana_clock::{Clock, Epoch, Slot},
+    solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     std::{
@@ -220,6 +221,30 @@ pub struct EpochInfo {
     pub slots_in_epoch: u64,
     /// Slots in this epoch where this validator is the leader.
     pub my_leader_slots: Vec<Slot>,
+
+    /// Every leader of this epoch, in the order they first take a turn.
+    ///
+    /// Sent once rather than on every slot. A slot entry used to carry its
+    /// leader's key, name and icon, which across a window of them is the same
+    /// forty-four characters repeated thousands of times.
+    pub leaders: Vec<String>,
+    /// One index into `leaders` for each run of consecutive slots the schedule
+    /// hands to a single leader, so the leader of a slot is
+    /// `leaders[turns[(slot - start_slot) / NUM_CONSECUTIVE_LEADER_SLOTS]]`.
+    ///
+    /// Empty where the schedule for this epoch is not derived yet, and empty
+    /// rather than partial where it could not be read as whole turns. A short
+    /// array here is indistinguishable from a short epoch, so there is no safe
+    /// way to send half of one.
+    pub turns: Vec<u16>,
+
+    /// Consensus limits every block of this epoch is measured against.
+    ///
+    /// Here rather than on each slot because they only move with feature
+    /// activation, which lands on an epoch boundary. Per slot they were the
+    /// same two numbers repeated for the life of the epoch.
+    pub block_cost_limit: u64,
+    pub account_cost_limit: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -292,6 +317,18 @@ pub struct Collector {
     first_observed_slot: Option<Slot>,
     /// Detail for blocks this validator produced, captured as they froze.
     produced: ProducedRing,
+    /// The epoch, and whether its schedule was known, the last time the epoch
+    /// message was built.
+    ///
+    /// Everything in that message is fixed for the epoch's whole life, and the
+    /// turn array is a hundred and eight thousand entries on mainnet. Built at
+    /// every poll it would be two hundred kilobytes of arrays assembled five
+    /// times a second for `Debounced` to find unchanged and throw away.
+    ///
+    /// The second half of the pair is what lets a schedule that arrives late
+    /// still be published. Until it is derived the arrays are empty, and on
+    /// the epoch alone the next tick would match and never try again.
+    epoch_published: Option<(Epoch, bool)>,
     /// This validator's leader slots for the epoch the *root* is in, kept so
     /// the skip rate can walk them as the root passes each one.
     ///
@@ -357,6 +394,7 @@ impl Collector {
             first_observed_slot: None,
             produced: ProducedRing::new(PRODUCED_BLOCKS),
             skip_leader_slots: Vec::new(),
+            epoch_published: None,
             skip_epoch: None,
             skip_next_index: 0,
             skip_produced: 0,
@@ -1126,22 +1164,41 @@ impl Collector {
         // and this message carries every leader slot in the epoch, so folding
         // the two together would send the whole schedule out once a second.
 
-        // An unknown schedule is published as no leader slots. The panel counts
-        // them, and a count is better absent-as-zero than withheld.
-        let my_leader_slots = self.leader_slots_in_epoch(bank, epoch).unwrap_or_default();
+        // Built when the epoch turns, not at every poll. See `epoch_published`
+        // for why, and for why the schedule being known is half of the key.
+        if self.epoch_published != Some((epoch, true)) {
+            // An unknown schedule is published as no leader slots. The panel
+            // counts them, and a count is better absent-as-zero than withheld.
+            let my_leader_slots = self.leader_slots_in_epoch(bank, epoch).unwrap_or_default();
+            let (leaders, turns) = self.epoch_turns(epoch, slots_in_epoch);
+            let known = !turns.is_empty();
 
-        self.debounces.epoch.publish(
-            &self.publisher,
-            TOPIC_EPOCH,
-            "new",
-            EpochInfo {
-                epoch,
-                start_slot,
-                end_slot,
-                slots_in_epoch,
-                my_leader_slots,
-            },
-        );
+            // Poisoned only if a replay thread panicked while holding it, in
+            // which case the validator has more pressing problems than a
+            // missing limit.
+            let (block_cost_limit, account_cost_limit) = match bank.read_cost_tracker() {
+                Ok(tracker) => (tracker.get_block_limit(), tracker.get_account_limit()),
+                Err(_) => (0, 0),
+            };
+
+            self.debounces.epoch.publish(
+                &self.publisher,
+                TOPIC_EPOCH,
+                "new",
+                EpochInfo {
+                    epoch,
+                    start_slot,
+                    end_slot,
+                    slots_in_epoch,
+                    my_leader_slots,
+                    leaders,
+                    turns,
+                    block_cost_limit,
+                    account_cost_limit,
+                },
+            );
+            self.epoch_published = Some((epoch, known));
+        }
 
         self.collect_epoch_countdown(bank, epoch, start_slot, end_slot);
     }
@@ -1242,6 +1299,63 @@ impl Collector {
     ///
     /// The bank is only read for its epoch schedule, which comes from genesis
     /// and so is the same on any bank.
+    /// The epoch's leader schedule, as a table of leaders and one index per
+    /// turn.
+    ///
+    /// The compact form is not something built here so much as recovered.
+    /// `LeaderSchedule` already stores one entry per turn and expands it on the
+    /// way out by repeating each, so stepping back over `get_slot_leaders` by
+    /// the same stride returns what it holds: on mainnet a hundred and eight
+    /// thousand entries rather than four hundred and thirty-two thousand.
+    ///
+    /// Empty, never partial, on anything unexpected. That stride is only right
+    /// while the schedule's own repeat matches `NUM_CONSECUTIVE_LEADER_SLOTS`,
+    /// and the two are set independently: the field is private, so there is
+    /// nothing to compare against but the length that comes out. A schedule
+    /// silently off by a factor would name the wrong leader for every slot on
+    /// the page, which is worse in every way than naming none.
+    fn epoch_turns(&self, epoch: Epoch, slots_in_epoch: u64) -> (Vec<String>, Vec<u16>) {
+        let Some(schedule) = self
+            .ctx
+            .leader_schedule_cache
+            .get_epoch_leader_schedule(epoch)
+        else {
+            return (Vec::new(), Vec::new());
+        };
+        let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get();
+
+        let mut leaders: Vec<String> = Vec::new();
+        let mut seen: HashMap<Pubkey, u16> = HashMap::new();
+        let mut turns: Vec<u16> = Vec::new();
+        for leader in schedule.get_slot_leaders().step_by(stride) {
+            let index = match seen.get(&leader.id) {
+                Some(index) => *index,
+                None => {
+                    // A cluster with more than sixty-five thousand distinct
+                    // leaders in one epoch cannot be indexed by this array.
+                    // Mainnet runs around thirteen hundred.
+                    let Ok(index) = u16::try_from(leaders.len()) else {
+                        return (Vec::new(), Vec::new());
+                    };
+                    leaders.push(leader.id.to_string());
+                    seen.insert(leader.id, index);
+                    index
+                }
+            };
+            turns.push(index);
+        }
+
+        let covered = (turns.len() as u64).saturating_mul(stride as u64);
+        if covered != slots_in_epoch {
+            log::warn!(
+                "dashboard: epoch {epoch} leader schedule read as {} turns covering {covered} slots, not {slots_in_epoch}; publishing no schedule for it",
+                turns.len()
+            );
+            return (Vec::new(), Vec::new());
+        }
+        (leaders, turns)
+    }
+
     fn leader_slots_in_epoch(&self, bank: &Bank, epoch: Epoch) -> Option<Vec<Slot>> {
         let epoch_schedule = bank.epoch_schedule();
         let start_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
@@ -1958,6 +2072,92 @@ mod tests {
         );
         assert_eq!(tally.non_delinquent_stake, 107);
         assert_eq!(tally.delinquent_stake, 30);
+    }
+
+    // ---- epoch schedule ---------------------------------------------------
+
+    #[test]
+    fn test_the_turn_array_names_the_leader_the_schedule_names() {
+        // The whole point of the compact form: every slot must resolve through
+        // the two arrays to the same key the leader schedule would give it. An
+        // off-by-one in the stride would still produce a plausible-looking
+        // array of the right length naming the wrong validator throughout.
+        let harness = fixture();
+        let collector = harness.collector();
+        let bank = harness.working_bank();
+        let schedule = bank.epoch_schedule();
+        let epoch = schedule.get_epoch(bank.slot());
+        let start = schedule.get_first_slot_in_epoch(epoch);
+        let slots_in_epoch = schedule.get_slots_in_epoch(epoch);
+
+        let (leaders, turns) = collector.epoch_turns(epoch, slots_in_epoch);
+        assert!(!turns.is_empty(), "the fixture's own schedule is derivable");
+
+        let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get() as u64;
+        assert_eq!((turns.len() as u64).saturating_mul(stride), slots_in_epoch);
+
+        // Walked by turn rather than by slot, which also keeps the division
+        // that would map one to the other out of it: the workspace denies
+        // `arithmetic_side_effects`, and a runtime divisor trips it however
+        // impossible a zero is.
+        for (turn, index) in turns.iter().enumerate().take(16) {
+            let slot = start.saturating_add((turn as u64).saturating_mul(stride));
+            let expected = harness
+                .ctx
+                .leader_schedule_cache
+                .slot_leader_at(slot, Some(&bank))
+                .expect("the fixture leads its own schedule");
+            assert_eq!(
+                leaders[*index as usize],
+                expected.id.to_string(),
+                "slot {slot}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_an_epoch_with_no_derived_schedule_carries_no_turns() {
+        // Empty, never partial. A short array is indistinguishable from a short
+        // epoch, so a schedule that cannot be read has to say nothing at all.
+        let harness = fixture();
+        let collector = harness.collector();
+        let bank = harness.working_bank();
+        let epoch = bank.epoch_schedule().get_epoch(bank.slot());
+
+        let (leaders, turns) = collector.epoch_turns(epoch.saturating_add(500), 432_000);
+        assert!(leaders.is_empty());
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn test_a_mismatched_stride_publishes_nothing_rather_than_a_wrong_schedule() {
+        // `slots_in_epoch` is what the walk is checked against, so asking for
+        // the real epoch against the wrong length is the same shape of failure
+        // as the schedule's private repeat drifting from the constant.
+        let harness = fixture();
+        let collector = harness.collector();
+        let bank = harness.working_bank();
+        let epoch = bank.epoch_schedule().get_epoch(bank.slot());
+        let slots_in_epoch = bank.epoch_schedule().get_slots_in_epoch(epoch);
+
+        let (_, turns) = collector.epoch_turns(epoch, slots_in_epoch.saturating_add(4));
+        assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn test_the_epoch_message_is_built_once_and_not_at_every_poll() {
+        // It carries a hundred and eight thousand turns on mainnet. Rebuilt at
+        // the poll rate that is two hundred kilobytes of arrays assembled five
+        // times a second for the debounce to discard.
+        let harness = fixture();
+        let mut collector = harness.collector();
+        collector.tick();
+        let first = collector.epoch_published;
+        assert!(first.is_some());
+
+        harness.advance_to(8);
+        collector.tick();
+        assert_eq!(collector.epoch_published, first);
     }
 
     // ---- what this build is ---------------------------------------------

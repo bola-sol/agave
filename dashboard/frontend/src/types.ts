@@ -190,6 +190,23 @@ export interface EpochInfo {
   end_slot: number;
   slots_in_epoch: number;
   my_leader_slots: number[];
+
+  /** Every leader of this epoch, in the order they first take a turn. */
+  leaders: string[];
+  /**
+   * One index into `leaders` per run of consecutive slots given to a single
+   * leader, so the leader of a slot is
+   * `leaders[turns[(slot - start_slot) / 4]]`, four being the run length the
+   * cluster guarantees.
+   *
+   * Empty where the validator could not derive the schedule, which is not the
+   * same as an epoch with no leaders and must not be drawn as one.
+   */
+  turns: number[];
+
+  /** Consensus limits every block of this epoch is measured against. */
+  block_cost_limit: number;
+  account_cost_limit: number;
 }
 
 export interface Network {
