@@ -172,7 +172,7 @@ export class Store {
    * have, resolves to a key with no name or to nothing at all, and the callers
    * fall back in that order.
    */
-  leaderOf(slot: number, mine = false): LeaderRef {
+  leaderOf(slot: number, mine: boolean): LeaderRef {
     // Ours takes no lookup, and must not depend on one. Both sources have a
     // reach, and our own slots are kept well past both: five hundred of them is
     // about eleven hours, which is far outside the peer table's window and

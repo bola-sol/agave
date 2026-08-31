@@ -90,7 +90,7 @@ export function SchedulePage() {
 
   const turns = useMemo(
     () =>
-      turnsOf(slots, (slot) => store.leaderOf(slot)).filter(
+      turnsOf(slots, (slot, mine) => store.leaderOf(slot, mine)).filter(
         (turn) => matchesQuery(turn, query) && (!oursOnly || turn.mine),
       ),
     // `store` is stable and its revision is what re-runs this; `leaderOf`
