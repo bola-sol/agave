@@ -35,6 +35,23 @@ import { ScrollTop } from "./ScrollTop";
  */
 const OLDER_SPAN = 512;
 
+/**
+ * Turns drawn at once, however many are loaded or matched.
+ *
+ * The list is not virtualised, so every turn on it is about fifty elements of
+ * real DOM and the browser lays all of them out. Measured on this stylesheet: a
+ * thousand turns is fifty-four thousand elements, half a second to render and
+ * thirty milliseconds of layout on every scroll, which is the edge of
+ * comfortable. Two and a half thousand is a second and a half and sixty-seven
+ * milliseconds a scroll, which is not.
+ *
+ * The depth beyond this is reached by searching rather than by scrolling to it.
+ * Nobody walks a hundred thousand slots four at a time; they look for a
+ * validator or paste a slot number, and a search narrows to a few hundred turns
+ * long before this bites.
+ */
+const MAX_TURNS = 1000;
+
 export function SchedulePage() {
   const store = useStore();
   const [query, setQuery] = useState("");
@@ -88,7 +105,7 @@ export function SchedulePage() {
     [peers],
   );
 
-  const turns = useMemo(
+  const matched = useMemo(
     () =>
       turnsOf(slots, (slot, mine) => store.leaderOf(slot, mine)).filter(
         (turn) => matchesQuery(turn, query) && (!oursOnly || turn.mine),
@@ -98,6 +115,15 @@ export function SchedulePage() {
     // values and so bump that revision when they change.
     [store, slots, query, oursOnly],
   );
+
+  // Newest first, so the cap keeps the newest and drops the tail. A search that
+  // matches more than the page will draw says so rather than quietly showing
+  // some of its answer.
+  const turns = matched.slice(0, MAX_TURNS);
+  const beyondCap = matched.length - turns.length;
+  // Counted in slots because that is what a span is asked for in. The live
+  // window is part of the total: it is drawn from the same list.
+  const atCeiling = slots.length >= MAX_TURNS * SLOTS_PER_TURN;
 
   return (
     <section className="schedule">
@@ -135,7 +161,13 @@ export function SchedulePage() {
             totalStake={stake?.total_stake}
           />
         ))}
-        {slots.length > 0 && !exhausted && (
+        {beyondCap > 0 && (
+          <div className="schedule-capped">
+            {count(turns.length)} of {count(matched.length)} matching turns shown.
+            Narrow the search to see the rest.
+          </div>
+        )}
+        {slots.length > 0 && !exhausted && !atCeiling && (
           <button
             type="button"
             className="schedule-older"
@@ -144,6 +176,12 @@ export function SchedulePage() {
           >
             {loading ? "loading…" : "load earlier turns"}
           </button>
+        )}
+        {atCeiling && beyondCap === 0 && (
+          <div className="schedule-capped">
+            As far back as this list goes. The validator keeps a great deal more;
+            search a name, a key or a slot number to reach it.
+          </div>
         )}
       </div>
     </section>
