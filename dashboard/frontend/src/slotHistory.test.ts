@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { entriesOf, HAS_BLOCK, HAS_CLOCK, leaderAt, leaderDisplays, type SlotRange, type WireRow } from "./slotHistory";
-import type { EpochInfo, SlotEntry } from "./types";
+import { leaderAt } from "./schedule";
+import { entriesOf, HAS_BLOCK, HAS_CLOCK, type SlotRange, type WireRow } from "./slotHistory";
+import type { EpochInfo } from "./types";
 
 const ALICE = "A1ice1111111111111111111111111111111111111";
 const BOB = "B0b22222222222222222222222222222222222222222";
@@ -56,7 +57,7 @@ describe("entriesOf", () => {
     // The one place the wire order is pinned on this side. It is positional, so
     // a silent reordering would put fees in the compute column and nothing
     // would fail until someone read the page.
-    const [entry] = entriesOf(range([row()]), epochOf(), new Map(), undefined);
+    const [entry] = entriesOf(range([row()]), epochOf(), undefined);
     expect(entry.level).toBe("rooted");
     expect(entry.block?.non_vote_transactions).toBe(8_752);
     expect(entry.block?.transactions).toBe(66 + 8_752);
@@ -67,7 +68,7 @@ describe("entriesOf", () => {
   it("takes the cost limits from the epoch rather than from the row", () => {
     // They are the same two numbers for the epoch's whole life, which is why
     // they are not on the row at all.
-    const [entry] = entriesOf(range([row()]), epochOf(), new Map(), undefined);
+    const [entry] = entriesOf(range([row()]), epochOf(), undefined);
     expect(entry.block?.block_cost_limit).toBe(60_000_000);
   });
 
@@ -76,7 +77,6 @@ describe("entriesOf", () => {
     const entries = entriesOf(
       range([row({ 6: 1_000_000 }), row({ 6: 1_000_400 })]),
       epochOf(),
-      new Map(),
       undefined,
     );
     expect(entries[0].duration_nanos).toBeNull();
@@ -89,7 +89,6 @@ describe("entriesOf", () => {
     const entries = entriesOf(
       range([row({ 6: 1_000_000 }), null, row({ 6: 1_000_800 })]),
       epochOf(),
-      new Map(),
       undefined,
     );
     expect(entries).toHaveLength(2);
@@ -98,40 +97,23 @@ describe("entriesOf", () => {
   });
 
   it("leaves a block out where none was recorded, rather than drawing an empty one", () => {
-    const [entry] = entriesOf(range([row({ 1: HAS_CLOCK })]), epochOf(), new Map(), undefined);
+    const [entry] = entriesOf(range([row({ 1: HAS_CLOCK })]), epochOf(), undefined);
     expect(entry.block).toBeNull();
   });
 
   it("marks the slots we led", () => {
-    const entries = entriesOf(range([row(), null, null, null, row()]), epochOf(), new Map(), ALICE);
+    const entries = entriesOf(range([row(), null, null, null, row()]), epochOf(), ALICE);
     expect(entries[0].mine).toBe(true);
     expect(entries[1].mine).toBe(false);
   });
 
-  it("names a leader from what the live window taught the page", () => {
-    const displays = leaderDisplays([
-      { leader: ALICE, leader_name: "Alice Co", leader_icon: "https://a/i.png" } as SlotEntry,
-    ]);
-    const [entry] = entriesOf(range([row()]), epochOf(), displays, undefined);
-    expect(entry.leader).toBe(ALICE);
-    expect(entry.leader_name).toBe("Alice Co");
-  });
-
-  it("falls back to the key for a leader the live window never showed", () => {
-    // Names are the largest strings a slot used to repeat, so the epoch arrays
-    // carry keys only. A turn from before anything was watched gets its key.
-    const [entry] = entriesOf(range([row()]), epochOf(), new Map(), undefined);
-    expect(entry.leader).toBe(ALICE);
-    expect(entry.leader_name).toBeNull();
-  });
-});
-
-describe("leaderDisplays", () => {
-  it("keeps the first naming of a leader and ignores the ones with nothing to add", () => {
-    const displays = leaderDisplays([
-      { leader: ALICE, leader_name: null, leader_icon: null } as SlotEntry,
-      { leader: ALICE, leader_name: "Alice Co", leader_icon: null } as SlotEntry,
-    ]);
-    expect(displays.get(ALICE)?.name).toBe("Alice Co");
+  it("says nothing about who led, only whether we did", () => {
+    // Naming is no longer this module's job. A fetched slot carries `mine` and
+    // the page resolves the leader itself, the same way it does for a live one,
+    // so the two agree by construction rather than by both being told.
+    const [entry] = entriesOf(range([row()]), epochOf(), ALICE);
+    expect(entry.mine).toBe(true);
+    expect("leader" in entry).toBe(false);
+    expect("leader_name" in entry).toBe(false);
   });
 });

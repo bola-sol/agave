@@ -11,9 +11,14 @@ export type SlotLevel =
 export interface SlotEntry {
   slot: number;
   level: SlotLevel;
-  leader: string | null;
-  leader_name: string | null;
-  leader_icon: string | null;
+  /**
+   * True when this validator was the scheduled leader.
+   *
+   * The leader itself is not here. It was three strings on every slot, the same
+   * key, name and icon repeated for all four slots of a turn. The key now comes
+   * from the epoch's turn array and the name and icon from the peer table, each
+   * holding one copy per leader. Resolve them with `store.leaderOf`.
+   */
   mine: boolean;
   /** What replay found in the block. Null for a slot with no block. */
   block: BlockDetail | null;
@@ -118,6 +123,10 @@ export interface Peer {
   version: string | null;
   stake: number;
   ip: string | null;
+  /** Display name from the validator's on-chain info, if it published one. */
+  name: string | null;
+  /** Icon URL from the same place. */
+  icon: string | null;
 }
 
 /**

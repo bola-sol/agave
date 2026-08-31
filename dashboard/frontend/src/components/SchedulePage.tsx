@@ -1,7 +1,7 @@
 import { memo, useMemo, useRef, useState } from "react";
 import { count, percent, shortKey, sol, solCompact } from "../format";
 import { matchesQuery, SLOTS_PER_TURN, turnKey, turnsOf, type Turn, type TurnSlot } from "../schedule";
-import { entriesOf, leaderDisplays, type SlotRange } from "../slotHistory";
+import { entriesOf, type SlotRange } from "../slotHistory";
 import type { EpochInfo, Peer, SlotEntry, StakeSummary } from "../types";
 import { useStore } from "../useStore";
 import { Copyable } from "./Copyable";
@@ -70,8 +70,7 @@ export function SchedulePage() {
         first_slot: first,
         count: earliest - first,
       });
-      const displays = leaderDisplays(slots);
-      const fetched = entriesOf(range, epoch, displays, identity);
+      const fetched = entriesOf(range, epoch, identity);
       // Nothing came back for any of it, so there is nothing older to ask for
       // and the control stops offering.
       if (fetched.length === 0) setExhausted(true);
@@ -90,8 +89,14 @@ export function SchedulePage() {
   );
 
   const turns = useMemo(
-    () => turnsOf(slots).filter((turn) => matchesQuery(turn, query) && (!oursOnly || turn.mine)),
-    [slots, query, oursOnly],
+    () =>
+      turnsOf(slots, (slot) => store.leaderOf(slot)).filter(
+        (turn) => matchesQuery(turn, query) && (!oursOnly || turn.mine),
+      ),
+    // `store` is stable and its revision is what re-runs this; `leaderOf`
+    // answers from the epoch and peer table, both of which arrive as published
+    // values and so bump that revision when they change.
+    [store, slots, query, oursOnly],
   );
 
   return (

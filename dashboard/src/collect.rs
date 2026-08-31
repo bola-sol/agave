@@ -198,6 +198,15 @@ pub struct Peer {
     pub stake: u64,
     /// Host of the gossip address, without the port.
     pub ip: Option<String>,
+    /// Display name from the validator's on-chain info, when it published one.
+    ///
+    /// Here rather than on every slot it leads. A leader takes four slots at a
+    /// time and comes round often, so on the slot it was the same string many
+    /// times over; here it is one copy, in a table the schedule page already
+    /// joins against for the version and stake beside it.
+    pub name: Option<String>,
+    /// The validator's on-chain icon URL, when it published one.
+    pub icon: Option<String>,
 }
 
 /// A slot the leader schedule has assigned that has not happened yet.
@@ -525,7 +534,6 @@ impl Collector {
         if subscribers > 0 && now.duration_since(self.last_slow_tick) >= SLOW_TICK {
             self.last_slow_tick = now;
             self.collect_validator_info(&frozen);
-            self.backfill_leader_names();
             self.collect_peers(&working_bank);
             self.collect_health();
             self.collect_skip_rate(&root_bank);
@@ -757,11 +765,10 @@ impl Collector {
                 self.leaders_resolved_to = slot;
                 return;
             };
-            let (name, icon) = self.peer_display(&leader.id);
-            if let Some(entry) =
-                self.slots
-                    .set_leader(slot, &leader.id, name, icon, leader.id == me)
-            {
+            // Only whether it is ours. Who the leader is comes off the epoch's
+            // turn array in the browser, and what they are called off the peer
+            // table, each of which holds one copy per leader.
+            if let Some(entry) = self.slots.set_mine(slot, leader.id == me) {
                 self.publish_slot(&entry);
             }
             self.leaders_resolved_to = slot.saturating_add(1);
@@ -841,7 +848,24 @@ impl Collector {
     /// unsorted list would look different on every tick and republish itself
     /// for no reason.
     fn collect_peer_table(&mut self, bank: &Bank, mut leaders: HashSet<String>) {
-        leaders.extend(self.slots.recent_leaders(SLOT_OVERVIEW_LEN));
+        // The leaders of the window a client holds, taken from the schedule
+        // rather than from the slots. The slots no longer carry a leader, and
+        // walking the schedule is cheaper anyway: a leader takes four slots at
+        // a time, so this is a quarter as many lookups as there are slots.
+        let highest = self.last_completed_slot;
+        let first = highest.saturating_sub(SLOT_OVERVIEW_LEN as u64);
+        let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get() as u64;
+        let mut slot = first.saturating_sub(first.checked_rem(stride).unwrap_or(0));
+        while slot <= highest {
+            if let Some(leader) = self
+                .ctx
+                .leader_schedule_cache
+                .slot_leader_at(slot, Some(bank))
+            {
+                leaders.insert(leader.id.to_string());
+            }
+            slot = slot.saturating_add(stride);
+        }
 
         let mut stakes: HashMap<String, u64> = HashMap::new();
         for (stake, account) in bank.vote_accounts().values() {
@@ -874,10 +898,16 @@ impl Collector {
             .into_iter()
             .map(|identity| {
                 let (version, ip) = gossip.get(&identity).cloned().unwrap_or_default();
+                let (name, icon) = identity
+                    .parse()
+                    .map(|key| self.peer_display(&key))
+                    .unwrap_or_default();
                 Peer {
                     stake: stakes.get(&identity).copied().unwrap_or(0),
                     version,
                     ip,
+                    name,
+                    icon,
                     identity,
                 }
             })
@@ -1468,37 +1498,6 @@ impl Collector {
         );
     }
 
-    /// Fills in leader names that were unknown when the slot was first labelled.
-    ///
-    /// The name scan takes minutes, so every slot seen before it finishes has no
-    /// name, and a slot is only labelled once. Without this they would stay as
-    /// raw pubkeys for as long as they remain in the ring.
-    fn backfill_leader_names(&mut self) {
-        let missing = self.slots.leaders_without_names();
-        if missing.is_empty() {
-            return;
-        }
-        let resolved: Vec<(Slot, Option<String>, Option<String>)> = {
-            let cache = self.info_cache.read().unwrap();
-            missing
-                .into_iter()
-                .filter_map(|(slot, leader)| {
-                    let identity = leader.parse().ok()?;
-                    let info = cache.get(&identity)?;
-                    // Only worth republishing the slot if something resolved.
-                    info.name
-                        .is_some()
-                        .then(|| (slot, info.name.clone(), info.icon_url.clone()))
-                })
-                .collect()
-        };
-        for (slot, name, icon) in resolved {
-            if let Some(entry) = self.slots.set_leader_display(slot, name, icon) {
-                self.publish_slot(&entry);
-            }
-        }
-    }
-
     /// Display name and icon URL for an identity, from its on-chain validator
     /// info. The icon is an arbitrary third-party URL the operator published,
     /// so the client fetches it directly and treats a failure as no icon.
@@ -1516,9 +1515,10 @@ impl Collector {
     /// makes the result complete: bank forks drops banks once they are rooted,
     /// so a sweep that skipped a tick would miss those slots for good.
     ///
-    /// What the cache feeds is `peer_display`, for slots labelled from here on,
-    /// and `backfill_leader_names`, for slots that were labelled before a name
-    /// was known. A name that changes after a slot already carries one does not
+    /// What the cache feeds is `peer_display`, and through it the peer table.
+    /// A name is looked up there once per leader when that table is rebuilt, so
+    /// one arriving late needs no backfill: the next rebuild has it. A name that
+    /// changes after a slot already carries one does not
     /// propagate to that slot, which is the right trade for a strip covering
     /// the last few minutes.
     ///

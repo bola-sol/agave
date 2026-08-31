@@ -226,9 +226,6 @@ mod tests {
         SlotEntry {
             slot,
             level: SlotLevel::Rooted,
-            leader: None,
-            leader_name: None,
-            leader_icon: None,
             mine: false,
             block: None,
             duration_nanos: None,

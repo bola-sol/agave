@@ -15,9 +15,6 @@ function slot(number: number, level: SlotEntry["level"] = "completed"): SlotEntr
   return {
     slot: number,
     level,
-    leader: null,
-    leader_name: null,
-    leader_icon: null,
     block: null,
     duration_nanos: null,
     mine: false,

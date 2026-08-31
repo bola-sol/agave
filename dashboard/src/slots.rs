@@ -3,8 +3,7 @@
 use {
     serde::Serialize,
     solana_clock::Slot,
-    solana_pubkey::Pubkey,
-    std::collections::{BTreeMap, HashSet, btree_map::Entry},
+    std::collections::{BTreeMap, btree_map::Entry},
 };
 
 /// How far a slot has progressed through consensus, ordered from least to most
@@ -30,14 +29,17 @@ pub enum SlotLevel {
 pub struct SlotEntry {
     pub slot: Slot,
     pub level: SlotLevel,
-    /// Base58 identity of the scheduled leader, when the schedule is known.
-    pub leader: Option<String>,
-    /// The leader's display name, carried here so the client needs no copy of
-    /// the cluster's peer table just to label a row.
-    pub leader_name: Option<String>,
-    /// The leader's on-chain icon URL, when it published one.
-    pub leader_icon: Option<String>,
     /// True when this validator was the scheduled leader.
+    ///
+    /// The leader itself is not here. It was three strings on every slot, and
+    /// across a window of them the same key, name and icon repeated for all
+    /// four slots of a turn: about a hundred bytes a slot, and a quarter of
+    /// what a client was sent on connect. The key now comes from the epoch's
+    /// turn array and the name and icon from the peer table, each holding one
+    /// copy per leader instead of one per slot.
+    ///
+    /// `mine` stays because it cannot be worked out from those without the
+    /// epoch arrays, which arrive on their own message and may not have yet.
     pub mine: bool,
     /// What replay found in the block. `None` until the slot freezes, and for
     /// a slot that was skipped or never replayed.
@@ -97,9 +99,6 @@ impl SlotEntry {
         Self {
             slot,
             level: SlotLevel::Incomplete,
-            leader: None,
-            leader_name: None,
-            leader_icon: None,
             mine: false,
             block: None,
             duration_nanos: None,
@@ -153,21 +152,6 @@ impl SlotRing {
     pub fn recent(&self, count: usize) -> Vec<SlotEntry> {
         let skip = self.entries.len().saturating_sub(count);
         self.entries.values().skip(skip).cloned().collect()
-    }
-
-    /// The distinct leaders of the most recent `count` slots.
-    ///
-    /// What the schedule page needs metadata for, and no more. Bounded by the
-    /// slots a client is actually holding rather than by the size of the
-    /// cluster, so the table that goes with it does not grow with a validator
-    /// set the page never shows.
-    pub fn recent_leaders(&self, count: usize) -> HashSet<String> {
-        let skip = self.entries.len().saturating_sub(count);
-        self.entries
-            .values()
-            .skip(skip)
-            .filter_map(|entry| entry.leader.clone())
-            .collect()
     }
 
     /// What a newly connected client is sent: the most recent `count` slots,
@@ -296,43 +280,12 @@ impl SlotRing {
             .collect()
     }
 
-    /// Slots that know their leader but have no name for it yet, as
-    /// `(slot, leader)` pairs.
-    pub fn leaders_without_names(&self) -> Vec<(Slot, String)> {
-        self.entries
-            .values()
-            .filter(|entry| entry.leader_name.is_none())
-            .filter_map(|entry| entry.leader.clone().map(|leader| (entry.slot, leader)))
-            .collect()
-    }
-
-    pub fn set_leader_display(
-        &mut self,
-        slot: Slot,
-        name: Option<String>,
-        icon: Option<String>,
-    ) -> Option<SlotEntry> {
-        self.update(slot, |entry| {
-            entry.leader_name = name;
-            entry.leader_icon = icon;
-        })
-    }
-
-    pub fn set_leader(
-        &mut self,
-        slot: Slot,
-        leader: &Pubkey,
-        name: Option<String>,
-        icon: Option<String>,
-        mine: bool,
-    ) -> Option<SlotEntry> {
-        let leader = leader.to_string();
-        self.update(slot, |entry| {
-            entry.leader = Some(leader);
-            entry.leader_name = name;
-            entry.leader_icon = icon;
-            entry.mine = mine;
-        })
+    /// Records that this validator leads `slot`.
+    ///
+    /// The only thing about a leader a slot still carries. Everything else the
+    /// page shows about them is one copy per leader elsewhere.
+    pub fn set_mine(&mut self, slot: Slot, mine: bool) -> Option<SlotEntry> {
+        self.update(slot, |entry| entry.mine = mine)
     }
 }
 
@@ -340,63 +293,21 @@ impl SlotRing {
 mod tests {
     use super::*;
 
-    fn leader(seed: u8) -> Pubkey {
-        Pubkey::new_from_array([seed; 32])
-    }
-
     #[test]
-    fn test_setting_a_leader_records_who_and_whether_it_is_ours() {
+    fn test_a_slot_records_only_whether_it_is_ours() {
         let mut ring = SlotRing::new(16);
-        let entry = ring
-            .set_leader(7, &leader(1), Some("Lantern".into()), None, true)
-            .expect("a new leader is a change");
-        assert_eq!(
-            entry.leader.as_deref(),
-            Some(leader(1).to_string().as_str())
-        );
-        assert_eq!(entry.leader_name.as_deref(), Some("Lantern"));
+        let entry = ring.set_mine(7, true).expect("a change");
         assert!(entry.mine);
     }
 
     #[test]
-    fn test_setting_the_same_leader_twice_reports_no_change() {
+    fn test_marking_the_same_slot_ours_twice_reports_no_change() {
         // The schedule is walked forwards on every tick, so a slot is labelled
         // repeatedly. Republishing each time would put the strip's whole window
         // on the wire five times a second.
         let mut ring = SlotRing::new(16);
-        assert!(ring.set_leader(7, &leader(1), None, None, false).is_some());
-        assert!(ring.set_leader(7, &leader(1), None, None, false).is_none());
-    }
-
-    #[test]
-    fn test_a_slot_awaits_a_name_only_while_it_has_none() {
-        let mut ring = SlotRing::new(16);
-        ring.set_leader(7, &leader(1), None, None, false);
-        ring.set_leader(8, &leader(2), Some("Known".into()), None, false);
-        // Slot 9 has no leader at all, so there is nothing to look up for it.
-        ring.update(9, |entry| entry.level = SlotLevel::Completed);
-
-        let waiting = ring.leaders_without_names();
-        assert_eq!(waiting.len(), 1);
-        assert_eq!(waiting[0].0, 7);
-        assert_eq!(waiting[0].1, leader(1).to_string());
-    }
-
-    #[test]
-    fn test_a_name_arriving_late_fills_the_slot_in() {
-        // The validator info scan takes minutes, so slots seen before it lands
-        // carry a raw pubkey until it does.
-        let mut ring = SlotRing::new(16);
-        ring.set_leader(7, &leader(1), None, None, false);
-        let entry = ring
-            .set_leader_display(7, Some("Lantern".into()), Some("https://i".into()))
-            .expect("a name where there was none is a change");
-        assert_eq!(entry.leader_name.as_deref(), Some("Lantern"));
-        assert_eq!(entry.leader_icon.as_deref(), Some("https://i"));
-        assert!(
-            ring.leaders_without_names().is_empty(),
-            "and it stops asking"
-        );
+        assert!(ring.set_mine(7, true).is_some());
+        assert!(ring.set_mine(7, true).is_none());
     }
 
     /// The two slot snapshots are the largest messages the server sends, and
@@ -409,12 +320,13 @@ mod tests {
     /// on the sum would fail for a shape that ships perfectly well.
     #[test]
     fn test_the_largest_slot_snapshots_fit_the_message_ceiling() {
-        // Worst case throughout: a full ring, every slot with a leader, and a
-        // name and icon as long as a validator-info account can carry.
+        // Worst case throughout: a full ring, every counter at its ceiling.
+        // Far smaller than it was, the leader's key, name and icon having moved
+        // off the slot; the check stays because what bounds the frame is still
+        // this message and a field added here is what would grow it.
         //
         // The 512 mirrors `SLOT_OVERVIEW_LEN` in `collect`, which this module
         // cannot see.
-        let long = "x".repeat(300);
         // Built per message rather than sliced from one vector: `encode` takes
         // a sized value, and a slice of entries is not one.
         let worst = |count: usize| -> Vec<SlotEntry> {
@@ -422,9 +334,6 @@ mod tests {
                 .map(|index| SlotEntry {
                     slot: 428_804_675 + index,
                     level: SlotLevel::OptimisticallyConfirmed,
-                    leader: Some("J7v9KQ8s3XjLpQmR4tVnW2yZ6bC1dE5fG8hJ3kL7mN9p".to_string()),
-                    leader_name: Some(long.clone()),
-                    leader_icon: Some(long.clone()),
                     mine: true,
                     block: Some(BlockDetail {
                         transactions: u64::MAX,

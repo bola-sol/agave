@@ -7,7 +7,8 @@
  * re-render the tree several hundred times a second to no visible effect.
  */
 
-import type { Envelope, NetworkSample, SlotEntry, TpsSample } from "./types";
+import { leaderAt, NO_LEADER, type LeaderRef } from "./schedule";
+import type { EpochInfo, Envelope, NetworkSample, Peer, SlotEntry, TpsSample } from "./types";
 
 /** Slots kept for the strip and sidebar. Matches the server's overview length. */
 const MAX_SLOTS = 512;
@@ -54,6 +55,18 @@ export class Store {
   private sender: ((frame: string) => void) | null = null;
   private pending = new Map<number, Pending>();
   private nextRequestId = 1;
+  /** The peer list the index below was built from, to know when it is stale. */
+  private peers: Peer[] | null = null;
+  private peerIndex = new Map<string, Peer>();
+  /**
+   * Resolved leaders by slot, so that repeated lookups return the same object.
+   *
+   * Not for speed. The rows that show a leader are memoised on their props, and
+   * a freshly built object every render would defeat that and rebuild the whole
+   * list on every meter sample. Cleared whenever the epoch or the peer table
+   * changes, which is the only way an answer here can change.
+   */
+  private leaderCache = new Map<number, LeaderRef>();
 
   private listeners = new Set<() => void>();
   private frame: number | null = null;
@@ -143,6 +156,46 @@ export class Store {
     });
   }
 
+  /**
+   * Who leads a slot, and what to call them.
+   *
+   * The one place that knows how a leader is put back together, because it is
+   * no longer in one place on the wire: the key comes from the epoch's turn
+   * array and the name and icon from the peer table. A slot carries neither.
+   *
+   * The peer table covers the leaders of the window a client holds and the ones
+   * about to lead, so a live turn is named before it is drawn. A turn from
+   * further back than that, or from an epoch whose schedule the page does not
+   * have, resolves to a key with no name or to nothing at all, and the callers
+   * fall back in that order.
+   */
+  leaderOf(slot: number): LeaderRef {
+    const cached = this.leaderCache.get(slot);
+    if (cached) return cached;
+
+    const key = leaderAt(this.values.get("epoch.new") as EpochInfo | undefined, slot);
+    const peer = key === null ? undefined : this.peersByIdentity().get(key);
+    const leader: LeaderRef =
+      key === null ? NO_LEADER : { key, name: peer?.name ?? null, icon: peer?.icon ?? null };
+    this.leaderCache.set(slot, leader);
+    return leader;
+  }
+
+  /**
+   * The peer table by identity, rebuilt only when the table itself changes.
+   *
+   * Compared by reference: the store replaces the whole array when a new one is
+   * published and never mutates it, so a different array is a different table.
+   */
+  private peersByIdentity(): Map<string, Peer> {
+    const peers = (this.values.get("peers.all") as Peer[] | undefined) ?? [];
+    if (this.peers !== peers) {
+      this.peers = peers;
+      this.peerIndex = new Map(peers.map((peer) => [peer.identity, peer]));
+    }
+    return this.peerIndex;
+  }
+
   /** Slots in ascending order. */
   getSlots(): SlotEntry[] {
     return [...this.slots.values()].sort((a, b) => a.slot - b.slot);
@@ -210,6 +263,9 @@ export class Store {
       }
     } else {
       this.values.set(`${topic}.${key}`, value);
+      // The two things a resolved leader is made of. Either changing makes
+      // every answer already given potentially wrong.
+      if (topic === "epoch" || topic === "peers") this.leaderCache.clear();
     }
 
     this.touch();

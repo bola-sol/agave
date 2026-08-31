@@ -14,7 +14,7 @@
  * be drawing a number that was never measured.
  */
 
-import { SLOTS_PER_TURN } from "./schedule";
+import { leaderAt } from "./schedule";
 import type { EpochInfo, SlotEntry, SlotLevel } from "./types";
 
 /** Set where the slot recorded a block. */
@@ -59,47 +59,6 @@ const LEVELS: SlotLevel[] = [
   "skipped",
 ];
 
-/** What a leader is called and looks like, as the live slots reported it. */
-export interface LeaderDisplay {
-  name: string | null;
-  icon: string | null;
-}
-
-/**
- * Who leads a slot, from the epoch's turn array.
- *
- * The array holds one index per run of consecutive slots, so this is two
- * lookups and no search. Null outside the epoch the arrays describe, and null
- * where the validator could not derive the schedule, which it sends as an empty
- * array rather than as a wrong one.
- */
-export function leaderAt(epoch: EpochInfo | undefined, slot: number): string | null {
-  if (!epoch || epoch.turns.length === 0) return null;
-  if (slot < epoch.start_slot || slot > epoch.end_slot) return null;
-  const turn = Math.floor((slot - epoch.start_slot) / SLOTS_PER_TURN);
-  const index = epoch.turns[turn];
-  if (index === undefined) return null;
-  return epoch.leaders[index] ?? null;
-}
-
-/**
- * Names and icons for the leaders the live window has already reported.
- *
- * The epoch arrays carry keys and nothing else, on purpose: names and icons are
- * the largest strings a slot used to repeat, and sending them per epoch would
- * put them straight back. So a fetched turn is named from whatever the live
- * slots have taught the page, and falls back to its key where they have not.
- */
-export function leaderDisplays(held: SlotEntry[]): Map<string, LeaderDisplay> {
-  const displays = new Map<string, LeaderDisplay>();
-  for (const entry of held) {
-    if (entry.leader === null || displays.has(entry.leader)) continue;
-    if (entry.leader_name === null && entry.leader_icon === null) continue;
-    displays.set(entry.leader, { name: entry.leader_name, icon: entry.leader_icon });
-  }
-  return displays;
-}
-
 /**
  * A fetched span as slot entries, oldest first.
  *
@@ -110,7 +69,6 @@ export function leaderDisplays(held: SlotEntry[]): Map<string, LeaderDisplay> {
 export function entriesOf(
   range: SlotRange,
   epoch: EpochInfo | undefined,
-  displays: Map<string, LeaderDisplay>,
   identity: string | undefined,
 ): SlotEntry[] {
   const entries: SlotEntry[] = [];
@@ -123,16 +81,15 @@ export function entriesOf(
     if (row === null) return;
     const slot = range.first_slot + index;
     const [level, flags, votes, nonVotes, compute, fees, timeMillis] = row;
+    // Only to decide whether the slot was ours. Who the leader is, and what
+    // they are called, the page resolves for itself through `store.leaderOf`,
+    // the same way it does for a live slot.
     const leader = leaderAt(epoch, slot);
-    const display = leader === null ? undefined : displays.get(leader);
     const timed = (flags & HAS_CLOCK) !== 0;
 
     entries.push({
       slot,
       level: LEVELS[level] ?? "incomplete",
-      leader,
-      leader_name: display?.name ?? null,
-      leader_icon: display?.icon ?? null,
       mine: leader !== null && leader === identity,
       block:
         (flags & HAS_BLOCK) === 0
