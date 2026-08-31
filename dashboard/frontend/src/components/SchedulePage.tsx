@@ -52,6 +52,19 @@ const OLDER_SPAN = 512;
  */
 const MAX_TURNS = 1000;
 
+/**
+ * Slots reached back through when somebody searches.
+ *
+ * The whole of what the validator retains. Fetching it is thirteen requests and
+ * about four megabytes, and holding it is some twenty-seven, which is what a
+ * search costs to be worth running: matching only what the list has loaded
+ * would answer for the last few minutes and call it the answer.
+ */
+const DEPTH_SLOTS = 100_000;
+
+/** Slots per request, the most the validator will answer at once. */
+const DEPTH_SPAN = 8192;
+
 export function SchedulePage() {
   const store = useStore();
   const [query, setQuery] = useState("");
@@ -77,14 +90,70 @@ export function SchedulePage() {
   // most searches are; a name search before it lands finds the leaders of the
   // live window and no more.
   const searching = query.trim().length > 0;
-  useEffect(() => {
-    if (searching) void store.loadDisplays().catch(() => {});
-  }, [searching, store]);
+
+  // Everything the validator still holds, fetched once, the first time somebody
+  // searches. Kept apart from the list's own slots on purpose: `turnsOf` over a
+  // hundred thousand entries is thirty milliseconds, and folded into the list
+  // it would run again on every slot that arrives. Here it is built once, when
+  // the fetch lands, and the live list stays cheap.
+  const [deep, setDeep] = useState<SlotEntry[] | null>(null);
+  const [deepLoading, setDeepLoading] = useState(false);
+  // Whether the cluster's names have arrived. A memo below is keyed on it
+  // because the store is one object for the life of the page: a re-render does
+  // not re-run a memo whose dependencies are unchanged, so without something
+  // that moves when the names do, the turns built before they landed would keep
+  // their bare keys for as long as the page was open.
+  const [named, setNamed] = useState(false);
 
   const [older, setOlder] = useState<SlotEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [exhausted, setExhausted] = useState(false);
   const slots = useMemo(() => [...older, ...live], [older, live]);
+
+  const loadDepth = async () => {
+    if (deep !== null || deepLoading) return;
+    const newest = live[live.length - 1]?.slot;
+    if (newest === undefined) return;
+    setDeepLoading(true);
+    try {
+      const spans: SlotEntry[][] = [];
+      const floor = Math.max(0, newest - DEPTH_SLOTS);
+      let end = newest;
+      while (end > floor) {
+        const first = Math.max(floor, end - DEPTH_SPAN);
+        const range = await store.request<SlotRange>("slot", "range", {
+          first_slot: first,
+          count: end - first,
+        });
+        const got = entriesOf(range, epoch, identity);
+        // A span with nothing in it is older than the validator has kept, and
+        // everything below it is too. On a node that started an hour ago this
+        // is what stops the walk after the second request rather than the
+        // thirteenth.
+        if (got.length === 0) break;
+        spans.unshift(got);
+        end = first;
+      }
+      setDeep(spans.flat());
+    } catch {
+      // Left unset, so the next search tries again rather than searching a
+      // window it cannot see the end of and calling that the answer.
+    } finally {
+      setDeepLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!searching) return;
+    void store
+      .loadDisplays()
+      .then(() => setNamed(true))
+      .catch(() => {});
+    void loadDepth();
+    // Deliberately only the flag: this runs on the first keystroke and not on
+    // every one after it, and `loadDepth` guards itself besides.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searching]);
 
   const loadOlder = async () => {
     if (loading) return;
@@ -117,16 +186,37 @@ export function SchedulePage() {
     [peers],
   );
 
-  const matched = useMemo(
-    () =>
-      turnsOf(slots, (slot, mine) => store.leaderOf(slot, mine)).filter(
-        (turn) => matchesQuery(turn, query) && (!oursOnly || turn.mine),
-      ),
-    // `store` is stable and its revision is what re-runs this; `leaderOf`
-    // answers from the epoch and peer table, both of which arrive as published
-    // values and so bump that revision when they change.
-    [store, slots, query, oursOnly],
+  // Built once when the depth lands, rather than with the list. Its own slots
+  // do not change as the chain moves, so this survives every arrival that
+  // rebuilds the list below it.
+  const deepTurns = useMemo(
+    () => (deep === null ? [] : turnsOf(deep, (slot, mine) => store.leaderOf(slot, mine))),
+    // Everything a leader is resolved from: the epoch's arrays, which arrive as
+    // one object and are replaced when the epoch turns, and the names, which
+    // arrive once. The peer table is left out on purpose. It is rebuilt every
+    // few seconds and rebuilding a hundred thousand entries with it would cost
+    // more than the handful of deep turns it could newly name.
+    [deep, store, epoch, named],
   );
+
+  const matched = useMemo(() => {
+    const wanted = (turn: Turn) => matchesQuery(turn, query) && (!oursOnly || turn.mine);
+    const near = turnsOf(slots, (slot, mine) => store.leaderOf(slot, mine)).filter(wanted);
+    if (!searching || deep === null) return near;
+
+    // The list's own turns first, then everything older that matches and is not
+    // already among them. The two overlap: the depth reaches up to the live
+    // window, and the list has usually loaded some way into it.
+    const seen = new Set(near.map(turnKey));
+    const far = deepTurns.filter((turn) => !seen.has(turnKey(turn)) && wanted(turn));
+    return [...near, ...far].sort(
+      (a, b) => (b.slots[0]?.slot ?? 0) - (a.slots[0]?.slot ?? 0),
+    );
+    // `slots` is a fresh array on every render, the store building it from its
+    // own map each time, so this recomputes whenever the page does and picks up
+    // a new peer table without being told. That is affordable here and only
+    // here: this side is bounded by the cap, and the deep side above is not.
+  }, [store, slots, deep, deepTurns, searching, query, oursOnly]);
 
   // Newest first, so the cap keeps the newest and drops the tail. A search that
   // matches more than the page will draw says so rather than quietly showing
@@ -173,6 +263,11 @@ export function SchedulePage() {
             totalStake={stake?.total_stake}
           />
         ))}
+        {deepLoading && (
+          <div className="schedule-capped">
+            reading back through what the validator has kept…
+          </div>
+        )}
         {beyondCap > 0 && (
           <div className="schedule-capped">
             {count(turns.length)} of {count(matched.length)} matching turns shown.
@@ -189,7 +284,7 @@ export function SchedulePage() {
             {loading ? "loading…" : "load earlier turns"}
           </button>
         )}
-        {atCeiling && beyondCap === 0 && (
+        {atCeiling && beyondCap === 0 && !searching && (
           <div className="schedule-capped">
             As far back as this list goes. The validator keeps a great deal more;
             search a name, a key or a slot number to reach it.
