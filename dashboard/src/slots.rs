@@ -415,31 +415,35 @@ mod tests {
         // The 512 mirrors `SLOT_OVERVIEW_LEN` in `collect`, which this module
         // cannot see.
         let long = "x".repeat(300);
-        let worst: Vec<SlotEntry> = (0..512.max(OWN_SLOTS_KEPT) as u64)
-            .map(|index| SlotEntry {
-                slot: 428_804_675 + index,
-                level: SlotLevel::OptimisticallyConfirmed,
-                leader: Some("J7v9KQ8s3XjLpQmR4tVnW2yZ6bC1dE5fG8hJ3kL7mN9p".to_string()),
-                leader_name: Some(long.clone()),
-                leader_icon: Some(long.clone()),
-                mine: true,
-                block: Some(BlockDetail {
-                    transactions: u64::MAX,
-                    non_vote_transactions: u64::MAX,
-                    failed_transactions: u64::MAX,
-                    entries: u64::MAX,
-                    block_cost: u64::MAX,
-                    block_cost_limit: u64::MAX,
-                    account_cost_limit: u64::MAX,
-                    total_fees: u64::MAX,
-                    priority_fees: u64::MAX,
-                }),
-                duration_nanos: Some(u64::MAX),
-            })
-            .collect();
+        // Built per message rather than sliced from one vector: `encode` takes
+        // a sized value, and a slice of entries is not one.
+        let worst = |count: usize| -> Vec<SlotEntry> {
+            (0..count as u64)
+                .map(|index| SlotEntry {
+                    slot: 428_804_675 + index,
+                    level: SlotLevel::OptimisticallyConfirmed,
+                    leader: Some("J7v9KQ8s3XjLpQmR4tVnW2yZ6bC1dE5fG8hJ3kL7mN9p".to_string()),
+                    leader_name: Some(long.clone()),
+                    leader_icon: Some(long.clone()),
+                    mine: true,
+                    block: Some(BlockDetail {
+                        transactions: u64::MAX,
+                        non_vote_transactions: u64::MAX,
+                        failed_transactions: u64::MAX,
+                        entries: u64::MAX,
+                        block_cost: u64::MAX,
+                        block_cost_limit: u64::MAX,
+                        account_cost_limit: u64::MAX,
+                        total_fees: u64::MAX,
+                        priority_fees: u64::MAX,
+                    }),
+                    duration_nanos: Some(u64::MAX),
+                })
+                .collect()
+        };
 
         for (key, count) in [("overview", 512), ("own", OWN_SLOTS_KEPT)] {
-            let encoded = crate::proto::encode("slot", key, &worst[..count]);
+            let encoded = crate::proto::encode("slot", key, &worst(count));
             assert!(
                 encoded.len() < crate::proto::MAX_MESSAGE,
                 "worst-case {key} is {} bytes against a {} byte ceiling",
