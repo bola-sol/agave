@@ -102,6 +102,53 @@ describe("slots", () => {
     expect(ours.map((entry) => entry.slot)).toEqual([1, 2, 3, 4]);
   });
 
+  it("answers a request with the reply carrying its id", async () => {
+    const store = new Store();
+    const sent: string[] = [];
+    store.setSender((frame) => sent.push(frame));
+    store.setConnection("open");
+
+    const reply = store.request<{ rows: number[] }>("slot", "range", { first_slot: 4 });
+    const frame = JSON.parse(sent[0]) as { id: number; topic: string; params: unknown };
+    expect(frame.topic).toBe("slot");
+    expect(frame.params).toEqual({ first_slot: 4 });
+
+    store.apply({ topic: "slot", key: "range", id: frame.id, value: { rows: [1, 2] } });
+    expect(await reply).toEqual({ rows: [1, 2] });
+  });
+
+  it("does not fold a reply into the state it happens to be named after", () => {
+    // The envelope of a reply and of a push differ only by the id, so without
+    // that check a queried range would overwrite the live slot map.
+    const store = new Store();
+    store.setSender(() => {});
+    store.setConnection("open");
+    store.apply(envelope("slot", "overview", [slot(900)]));
+
+    store.apply({ topic: "slot", key: "update", id: 77, value: slot(1) });
+    expect(store.getSlots().map((entry) => entry.slot)).toEqual([900]);
+  });
+
+  it("fails the requests in flight when the connection goes", async () => {
+    // Both paths that give up on a socket set the connection state, so this is
+    // the one place that has to notice. Left pending, a caller shows a loading
+    // state that never resolves.
+    const store = new Store();
+    store.setSender(() => {});
+    store.setConnection("open");
+
+    const reply = store.request("slot", "range", {});
+    store.setConnection("closed");
+    await expect(reply).rejects.toThrow("connection lost");
+  });
+
+  it("refuses a request made with no connection rather than queueing it", async () => {
+    // Answered after the next reconnect, it would arrive against a page that
+    // has moved on.
+    const store = new Store();
+    await expect(store.request("slot", "range", {})).rejects.toThrow("not connected");
+  });
+
   it("keeps the own-slot snapshot that arrives after the overview", () => {
     // The connect snapshot is two messages. The first clears and fills the
     // recent window; the second carries our own leader slots from before it

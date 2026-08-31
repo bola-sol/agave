@@ -11,7 +11,17 @@
 //! the depth is being retained before the query that serves it is built, since
 //! a history only starts being useful once it has had time to fill.
 
-use {crate::slots::SlotEntry, solana_clock::Slot};
+use {crate::slots::SlotEntry, serde::Serialize, solana_clock::Slot};
+
+/// Slots kept in the packed history.
+///
+/// A hundred thousand of them, about eleven hours at four hundred milliseconds
+/// a slot, for under four megabytes. The same span as whole slot entries would
+/// be some twenty-seven, and no client could be sent that in any case.
+///
+/// Allocated by the service rather than by the collector, because the server
+/// answers range queries out of it and starts before the collector exists.
+pub const PACKED_SLOTS: usize = 100_000;
 
 /// One slot, packed to the columns a schedule row draws.
 ///
@@ -51,6 +61,38 @@ pub struct PackedSlot {
     pub time_millis: u64,
 }
 
+/// Most slots one range may carry.
+///
+/// The reply shares the frame ceiling with everything else the server sends,
+/// and a row is about forty-four bytes of JSON, so the ceiling alone would
+/// allow some twenty-three thousand. This is well inside that and still fifty
+/// times a screenful, which is the figure that matters: the page asks for what
+/// it is about to draw, not for everything it might one day scroll to.
+pub const MAX_RANGE_SLOTS: usize = 8192;
+
+/// One slot as it goes on the wire.
+///
+/// Positional rather than an object because the field names would outweigh the
+/// figures several times over across a span of these. Order: level, flags,
+/// votes, non-votes, compute, fees, time. The frontend mirrors it, so the two
+/// only agree by being changed together.
+pub type WireRow = (u8, u8, u32, u32, u32, u64, u64);
+
+/// A span of the history, as it goes on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SlotRange {
+    /// The slot `rows[0]` describes. Every row after it is one slot on, so the
+    /// slot numbers themselves are never sent.
+    pub first_slot: Slot,
+    /// One entry per slot, `null` for a slot the history does not hold.
+    ///
+    /// Null covers three cases the reader cannot tell apart and does not need
+    /// to: a slot older than the history reaches, one newer than anything
+    /// recorded, and one that was never seen. All three are drawn the same way,
+    /// as a row with no figures.
+    pub rows: Vec<Option<WireRow>>,
+}
+
 /// Set where the slot recorded a block, as against one that has not frozen or
 /// was skipped.
 pub const HAS_BLOCK: u8 = 1;
@@ -84,6 +126,32 @@ impl SlotHistory {
     pub fn get(&self, slot: Slot) -> Option<&PackedSlot> {
         let (held, row) = self.rows.get(self.index(slot))?;
         (*held == slot && slot != 0).then_some(row)
+    }
+
+    /// A span of slots, oldest first, for sending to a client.
+    ///
+    /// `count` is clamped rather than refused. A caller asking for more than
+    /// the ceiling gets what fits, and knows it did because the rows it is
+    /// given are positional and it can count them; refusing would make a client
+    /// that guessed slightly wrong get nothing at all.
+    pub fn range(&self, first_slot: Slot, count: usize) -> SlotRange {
+        let count = count.min(MAX_RANGE_SLOTS);
+        let rows = (0..count as u64)
+            .map(|offset| {
+                self.get(first_slot.saturating_add(offset)).map(|row| {
+                    (
+                        row.level,
+                        row.flags,
+                        row.votes,
+                        row.non_votes,
+                        row.compute,
+                        row.fees,
+                        row.time_millis,
+                    )
+                })
+            })
+            .collect();
+        SlotRange { first_slot, rows }
     }
 
     /// What one slot contained, from the entry the collector already keeps.
@@ -245,6 +313,63 @@ mod tests {
         assert_eq!(row.flags, 0);
         assert_eq!(row.non_votes, 0);
         assert_eq!(row.time_millis, 0);
+    }
+
+    #[test]
+    fn test_a_range_is_positional_and_holds_a_gap_open() {
+        // The slot numbers are never sent, so a slot the history has not got
+        // has to take up its place in the list rather than be left out. Dropped
+        // instead, every row after it would describe the wrong slot.
+        let mut history = SlotHistory::new(64);
+        history.record(&with_block(10, 10, 4));
+        history.record(&with_block(12, 20, 9));
+
+        let range = history.range(10, 3);
+        assert_eq!(range.first_slot, 10);
+        assert_eq!(range.rows.len(), 3);
+        assert!(range.rows[0].is_some());
+        assert!(range.rows[1].is_none(), "slot 11 was never recorded");
+        assert_eq!(range.rows[2].expect("slot 12").3, 9);
+    }
+
+    #[test]
+    fn test_a_range_past_the_ceiling_is_clamped_rather_than_refused() {
+        // A client that guesses slightly wrong gets what fits. Refusing would
+        // give it nothing at all, and it can see how much it got: the rows are
+        // positional and it can count them.
+        let history = SlotHistory::new(64);
+        let range = history.range(10, MAX_RANGE_SLOTS.saturating_add(1_000));
+        assert_eq!(range.rows.len(), MAX_RANGE_SLOTS);
+    }
+
+    #[test]
+    fn test_a_range_off_the_end_of_the_history_is_all_holes() {
+        // Not an error. Scrolling past what has been retained is ordinary, and
+        // the page draws rows with no figures for it.
+        let history = SlotHistory::new(64);
+        let range = history.range(900, 4);
+        assert_eq!(range.rows.len(), 4);
+        assert!(range.rows.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn test_a_range_carries_the_columns_in_the_order_the_frontend_reads_them() {
+        // The one place the wire order is pinned. It is positional, so the two
+        // sides only agree by being changed together, and a silent reordering
+        // would put fees in the compute column.
+        let mut history = SlotHistory::new(64);
+        history.record(&with_block(10, 9_500, 8_752));
+        history.record_time(10, 1_756_000_000_123);
+
+        let (level, flags, votes, non_votes, compute, fees, time) =
+            history.range(10, 1).rows[0].expect("recorded");
+        assert_eq!(level, SlotLevel::Rooted as u8);
+        assert_eq!(flags, HAS_BLOCK | HAS_CLOCK);
+        assert_eq!(votes, 748);
+        assert_eq!(non_votes, 8_752);
+        assert_eq!(compute, 41_827_311);
+        assert_eq!(fees, 104_600_000);
+        assert_eq!(time, 1_756_000_000_123);
     }
 
     #[test]

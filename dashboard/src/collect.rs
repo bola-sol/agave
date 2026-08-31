@@ -51,14 +51,6 @@ const SLOT_OVERVIEW_LEN: usize = 512;
 /// arriving late can still be matched against.
 const SLOT_HISTORY: usize = 4096;
 
-/// Slots kept in the packed history, which is a different thing from the ring
-/// above and much cheaper per slot.
-///
-/// A hundred thousand of them, about eleven hours at four hundred milliseconds
-/// a slot, for four megabytes. The same span as whole entries would be some
-/// twenty-seven, and no client could be sent that in any case.
-const PACKED_SLOTS: usize = 100_000;
-
 /// Distinct client versions reported before the tail is folded into one row.
 const MAX_VERSIONS_REPORTED: usize = 5;
 
@@ -327,10 +319,12 @@ pub struct Collector {
     /// Detail for blocks this validator produced, captured as they froze.
     produced: ProducedRing,
     /// The same slots as the ring above, packed to the columns a schedule row
-    /// draws and kept far deeper. Written and not yet read: the query that
-    /// serves it comes next, and a history is only worth serving once it has
-    /// had the time to fill.
-    history: SlotHistory,
+    /// draws and kept far deeper.
+    ///
+    /// Shared with the server, which answers range queries out of it. Written
+    /// here on every slot change and read there on demand, so a read lock is
+    /// held for the length of one range and a write for the length of one row.
+    history: Arc<RwLock<SlotHistory>>,
     /// The epoch, and whether its schedule was known, the last time the epoch
     /// message was built.
     ///
@@ -392,6 +386,7 @@ impl Collector {
         ctx: DashboardContext,
         publisher: Arc<Publisher>,
         info_cache: Arc<RwLock<ValidatorInfoCache>>,
+        history: Arc<RwLock<SlotHistory>>,
         startup_progress: StartupProgressFn,
     ) -> Self {
         let now = Instant::now();
@@ -407,7 +402,7 @@ impl Collector {
             info_scanned_to: 0,
             first_observed_slot: None,
             produced: ProducedRing::new(PRODUCED_BLOCKS),
-            history: SlotHistory::new(PACKED_SLOTS),
+            history,
             skip_leader_slots: Vec::new(),
             epoch_published: None,
             skip_epoch: None,
@@ -661,7 +656,7 @@ impl Collector {
             // It is the slot's own wall clock, and the packed history is what
             // keeps it; the entries above carry only the difference between one
             // slot and the last.
-            self.history.record_time(slot, arrived);
+            self.history.write().unwrap().record_time(slot, arrived);
             self.last_shred_time = Some((slot, arrived));
             self.slot_time_window.push_back((slot, arrived));
             // Skipped slots carry no timestamp and so never enter the window.
@@ -1024,7 +1019,7 @@ impl Collector {
     /// no moment at which an entry is finished and no other single point every
     /// change already passes through.
     fn publish_slot(&mut self, entry: &SlotEntry) {
-        self.history.record(entry);
+        self.history.write().unwrap().record(entry);
         self.publisher
             .publish_ephemeral(TOPIC_SLOT, "update", entry);
     }

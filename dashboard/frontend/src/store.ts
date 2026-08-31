@@ -32,6 +32,18 @@ const MAX_TPS_SAMPLES = 300;
 
 export type ConnectionState = "connecting" | "open" | "closed";
 
+/**
+ * A request sent to the validator and not yet answered.
+ *
+ * The server answers everything it can parse as a request, including keys it
+ * does not recognise, so an entry that is never settled means the connection
+ * went away rather than the request being ignored.
+ */
+interface Pending {
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+}
+
 export class Store {
   /** Latest value for each `topic.key`, exactly as published. */
   private values = new Map<string, unknown>();
@@ -39,6 +51,9 @@ export class Store {
   private tps: TpsSample[] = [];
   private network: NetworkSample[] = [];
   private connection: ConnectionState = "connecting";
+  private sender: ((frame: string) => void) | null = null;
+  private pending = new Map<number, Pending>();
+  private nextRequestId = 1;
 
   private listeners = new Set<() => void>();
   private frame: number | null = null;
@@ -79,7 +94,53 @@ export class Store {
 
   setConnection(state: ConnectionState): void {
     this.connection = state;
+    if (state !== "open") {
+      // A reply can only come back on the socket that carried the request, so
+      // losing one ends every request in flight. Left pending they would be
+      // promises that never settle, and a caller waiting on one shows a
+      // loading state that never resolves.
+      this.sender = null;
+      const inflight = [...this.pending.values()];
+      this.pending.clear();
+      for (const pending of inflight) pending.reject(new Error("connection lost"));
+    }
     this.touch();
+  }
+
+  /**
+   * How to write to the current socket, installed by `connect` when one opens.
+   *
+   * Held rather than reached for, because the store is what callers have and
+   * the socket is replaced on every reconnect.
+   */
+  setSender(sender: (frame: string) => void): void {
+    this.sender = sender;
+  }
+
+  /**
+   * Asks the validator for something, rather than waiting for it to be pushed.
+   *
+   * For data too large to send to every client on connect and too rarely read
+   * to send at all: a span of slot history is the first of it. Rejects rather
+   * than queues when there is no connection, since a request made now and
+   * answered after the next reconnect would arrive against a page that has
+   * moved on.
+   */
+  request<T>(topic: string, key: string, params: unknown): Promise<T> {
+    const sender = this.sender;
+    if (sender === null) return Promise.reject(new Error("not connected"));
+
+    const id = this.nextRequestId;
+    this.nextRequestId += 1;
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject });
+      try {
+        sender(JSON.stringify({ topic, key, id, params }));
+      } catch (error) {
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
   }
 
   /** Slots in ascending order. */
@@ -102,8 +163,17 @@ export class Store {
   apply(envelope: Envelope): void {
     const { topic, key, value } = envelope;
 
-    // Replies to our own requests carry an id and are not state.
-    if (envelope.id !== undefined) return;
+    // Replies to our own requests carry an id and are not state. An id we are
+    // not waiting on is dropped: a reply that outlived its caller is the
+    // ordinary result of a reconnect, not something to act on.
+    if (envelope.id !== undefined) {
+      const pending = this.pending.get(envelope.id);
+      if (pending) {
+        this.pending.delete(envelope.id);
+        pending.resolve(value);
+      }
+      return;
+    }
 
     if (topic === "slot" && key === "overview") {
       this.slots.clear();
