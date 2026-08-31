@@ -8,7 +8,15 @@
  */
 
 import { leaderAt, NO_LEADER, type LeaderRef } from "./schedule";
-import type { EpochInfo, Envelope, NetworkSample, Peer, SlotEntry, TpsSample } from "./types";
+import type {
+  Displays,
+  EpochInfo,
+  Envelope,
+  NetworkSample,
+  Peer,
+  SlotEntry,
+  TpsSample,
+} from "./types";
 
 /** Slots kept for the strip and sidebar. Matches the server's overview length. */
 const MAX_SLOTS = 512;
@@ -70,6 +78,15 @@ export class Store {
   /** Us, rebuilt only when one of the three values it is made of changes. */
   private ours: LeaderRef = NO_LEADER;
   private oursFrom = "";
+  /**
+   * Names and icons for the whole cluster, once something has asked for them.
+   *
+   * The peer table only reaches the leaders of the window a client holds, so a
+   * turn from further back has a key and nothing else until this arrives.
+   * Empty until `loadDisplays` is called, which the schedule page does the
+   * first time somebody searches.
+   */
+  private displays = new Map<string, { name: string | null; icon: string | null }>();
 
   private listeners = new Set<() => void>();
   private frame: number | null = null;
@@ -184,11 +201,35 @@ export class Store {
     if (cached) return cached;
 
     const key = leaderAt(this.values.get("epoch.new") as EpochInfo | undefined, slot);
-    const peer = key === null ? undefined : this.peersByIdentity().get(key);
+    // The peer table first, being the fresher of the two: it is rebuilt every
+    // few seconds where the display table is fetched once. Both hold the same
+    // answer for a leader they both know.
+    const shown = key === null ? undefined : (this.peersByIdentity().get(key) ?? this.displays.get(key));
     const leader: LeaderRef =
-      key === null ? NO_LEADER : { key, name: peer?.name ?? null, icon: peer?.icon ?? null };
+      key === null ? NO_LEADER : { key, name: shown?.name ?? null, icon: shown?.icon ?? null };
     this.leaderCache.set(slot, leader);
     return leader;
+  }
+
+  /**
+   * Fetches the cluster's names and icons, once.
+   *
+   * Called when something needs a name for a leader the peer table does not
+   * reach, which in practice means a search that has gone into history. Later
+   * calls are free: the table does not change often enough to be worth asking
+   * twice in a session, and a stale name is a great deal better than none.
+   */
+  async loadDisplays(): Promise<void> {
+    if (this.displays.size > 0) return;
+    const table = await this.request<Displays>("summary", "displays", {});
+    const next = new Map<string, { name: string | null; icon: string | null }>();
+    table.keys.forEach((key, index) => {
+      next.set(key, { name: table.names[index] ?? null, icon: table.icons[index] ?? null });
+    });
+    this.displays = next;
+    // Every answer already given was given without these.
+    this.leaderCache.clear();
+    this.touch();
   }
 
   /**

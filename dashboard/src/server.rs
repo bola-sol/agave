@@ -10,6 +10,7 @@ use {
     crate::{
         history::SlotHistory,
         proto::{MAX_MESSAGE, Message, Publisher, Request, encode_with_id},
+        validator_info::ValidatorInfoCache,
     },
     soketto::handshake::{Server, server},
     solana_clock::Slot,
@@ -125,6 +126,7 @@ pub async fn serve(
     listener: TcpListener,
     publisher: Arc<Publisher>,
     history: Arc<RwLock<SlotHistory>>,
+    info: Arc<RwLock<ValidatorInfoCache>>,
     allowed_hosts: Arc<[String]>,
 ) {
     let limits = Limits::new();
@@ -138,10 +140,12 @@ pub async fn serve(
         };
         let publisher = publisher.clone();
         let history = history.clone();
+        let info = info.clone();
         let limits = limits.clone();
         let allowed_hosts = allowed_hosts.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle(socket, publisher, history, limits, &allowed_hosts).await {
+            if let Err(err) = handle(socket, publisher, history, info, limits, &allowed_hosts).await
+            {
                 log::debug!("dashboard: connection from {peer} ended: {err}");
             }
         });
@@ -152,6 +156,7 @@ async fn handle(
     mut socket: TcpStream,
     publisher: Arc<Publisher>,
     history: Arc<RwLock<SlotHistory>>,
+    info: Arc<RwLock<ValidatorInfoCache>>,
     limits: Limits,
     allowed_hosts: &[String],
 ) -> Result<(), ConnectionError> {
@@ -198,7 +203,7 @@ async fn handle(
             return refuse(socket, head_len, 503, b"too many dashboard clients").await;
         };
         let path = request_path(&head).to_string();
-        serve_websocket(socket, publisher, history, &path).await
+        serve_websocket(socket, publisher, history, info, &path).await
     } else {
         // Consume the bytes that were only peeked at. Closing a socket that
         // still has unread data makes the kernel send RST rather than FIN,
@@ -478,6 +483,7 @@ async fn serve_websocket(
     socket: TcpStream,
     publisher: Arc<Publisher>,
     history: Arc<RwLock<SlotHistory>>,
+    info: Arc<RwLock<ValidatorInfoCache>>,
     path: &str,
 ) -> Result<(), ConnectionError> {
     let mut server = Server::new(socket.compat());
@@ -588,7 +594,7 @@ async fn serve_websocket(
         if incoming.len() > MAX_CLIENT_MESSAGE {
             return Err(ConnectionError::Oversized(incoming.len()));
         }
-        if let Some(reply) = respond(&incoming, &history) {
+        if let Some(reply) = respond(&incoming, &history, &info) {
             send_or_timeout!(sender.send_text(&*reply));
             send_or_timeout!(sender.flush());
         }
@@ -632,11 +638,32 @@ struct SlotRangeParams {
 
 /// Handles a client request. Even unknown requests get an answer, so a client
 /// is never left waiting on an id that will never come back.
-fn respond(payload: &[u8], history: &RwLock<SlotHistory>) -> Option<Message> {
+fn respond(
+    payload: &[u8],
+    history: &RwLock<SlotHistory>,
+    info: &RwLock<ValidatorInfoCache>,
+) -> Option<Message> {
     let request: Request = serde_json::from_slice(payload).ok()?;
     let id = request.id;
     match (request.topic.as_str(), request.key.as_str()) {
         ("summary", "ping") => Some(encode_with_id("summary", "ping", id, &())),
+        ("summary", "displays") => {
+            // Asked for rather than published. It is a hundred and fifty
+            // kilobytes on a cluster this size, which is more than every other
+            // retained message together, and most of a session never needs it:
+            // a name is only wanted for a leader outside the window the peer
+            // table covers, which is a page that has searched into history.
+            //
+            // The whole table rather than the leaders of one epoch. Nothing
+            // here knows which epoch is being asked about, the cache is keyed
+            // by identity and not by schedule, and a validator's name does not
+            // change with the epoch anyway.
+            let displays = match info.read() {
+                Ok(info) => info.displays(),
+                Err(_) => return Some(encode_with_id("summary", "displays", id, &())),
+            };
+            Some(encode_with_id("summary", "displays", id, &displays))
+        }
         ("slot", "range") => {
             // Malformed parameters are answered rather than dropped, for the
             // same reason an unknown request is: a client left waiting on an id
@@ -691,12 +718,66 @@ mod tests {
         Arc::new(empty())
     }
 
+    /// A cache nothing has been scanned into, which is what every test here
+    /// wants: none of them is about the names, and an empty one still answers.
+    fn no_info() -> RwLock<ValidatorInfoCache> {
+        RwLock::new(ValidatorInfoCache::default())
+    }
+
+    fn no_info_shared() -> Arc<RwLock<ValidatorInfoCache>> {
+        Arc::new(no_info())
+    }
+
+    #[test]
+    fn test_the_display_table_carries_what_a_validator_calls_itself() {
+        use crate::validator_info::ValidatorInfo;
+        let info = RwLock::new(ValidatorInfoCache::default());
+        info.write().unwrap().insert(
+            solana_pubkey::Pubkey::new_from_array([7; 32]),
+            ValidatorInfo {
+                name: Some("Lantern".to_string()),
+                icon_url: Some("https://l/i.png".to_string()),
+            },
+        );
+
+        let reply = respond(
+            br#"{"topic":"summary","key":"displays","id":4}"#,
+            &empty(),
+            &info,
+        )
+        .unwrap();
+        assert!(reply.contains(r#""id":4"#), "{reply}");
+        assert!(reply.contains(r#""Lantern""#), "{reply}");
+        assert!(reply.contains(r#""https://l/i.png""#), "{reply}");
+    }
+
+    #[test]
+    fn test_a_validator_that_published_nothing_takes_no_room_in_the_table() {
+        // Most of a cluster publishes neither a name nor an icon. Carrying them
+        // as a key and two nulls each would be most of the table saying nothing.
+        use crate::validator_info::ValidatorInfo;
+        let info = RwLock::new(ValidatorInfoCache::default());
+        info.write().unwrap().insert(
+            solana_pubkey::Pubkey::new_from_array([9; 32]),
+            ValidatorInfo::default(),
+        );
+
+        let reply = respond(
+            br#"{"topic":"summary","key":"displays","id":5}"#,
+            &empty(),
+            &info,
+        )
+        .unwrap();
+        assert!(reply.contains(r#""keys":[]"#), "{reply}");
+    }
+
     #[test]
     fn test_a_range_request_is_answered_with_its_own_id() {
         let history = empty();
         let reply = respond(
             br#"{"topic":"slot","key":"range","id":9,"params":{"first_slot":4,"count":2}}"#,
             &history,
+            &no_info(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":9"#), "{reply}");
@@ -711,6 +792,7 @@ mod tests {
         let reply = respond(
             br#"{"topic":"slot","key":"range","id":3,"params":{"first_slot":"soon"}}"#,
             &empty(),
+            &no_info(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":3"#), "{reply}");
@@ -873,7 +955,15 @@ mod tests {
             let limits = limits.clone();
             async move {
                 let (socket, _) = listener.accept().await.unwrap();
-                handle(socket, publisher, empty_history(), limits, &allowed_hosts).await
+                handle(
+                    socket,
+                    publisher,
+                    empty_history(),
+                    no_info_shared(),
+                    limits,
+                    &allowed_hosts,
+                )
+                .await
             }
         });
 
@@ -894,7 +984,15 @@ mod tests {
         let limits = Limits::new();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            handle(socket, publisher, empty_history(), limits, &allowed_hosts).await
+            handle(
+                socket,
+                publisher,
+                empty_history(),
+                no_info_shared(),
+                limits,
+                &allowed_hosts,
+            )
+            .await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -976,7 +1074,15 @@ mod tests {
             let limits = limits.clone();
             async move {
                 let (socket, _) = listener.accept().await.unwrap();
-                handle(socket, publisher, empty_history(), limits, &allowed_hosts).await
+                handle(
+                    socket,
+                    publisher,
+                    empty_history(),
+                    no_info_shared(),
+                    limits,
+                    &allowed_hosts,
+                )
+                .await
             }
         });
 
@@ -1114,19 +1220,29 @@ mod tests {
 
     #[test]
     fn test_ping_is_answered_with_its_id() {
-        let reply = respond(br#"{"topic":"summary","key":"ping","id":7}"#, &empty()).unwrap();
+        let reply = respond(
+            br#"{"topic":"summary","key":"ping","id":7}"#,
+            &empty(),
+            &no_info(),
+        )
+        .unwrap();
         assert!(reply.contains(r#""id":7"#));
     }
 
     #[test]
     fn test_unknown_requests_still_get_a_reply() {
-        let reply = respond(br#"{"topic":"nope","key":"nope","id":1}"#, &empty()).unwrap();
+        let reply = respond(
+            br#"{"topic":"nope","key":"nope","id":1}"#,
+            &empty(),
+            &no_info(),
+        )
+        .unwrap();
         assert!(reply.contains("unsupported request"));
     }
 
     #[test]
     fn test_malformed_requests_are_ignored() {
-        assert!(respond(b"not json", &empty()).is_none());
+        assert!(respond(b"not json", &empty(), &no_info()).is_none());
     }
 
     #[test]
@@ -1223,6 +1339,7 @@ mod tests {
                 socket,
                 publisher,
                 empty_history(),
+                no_info_shared(),
                 Limits::new(),
                 &allowed_hosts,
             )

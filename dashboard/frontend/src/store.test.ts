@@ -99,6 +99,66 @@ describe("slots", () => {
     expect(ours.map((entry) => entry.slot)).toEqual([1, 2, 3, 4]);
   });
 
+  it("names a leader the peer table does not reach, once the table is fetched", async () => {
+    // The peer table covers the leaders of the held window. A turn from further
+    // back had a key and nothing else, which is what made a search by name find
+    // only the last few minutes of a history eleven hours deep.
+    const store = new Store();
+    const sent: string[] = [];
+    store.setSender((frame) => sent.push(frame));
+    store.setConnection("open");
+    store.apply(
+      envelope("epoch", "new", {
+        epoch: 1,
+        start_slot: 100,
+        end_slot: 115,
+        slots_in_epoch: 16,
+        my_leader_slots: [],
+        leaders: ["FARAWAY"],
+        turns: [0, 0, 0, 0],
+        block_cost_limit: 0,
+        account_cost_limit: 0,
+      }),
+    );
+    expect(store.leaderOf(104, false)).toEqual({ key: "FARAWAY", name: null, icon: null });
+
+    const loading = store.loadDisplays();
+    const id = (JSON.parse(sent[0]) as { id: number }).id;
+    store.apply({
+      topic: "summary",
+      key: "displays",
+      id,
+      value: { keys: ["FARAWAY"], names: ["Far Away Co"], icons: [null] },
+    });
+    await loading;
+
+    expect(store.leaderOf(104, false)).toEqual({
+      key: "FARAWAY",
+      name: "Far Away Co",
+      icon: null,
+    });
+  });
+
+  it("asks for the display table once and no more", async () => {
+    const store = new Store();
+    const sent: string[] = [];
+    store.setSender((frame) => sent.push(frame));
+    store.setConnection("open");
+
+    const loading = store.loadDisplays();
+    const id = (JSON.parse(sent[0]) as { id: number }).id;
+    store.apply({
+      topic: "summary",
+      key: "displays",
+      id,
+      value: { keys: ["A"], names: ["Alpha"], icons: [null] },
+    });
+    await loading;
+
+    await store.loadDisplays();
+    expect(sent).toHaveLength(1);
+  });
+
   it("names a slot of ours from what the validator says about itself", () => {
     // Not from the turn array or the peer table. Both have a reach and our own
     // slots are kept past both: five hundred of them is about eleven hours,

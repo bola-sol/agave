@@ -1,4 +1,4 @@
-import { memo, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { count, percent, shortKey, sol, solCompact } from "../format";
 import { matchesQuery, SLOTS_PER_TURN, turnKey, turnsOf, type Turn, type TurnSlot } from "../schedule";
 import { entriesOf, type SlotRange } from "../slotHistory";
@@ -69,6 +69,18 @@ export function SchedulePage() {
   // they are this page's working set, and putting a hundred thousand
   // reconstructed entries into the shared slot map is the thing this design
   // exists to avoid.
+  // The cluster's names and icons, fetched the first time somebody searches.
+  //
+  // Not on load: it is a hundred and fifty kilobytes and most visits never
+  // search. Not per query either, since the store only fetches it once. Until
+  // it arrives a search still matches on key and on slot number, which is what
+  // most searches are; a name search before it lands finds the leaders of the
+  // live window and no more.
+  const searching = query.trim().length > 0;
+  useEffect(() => {
+    if (searching) void store.loadDisplays().catch(() => {});
+  }, [searching, store]);
+
   const [older, setOlder] = useState<SlotEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [exhausted, setExhausted] = useState(false);

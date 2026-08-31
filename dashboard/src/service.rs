@@ -84,6 +84,9 @@ pub struct DashboardService {
     /// first: a request that arrives before the validator has finished booting
     /// gets an empty history rather than a connection that cannot answer.
     history: Arc<RwLock<SlotHistory>>,
+    /// Validator names and icons, shared with the server, which answers a
+    /// request for the whole table out of it.
+    info_cache: Arc<RwLock<ValidatorInfoCache>>,
     server: Option<JoinHandle<()>>,
     boot: Option<JoinHandle<()>>,
     collector: Option<JoinHandle<()>>,
@@ -111,6 +114,10 @@ impl DashboardService {
         // nothing and the hook stays empty.
         let metrics_tap = MetricsTap::install();
         let history = Arc::new(RwLock::new(SlotHistory::new(PACKED_SLOTS)));
+        // Here rather than with the collector for the same reason: the server
+        // answers a request out of it and starts first, so one arriving before
+        // the scan has run gets an empty table rather than no answer.
+        let info_cache = Arc::new(RwLock::new(ValidatorInfoCache::default()));
         let attached = Arc::new(AtomicBool::new(false));
 
         let runtime = Builder::new_multi_thread()
@@ -130,6 +137,7 @@ impl DashboardService {
         let server = {
             let publisher = publisher.clone();
             let history = history.clone();
+            let info_cache = info_cache.clone();
             let exit = exit.clone();
             let validator_exit = validator_exit.clone();
             thread::Builder::new()
@@ -137,7 +145,7 @@ impl DashboardService {
                 .spawn(move || {
                     runtime.block_on(async move {
                         tokio::select! {
-                            _ = server::serve(listener, publisher, history, allowed_hosts) => {}
+                            _ = server::serve(listener, publisher, history, info_cache, allowed_hosts) => {}
                             _ = wait_for_exit(exit, validator_exit) => {}
                         }
                     });
@@ -172,6 +180,7 @@ impl DashboardService {
             startup_progress,
             metrics_tap,
             history,
+            info_cache,
             server: Some(server),
             boot: Some(boot),
             collector: None,
@@ -190,7 +199,7 @@ impl DashboardService {
         context: DashboardContext,
         validator_exit: Arc<AtomicBool>,
     ) -> io::Result<()> {
-        let info_cache = Arc::new(RwLock::new(ValidatorInfoCache::default()));
+        let info_cache = self.info_cache.clone();
 
         // Validator names are read once here rather than on the collector's
         // timer. The read is a secondary index lookup returning a few thousand
