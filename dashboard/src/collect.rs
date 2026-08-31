@@ -67,9 +67,13 @@ const NEXT_LEADER_LOOKAHEAD: u64 = 20_000;
 /// wire than the seconds it describes are worth.
 const UPCOMING_SLOTS: u64 = 32;
 
-/// Produced blocks kept for the block detail panel. A validator leads about
-/// four slots in every eight hundred, so this is hours of them.
-const PRODUCED_BLOCKS: usize = 64;
+/// Produced blocks kept for the block detail panel.
+///
+/// A validator leads about four slots in every eight hundred, so five hundred
+/// of them span roughly a hundred thousand slots, or eleven hours. Matched to
+/// the own-slot retention in the slot ring: a slot the sidebar still lists and
+/// the detail panel cannot open would be a link to nothing.
+const PRODUCED_BLOCKS: usize = 500;
 
 /// Slots of arrival times kept, about five minutes of them.
 ///
@@ -965,7 +969,17 @@ impl Collector {
         self.publisher.retain_only(
             TOPIC_SLOT,
             "overview",
-            &self.slots.overview(SLOT_OVERVIEW_LEN),
+            &self.slots.recent(SLOT_OVERVIEW_LEN),
+        );
+        // Our own slots from before that window, as their own message. Two
+        // messages because one carrying both would pass the frame ceiling in
+        // the worst case; see `SlotRing::own_before_window`. The key matters:
+        // the retained map is a `BTreeMap`, so "overview" is sent before "own"
+        // and the client can clear on the first and merge on the second.
+        self.publisher.retain_only(
+            TOPIC_SLOT,
+            "own",
+            &self.slots.own_before_window(SLOT_OVERVIEW_LEN),
         );
     }
 

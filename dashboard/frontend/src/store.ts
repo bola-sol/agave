@@ -19,8 +19,13 @@ const MAX_SLOTS = 512;
  * slots of history usually contains none of its own. Kept separately, the
  * sidebar's own-slots view has something to show; pruned with everything else
  * it would be empty almost all the time.
+ *
+ * Five hundred of them, which at that share is about eleven hours of cluster
+ * history. Matches `OWN_SLOTS_KEPT` on the server, so a reload restores what
+ * was on screen rather than some other depth; the two are one figure split
+ * across the wire and only agree by being kept the same.
  */
-const MAX_OWN_SLOTS = 64;
+const MAX_OWN_SLOTS = 500;
 
 /** TPS samples kept for the chart. */
 const MAX_TPS_SAMPLES = 300;
@@ -102,6 +107,14 @@ export class Store {
 
     if (topic === "slot" && key === "overview") {
       this.slots.clear();
+      for (const entry of value as SlotEntry[]) this.slots.set(entry.slot, entry);
+      this.trimSlots();
+    } else if (topic === "slot" && key === "own") {
+      // Merged, not cleared. This is the second half of the connect snapshot:
+      // our own leader slots from before the recent window, sent separately
+      // because the two together pass the frame ceiling. The server's retained
+      // map is ordered by key, so "overview" always lands first and has done
+      // the clearing by the time this arrives.
       for (const entry of value as SlotEntry[]) this.slots.set(entry.slot, entry);
       this.trimSlots();
     } else if (topic === "slot" && key === "update") {

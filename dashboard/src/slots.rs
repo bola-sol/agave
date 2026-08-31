@@ -114,12 +114,19 @@ impl SlotEntry {
 /// still receives them; pruned with everything else, the sidebar's own-slots
 /// view would be empty on every reload.
 ///
+/// Five hundred of them, which at four slots in every eight hundred is about a
+/// hundred thousand slots of cluster history, or eleven hours. That is the
+/// depth an operator wants when they come back to a shift they were not
+/// watching, and it is what the figure is sized for rather than any property
+/// of the ring.
+///
 /// They occupy the ring's capacity rather than extending it, so the oldest
-/// ordinary slots make way for them. Expected to stay well under that capacity,
-/// which at sixty-four against four thousand it comfortably is. Matches the
+/// ordinary slots make way for them. Five hundred against four thousand leaves
+/// the ordinary window about twenty-four minutes deep, which is still far more
+/// than the five hundred and twelve slots a client is ever sent. Matches the
 /// browser's own retention, so a reload restores what was on screen rather than
 /// some other depth.
-const OWN_SLOTS_KEPT: usize = 64;
+const OWN_SLOTS_KEPT: usize = 500;
 
 /// A bounded, slot-keyed history. Slots more than `capacity` behind the highest
 /// one seen are dropped, except for this validator's own.
@@ -168,17 +175,24 @@ impl SlotRing {
     ///
     /// Without the second part a reload lost every leader slot on screen, since
     /// the recent window almost never contains one.
-    pub fn overview(&self, count: usize) -> Vec<SlotEntry> {
-        let recent = self.recent(count);
-        let floor = recent.first().map_or(Slot::MAX, |entry| entry.slot);
-        let mut overview: Vec<SlotEntry> = self
-            .entries
+    ///
+    /// The two parts go out as two messages rather than one. Five hundred of
+    /// our own slots and five hundred and twelve recent ones, each carrying a
+    /// name and an icon as long as a validator-info account can hold, put a
+    /// single message past the frame ceiling; split, neither half is close to
+    /// it. The client clears on the recent half and merges on this one, which
+    /// is safe because the retained map is keyed and ordered, and `overview`
+    /// sorts before `own`.
+    pub fn own_before_window(&self, count: usize) -> Vec<SlotEntry> {
+        // The same slot `recent` would start at, found without cloning the
+        // window to look at its first entry.
+        let skip = self.entries.len().saturating_sub(count);
+        let floor = self.entries.keys().nth(skip).copied().unwrap_or(Slot::MAX);
+        self.entries
             .values()
             .filter(|entry| entry.mine && entry.slot < floor)
             .cloned()
-            .collect();
-        overview.extend(recent);
-        overview
+            .collect()
     }
 
     /// Applies `update` to the entry for `slot`, creating it if needed, and
@@ -385,20 +399,23 @@ mod tests {
         );
     }
 
-    /// The slot overview is the largest message the server sends, and the
-    /// websocket ceiling is sized from it. If a field is added here, or the
-    /// overview grows, this is what notices before a client is cut off
+    /// The two slot snapshots are the largest messages the server sends, and
+    /// the websocket ceiling is sized from them. If a field is added here, or
+    /// either grows, this is what notices before a client is cut off
     /// mid-snapshot in production.
+    ///
+    /// Checked separately because they are sent separately. Added together
+    /// they are over the ceiling, which is why they were split, and asserting
+    /// on the sum would fail for a shape that ships perfectly well.
     #[test]
-    fn test_largest_overview_fits_the_message_ceiling() {
+    fn test_the_largest_slot_snapshots_fit_the_message_ceiling() {
         // Worst case throughout: a full ring, every slot with a leader, and a
         // name and icon as long as a validator-info account can carry.
         //
         // The 512 mirrors `SLOT_OVERVIEW_LEN` in `collect`, which this module
-        // cannot see. The overview carries our own slots ahead of that window,
-        // so the largest it can be is the two added together.
+        // cannot see.
         let long = "x".repeat(300);
-        let entries: Vec<SlotEntry> = (0..512 + OWN_SLOTS_KEPT as u64)
+        let worst: Vec<SlotEntry> = (0..512.max(OWN_SLOTS_KEPT) as u64)
             .map(|index| SlotEntry {
                 slot: 428_804_675 + index,
                 level: SlotLevel::OptimisticallyConfirmed,
@@ -421,13 +438,27 @@ mod tests {
             })
             .collect();
 
-        let encoded = crate::proto::encode("slot", "overview", &entries);
-        assert!(
-            encoded.len() < crate::proto::MAX_MESSAGE,
-            "worst-case overview is {} bytes against a {} byte ceiling",
-            encoded.len(),
-            crate::proto::MAX_MESSAGE
-        );
+        for (key, count) in [("overview", 512), ("own", OWN_SLOTS_KEPT)] {
+            let encoded = crate::proto::encode("slot", key, &worst[..count]);
+            assert!(
+                encoded.len() < crate::proto::MAX_MESSAGE,
+                "worst-case {key} is {} bytes against a {} byte ceiling",
+                encoded.len(),
+                crate::proto::MAX_MESSAGE
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_recent_window_is_keyed_ahead_of_our_own_slots() {
+        // Load-bearing, and invisible at the call site. The client clears its
+        // slot map on "overview" and merges on "own", so a snapshot that
+        // delivered them the other way round would wipe our own slots every
+        // time a client connected. The retained map is a `BTreeMap` keyed by
+        // (topic, key), so the guarantee is alphabetical and this is all of it:
+        // renaming "own" to anything sorting before "overview" breaks it.
+        use crate::proto::TOPIC_SLOT;
+        assert!((TOPIC_SLOT, "overview") < (TOPIC_SLOT, "own"));
     }
 
     /// Every slot this validator led, oldest first.
@@ -456,17 +487,22 @@ mod tests {
 
     #[test]
     fn test_own_retention_is_bounded() {
+        // Saturating rather than bare `+`: the workspace denies
+        // `arithmetic_side_effects`, and a cast of a constant is not a literal
+        // as far as the lint is concerned.
+        let led = (OWN_SLOTS_KEPT as Slot).saturating_add(100);
         let mut ring = SlotRing::new(8);
-        for slot in 1..=100 {
+        for slot in 1..=led {
             ring.update(slot, |entry| entry.mine = true);
         }
-        for slot in 101..=300 {
+        for slot in led.saturating_add(1)..=led.saturating_add(200) {
             ring.update(slot, |entry| entry.level = SlotLevel::Rooted);
         }
         let kept = ours(&ring);
         assert_eq!(kept.len(), OWN_SLOTS_KEPT);
         // The newest of ours, not the first we ever led.
-        assert_eq!(kept.last(), Some(&100));
+        assert_eq!(kept.last(), Some(&led));
+        assert_eq!(kept.first(), Some(&101));
     }
 
     #[test]
@@ -512,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn test_overview_carries_our_own_slots_from_before_it() {
+    fn test_the_two_snapshots_together_carry_our_own_slots_from_before_the_window() {
         let mut ring = SlotRing::new(512);
         for slot in [1, 2] {
             ring.update(slot, |entry| entry.mine = true);
@@ -520,24 +556,36 @@ mod tests {
         for slot in 3..=100 {
             ring.update(slot, |entry| entry.level = SlotLevel::Rooted);
         }
-        let slots: Vec<Slot> = ring.overview(10).iter().map(|entry| entry.slot).collect();
-        assert_eq!(&slots[..2], &[1, 2]);
-        assert_eq!(slots.last(), Some(&100));
+        let own: Vec<Slot> = ring
+            .own_before_window(10)
+            .iter()
+            .map(|entry| entry.slot)
+            .collect();
+        let recent: Vec<Slot> = ring.recent(10).iter().map(|entry| entry.slot).collect();
+
+        assert_eq!(own, vec![1, 2]);
+        assert_eq!(recent.last(), Some(&100));
+        // Applied in order by the client, the pair is still one ordered list
+        // with nothing in it twice.
+        let together: Vec<Slot> = own.iter().chain(recent.iter()).copied().collect();
         assert!(
-            slots.windows(2).all(|pair| pair[0] < pair[1]),
-            "the overview must stay ordered and hold no duplicates: {slots:?}"
+            together.windows(2).all(|pair| pair[0] < pair[1]),
+            "the snapshots must not overlap or arrive out of order: {together:?}"
         );
     }
 
     #[test]
-    fn test_own_slot_inside_the_window_is_not_sent_twice() {
+    fn test_an_own_slot_inside_the_window_is_not_sent_twice() {
         let mut ring = SlotRing::new(512);
         for slot in 1..=20 {
             ring.update(slot, |entry| entry.level = SlotLevel::Rooted);
         }
         ring.update(18, |entry| entry.mine = true);
-        let slots: Vec<Slot> = ring.overview(5).iter().map(|entry| entry.slot).collect();
-        assert_eq!(slots, vec![16, 17, 18, 19, 20]);
+
+        // Already in the recent half, so the own half must leave it out.
+        assert!(ring.own_before_window(5).is_empty());
+        let recent: Vec<Slot> = ring.recent(5).iter().map(|entry| entry.slot).collect();
+        assert_eq!(recent, vec![16, 17, 18, 19, 20]);
     }
 
     #[test]
