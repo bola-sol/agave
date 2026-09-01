@@ -87,6 +87,24 @@ export class Store {
    * first time somebody searches.
    */
   private displays = new Map<string, { name: string | null; icon: string | null }>();
+  /**
+   * Epochs other than the current one, once something has asked for them.
+   *
+   * The current epoch arrives on its own message; this holds the ones reached
+   * by reading back through the history, which crosses a boundary whenever the
+   * tip is within a hundred thousand slots of one. `null` for an epoch the
+   * validator no longer has a schedule for, remembered so it is asked once.
+   */
+  private epochs = new Map<number, EpochInfo | null>();
+  /**
+   * Bumped whenever a leader could newly resolve: an epoch's arrays arriving,
+   * the names arriving, the epoch turning.
+   *
+   * Read by anything memoising over resolved leaders. The store is one object
+   * for the life of the page, so a memo keyed on it alone never re-runs, and
+   * the turns built before this moved would keep their bare keys.
+   */
+  private leaderRevision = 0;
 
   private listeners = new Set<() => void>();
   private frame: number | null = null;
@@ -189,6 +207,31 @@ export class Store {
    * have, resolves to a key with no name or to nothing at all, and the callers
    * fall back in that order.
    */
+  getLeaderRevision = (): number => this.leaderRevision;
+
+  /**
+   * Fetches an epoch's schedule, once.
+   *
+   * Only the current one is published, it being half a megabyte and wanted by
+   * the pages that read back far enough to leave it. Asked for rather than sent
+   * for the same reason the names are.
+   */
+  async loadEpoch(epoch: number): Promise<void> {
+    if (this.epochs.has(epoch)) return;
+    const record = await this.request<EpochInfo | null>("epoch", "query", { epoch });
+    // Held even when nothing came back, so an epoch the validator has no
+    // schedule for is asked about once rather than on every search.
+    this.epochs.set(epoch, record ?? null);
+    if (record) this.leadersChanged();
+  }
+
+  /** Every answer already given was given without whatever just arrived. */
+  private leadersChanged(): void {
+    this.leaderRevision += 1;
+    this.leaderCache.clear();
+    this.touch();
+  }
+
   leaderOf(slot: number, mine: boolean): LeaderRef {
     // Ours takes no lookup, and must not depend on one. Both sources have a
     // reach, and our own slots are kept well past both: five hundred of them is
@@ -200,7 +243,7 @@ export class Store {
     const cached = this.leaderCache.get(slot);
     if (cached) return cached;
 
-    const key = leaderAt(this.values.get("epoch.new") as EpochInfo | undefined, slot);
+    const key = this.leaderAtAny(slot);
     // The peer table first, being the fresher of the two: it is rebuilt every
     // few seconds where the display table is fetched once. Both hold the same
     // answer for a leader they both know.
@@ -209,6 +252,24 @@ export class Store {
       key === null ? NO_LEADER : { key, name: shown?.name ?? null, icon: shown?.icon ?? null };
     this.leaderCache.set(slot, leader);
     return leader;
+  }
+
+  /**
+   * Who leads a slot, from whichever epoch's arrays cover it.
+   *
+   * The published one first, being the one nearly every slot on the page falls
+   * in. The fetched ones are only consulted for a slot outside it, which is a
+   * page that has read back past a boundary.
+   */
+  private leaderAtAny(slot: number): string | null {
+    const here = leaderAt(this.values.get("epoch.new") as EpochInfo | undefined, slot);
+    if (here !== null) return here;
+    for (const past of this.epochs.values()) {
+      if (past === null) continue;
+      const there = leaderAt(past, slot);
+      if (there !== null) return there;
+    }
+    return null;
   }
 
   /**
@@ -227,9 +288,7 @@ export class Store {
       next.set(key, { name: table.names[index] ?? null, icon: table.icons[index] ?? null });
     });
     this.displays = next;
-    // Every answer already given was given without these.
-    this.leaderCache.clear();
-    this.touch();
+    this.leadersChanged();
   }
 
   /**
@@ -337,7 +396,7 @@ export class Store {
       this.values.set(`${topic}.${key}`, value);
       // The two things a resolved leader is made of. Either changing makes
       // every answer already given potentially wrong.
-      if (topic === "epoch" || topic === "peers") this.leaderCache.clear();
+      if (topic === "epoch" || topic === "peers") this.leadersChanged();
     }
 
     this.touch();

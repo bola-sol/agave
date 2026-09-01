@@ -98,12 +98,13 @@ export function SchedulePage() {
   // the fetch lands, and the live list stays cheap.
   const [deep, setDeep] = useState<SlotEntry[] | null>(null);
   const [deepLoading, setDeepLoading] = useState(false);
-  // Whether the cluster's names have arrived. A memo below is keyed on it
-  // because the store is one object for the life of the page: a re-render does
-  // not re-run a memo whose dependencies are unchanged, so without something
-  // that moves when the names do, the turns built before they landed would keep
-  // their bare keys for as long as the page was open.
-  const [named, setNamed] = useState(false);
+  // Moves whenever a leader could newly resolve: the names arriving, an
+  // epoch's arrays arriving, the epoch turning. The memo below is keyed on it
+  // because the store is one object for the life of the page, and a re-render
+  // does not re-run a memo whose dependencies are unchanged: without this the
+  // turns built before any of that landed would keep their bare keys for as
+  // long as the page stayed open.
+  const leaderRevision = store.getLeaderRevision();
 
   const [older, setOlder] = useState<SlotEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -134,7 +135,17 @@ export function SchedulePage() {
         spans.unshift(got);
         end = first;
       }
-      setDeep(spans.flat());
+      const all = spans.flat();
+      setDeep(all);
+
+      // Reading this far back leaves the epoch the page was sent whenever the
+      // tip is within the history's depth of a boundary, which is about a
+      // quarter of every epoch. Without the epoch before it, every slot on the
+      // far side has no leader the page can name.
+      const oldest = all[0]?.slot;
+      if (oldest !== undefined && epoch && oldest < epoch.start_slot) {
+        await store.loadEpoch(epoch.epoch - 1);
+      }
     } catch {
       // Left unset, so the next search tries again rather than searching a
       // window it cannot see the end of and calling that the answer.
@@ -145,10 +156,7 @@ export function SchedulePage() {
 
   useEffect(() => {
     if (!searching) return;
-    void store
-      .loadDisplays()
-      .then(() => setNamed(true))
-      .catch(() => {});
+    void store.loadDisplays().catch(() => {});
     void loadDepth();
     // Deliberately only the flag: this runs on the first keystroke and not on
     // every one after it, and `loadDepth` guards itself besides.
@@ -196,7 +204,7 @@ export function SchedulePage() {
     // arrive once. The peer table is left out on purpose. It is rebuilt every
     // few seconds and rebuilding a hundred thousand entries with it would cost
     // more than the handful of deep turns it could newly name.
-    [deep, store, epoch, named],
+    [deep, store, leaderRevision],
   );
 
   const matched = useMemo(() => {

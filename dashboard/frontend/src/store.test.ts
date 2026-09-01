@@ -99,6 +99,73 @@ describe("slots", () => {
     expect(ours.map((entry) => entry.slot)).toEqual([1, 2, 3, 4]);
   });
 
+  it("names a leader in an epoch the page was never sent, once it is fetched", async () => {
+    // Reading back through the history leaves the published epoch whenever the
+    // tip is within its depth of a boundary, about a quarter of the time. Every
+    // slot on the far side had no leader at all until this.
+    const store = new Store();
+    const sent: string[] = [];
+    store.setSender((frame) => sent.push(frame));
+    store.setConnection("open");
+    store.apply(
+      envelope("epoch", "new", {
+        epoch: 2,
+        start_slot: 200,
+        end_slot: 299,
+        slots_in_epoch: 100,
+        my_leader_slots: [],
+        leaders: ["NOW"],
+        turns: Array.from({ length: 25 }, () => 0),
+        block_cost_limit: 0,
+        account_cost_limit: 0,
+      }),
+    );
+    expect(store.leaderOf(104, false).key).toBeNull();
+    const before = store.getLeaderRevision();
+
+    const loading = store.loadEpoch(1);
+    const id = (JSON.parse(sent[0]) as { id: number }).id;
+    store.apply({
+      topic: "epoch",
+      key: "query",
+      id,
+      value: {
+        epoch: 1,
+        start_slot: 100,
+        end_slot: 199,
+        slots_in_epoch: 100,
+        my_leader_slots: [],
+        leaders: ["BEFORE"],
+        turns: Array.from({ length: 25 }, () => 0),
+        block_cost_limit: 0,
+        account_cost_limit: 0,
+      },
+    });
+    await loading;
+
+    expect(store.leaderOf(104, false).key).toBe("BEFORE");
+    // The current epoch still answers for its own slots, and first.
+    expect(store.leaderOf(204, false).key).toBe("NOW");
+    expect(store.getLeaderRevision()).toBeGreaterThan(before);
+  });
+
+  it("asks about an epoch it has no schedule for only once", async () => {
+    // A validator that has not been up long has nothing for it, and every
+    // search would otherwise ask again.
+    const store = new Store();
+    const sent: string[] = [];
+    store.setSender((frame) => sent.push(frame));
+    store.setConnection("open");
+
+    const loading = store.loadEpoch(1);
+    const id = (JSON.parse(sent[0]) as { id: number }).id;
+    store.apply({ topic: "epoch", key: "query", id, value: null });
+    await loading;
+
+    await store.loadEpoch(1);
+    expect(sent).toHaveLength(1);
+  });
+
   it("names a leader the peer table does not reach, once the table is fetched", async () => {
     // The peer table covers the leaders of the held window. A turn from further
     // back had a key and nothing else, which is what made a search by name find

@@ -8,6 +8,7 @@
 
 use {
     crate::{
+        collect::EpochInfo,
         history::SlotHistory,
         proto::{MAX_MESSAGE, Message, Publisher, Request, encode_with_id},
         validator_info::ValidatorInfoCache,
@@ -127,6 +128,7 @@ pub async fn serve(
     publisher: Arc<Publisher>,
     history: Arc<RwLock<SlotHistory>>,
     info: Arc<RwLock<ValidatorInfoCache>>,
+    epochs: Arc<RwLock<Vec<EpochInfo>>>,
     allowed_hosts: Arc<[String]>,
 ) {
     let limits = Limits::new();
@@ -141,10 +143,20 @@ pub async fn serve(
         let publisher = publisher.clone();
         let history = history.clone();
         let info = info.clone();
+        let epochs = epochs.clone();
         let limits = limits.clone();
         let allowed_hosts = allowed_hosts.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle(socket, publisher, history, info, limits, &allowed_hosts).await
+            if let Err(err) = handle(
+                socket,
+                publisher,
+                history,
+                info,
+                epochs,
+                limits,
+                &allowed_hosts,
+            )
+            .await
             {
                 log::debug!("dashboard: connection from {peer} ended: {err}");
             }
@@ -157,6 +169,7 @@ async fn handle(
     publisher: Arc<Publisher>,
     history: Arc<RwLock<SlotHistory>>,
     info: Arc<RwLock<ValidatorInfoCache>>,
+    epochs: Arc<RwLock<Vec<EpochInfo>>>,
     limits: Limits,
     allowed_hosts: &[String],
 ) -> Result<(), ConnectionError> {
@@ -203,7 +216,7 @@ async fn handle(
             return refuse(socket, head_len, 503, b"too many dashboard clients").await;
         };
         let path = request_path(&head).to_string();
-        serve_websocket(socket, publisher, history, info, &path).await
+        serve_websocket(socket, publisher, history, info, epochs, &path).await
     } else {
         // Consume the bytes that were only peeked at. Closing a socket that
         // still has unread data makes the kernel send RST rather than FIN,
@@ -484,6 +497,7 @@ async fn serve_websocket(
     publisher: Arc<Publisher>,
     history: Arc<RwLock<SlotHistory>>,
     info: Arc<RwLock<ValidatorInfoCache>>,
+    epochs: Arc<RwLock<Vec<EpochInfo>>>,
     path: &str,
 ) -> Result<(), ConnectionError> {
     let mut server = Server::new(socket.compat());
@@ -594,7 +608,7 @@ async fn serve_websocket(
         if incoming.len() > MAX_CLIENT_MESSAGE {
             return Err(ConnectionError::Oversized(incoming.len()));
         }
-        if let Some(reply) = respond(&incoming, &history, &info) {
+        if let Some(reply) = respond(&incoming, &history, &info, &epochs) {
             send_or_timeout!(sender.send_text(&*reply));
             send_or_timeout!(sender.flush());
         }
@@ -627,6 +641,12 @@ fn for_logging(value: &str) -> String {
     out
 }
 
+/// Which epoch an `epoch.query` request is about.
+#[derive(serde::Deserialize)]
+struct EpochParams {
+    epoch: u64,
+}
+
 /// What a `slot.range` request asks for.
 #[derive(serde::Deserialize)]
 struct SlotRangeParams {
@@ -642,6 +662,7 @@ fn respond(
     payload: &[u8],
     history: &RwLock<SlotHistory>,
     info: &RwLock<ValidatorInfoCache>,
+    epochs: &RwLock<Vec<EpochInfo>>,
 ) -> Option<Message> {
     let request: Request = serde_json::from_slice(payload).ok()?;
     let id = request.id;
@@ -663,6 +684,29 @@ fn respond(
                 Err(_) => return Some(encode_with_id("summary", "displays", id, &())),
             };
             Some(encode_with_id("summary", "displays", id, &displays))
+        }
+        ("epoch", "query") => {
+            let Ok(params) = serde_json::from_value::<EpochParams>(request.params) else {
+                return Some(encode_with_id(
+                    "epoch",
+                    "query",
+                    id,
+                    &serde_json::json!({ "error": "query needs an epoch" }),
+                ));
+            };
+            // Only this epoch and the one before it are held. Anything else is
+            // answered with nothing rather than with an error: a page reading
+            // back through the history asks for whatever epoch its oldest slot
+            // fell in, and a validator that has not been up that long simply
+            // has no schedule for it to find.
+            let found = match epochs.read() {
+                Ok(epochs) => epochs
+                    .iter()
+                    .find(|held| held.epoch == params.epoch)
+                    .cloned(),
+                Err(_) => None,
+            };
+            Some(encode_with_id("epoch", "query", id, &found))
         }
         ("slot", "range") => {
             // Malformed parameters are answered rather than dropped, for the
@@ -728,6 +772,63 @@ mod tests {
         Arc::new(no_info())
     }
 
+    /// No epoch held, which is a validator that has only just started. Every
+    /// test here is about something else, and an empty archive still answers.
+    fn no_epochs() -> RwLock<Vec<EpochInfo>> {
+        RwLock::new(Vec::new())
+    }
+
+    fn no_epochs_shared() -> Arc<RwLock<Vec<EpochInfo>>> {
+        Arc::new(no_epochs())
+    }
+
+    fn epoch_record(epoch: u64) -> EpochInfo {
+        EpochInfo {
+            epoch,
+            start_slot: epoch.saturating_mul(432_000),
+            end_slot: epoch.saturating_mul(432_000).saturating_add(431_999),
+            slots_in_epoch: 432_000,
+            my_leader_slots: Vec::new(),
+            leaders: vec!["LEADER".to_string()],
+            turns: vec![0],
+            block_cost_limit: 60_000_000,
+            account_cost_limit: 12_000_000,
+        }
+    }
+
+    #[test]
+    fn test_an_epoch_the_validator_still_holds_is_answered_with_its_arrays() {
+        let epochs = RwLock::new(vec![epoch_record(841), epoch_record(842)]);
+        let reply = respond(
+            br#"{"topic":"epoch","key":"query","id":11,"params":{"epoch":841}}"#,
+            &empty(),
+            &no_info(),
+            &epochs,
+        )
+        .unwrap();
+        assert!(reply.contains(r#""id":11"#), "{reply}");
+        assert!(reply.contains(r#""epoch":841"#), "{reply}");
+        assert!(reply.contains(r#""LEADER""#), "{reply}");
+    }
+
+    #[test]
+    fn test_an_epoch_older_than_the_validator_kept_is_answered_with_nothing() {
+        // Not an error. A page reads back through the history and asks about
+        // whichever epoch its oldest slot fell in; a validator that has not been
+        // up that long simply has no schedule for it, and the page draws those
+        // turns without a leader rather than failing.
+        let epochs = RwLock::new(vec![epoch_record(842)]);
+        let reply = respond(
+            br#"{"topic":"epoch","key":"query","id":12,"params":{"epoch":700}}"#,
+            &empty(),
+            &no_info(),
+            &epochs,
+        )
+        .unwrap();
+        assert!(reply.contains(r#""id":12"#), "{reply}");
+        assert!(reply.contains(r#""value":null"#), "{reply}");
+    }
+
     #[test]
     fn test_the_display_table_carries_what_a_validator_calls_itself() {
         use crate::validator_info::ValidatorInfo;
@@ -744,6 +845,7 @@ mod tests {
             br#"{"topic":"summary","key":"displays","id":4}"#,
             &empty(),
             &info,
+            &no_epochs(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":4"#), "{reply}");
@@ -766,6 +868,7 @@ mod tests {
             br#"{"topic":"summary","key":"displays","id":5}"#,
             &empty(),
             &info,
+            &no_epochs(),
         )
         .unwrap();
         assert!(reply.contains(r#""keys":[]"#), "{reply}");
@@ -778,6 +881,7 @@ mod tests {
             br#"{"topic":"slot","key":"range","id":9,"params":{"first_slot":4,"count":2}}"#,
             &history,
             &no_info(),
+            &no_epochs(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":9"#), "{reply}");
@@ -793,6 +897,7 @@ mod tests {
             br#"{"topic":"slot","key":"range","id":3,"params":{"first_slot":"soon"}}"#,
             &empty(),
             &no_info(),
+            &no_epochs(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":3"#), "{reply}");
@@ -960,6 +1065,8 @@ mod tests {
                     publisher,
                     empty_history(),
                     no_info_shared(),
+                    no_epochs_shared(),
+                    no_epochs_shared(),
                     limits,
                     &allowed_hosts,
                 )
@@ -989,6 +1096,7 @@ mod tests {
                 publisher,
                 empty_history(),
                 no_info_shared(),
+                no_epochs_shared(),
                 limits,
                 &allowed_hosts,
             )
@@ -1079,6 +1187,8 @@ mod tests {
                     publisher,
                     empty_history(),
                     no_info_shared(),
+                    no_epochs_shared(),
+                    no_epochs_shared(),
                     limits,
                     &allowed_hosts,
                 )
@@ -1224,6 +1334,7 @@ mod tests {
             br#"{"topic":"summary","key":"ping","id":7}"#,
             &empty(),
             &no_info(),
+            &no_epochs(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":7"#));
@@ -1235,6 +1346,7 @@ mod tests {
             br#"{"topic":"nope","key":"nope","id":1}"#,
             &empty(),
             &no_info(),
+            &no_epochs(),
         )
         .unwrap();
         assert!(reply.contains("unsupported request"));
@@ -1242,7 +1354,7 @@ mod tests {
 
     #[test]
     fn test_malformed_requests_are_ignored() {
-        assert!(respond(b"not json", &empty(), &no_info()).is_none());
+        assert!(respond(b"not json", &empty(), &no_info(), &no_epochs()).is_none());
     }
 
     #[test]
@@ -1340,6 +1452,7 @@ mod tests {
                 publisher,
                 empty_history(),
                 no_info_shared(),
+                no_epochs_shared(),
                 Limits::new(),
                 &allowed_hosts,
             )
