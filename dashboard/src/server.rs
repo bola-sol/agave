@@ -1066,7 +1066,6 @@ mod tests {
                     empty_history(),
                     no_info_shared(),
                     no_epochs_shared(),
-                    no_epochs_shared(),
                     limits,
                     &allowed_hosts,
                 )
@@ -1187,7 +1186,6 @@ mod tests {
                     publisher,
                     empty_history(),
                     no_info_shared(),
-                    no_epochs_shared(),
                     no_epochs_shared(),
                     limits,
                     &allowed_hosts,
