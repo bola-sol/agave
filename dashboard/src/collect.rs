@@ -2408,8 +2408,18 @@ mod tests {
             Some((0, stranger)),
             "the latch must not still belong to the identity that has gone"
         );
+        // Not nought: the reset is followed straight away by the walk, which
+        // steps over every leader slot the root has already passed. Compared
+        // against a collector meeting this epoch for the first time, which is
+        // what a restarted walk should agree with, rather than against a
+        // constant that would depend on how many slots the fixture leads.
+        let restarted = {
+            let mut control = harness.collector();
+            control.collect_skip_rate(&harness.working_bank());
+            control.skip_next_index
+        };
         assert_eq!(
-            collector.skip_next_index, 0,
+            collector.skip_next_index, restarted,
             "the walk restarts rather than carrying an index into another schedule"
         );
     }
