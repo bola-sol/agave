@@ -373,7 +373,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_the_three_averages_and_the_thread_counts() {
+    fn test_reads_the_three_averages_and_the_thread_counts() {
         let load = parse_load("12.40 11.80 10.90 14/1847 3320145\n").unwrap();
         assert_eq!(load.one, 12.40);
         assert_eq!(load.five, 11.80);
@@ -383,14 +383,14 @@ mod tests {
     }
 
     #[test]
-    fn survives_a_loadavg_without_the_thread_pair() {
+    fn test_survives_a_loadavg_without_the_thread_pair() {
         let load = parse_load("0.10 0.20 0.30").unwrap();
         assert_eq!(load.running, 0);
         assert_eq!(load.threads, 0);
     }
 
     #[test]
-    fn refuses_a_loadavg_it_cannot_read() {
+    fn test_refuses_a_loadavg_it_cannot_read() {
         assert!(parse_load("").is_none());
         assert!(parse_load("not a number 1 2").is_none());
     }
@@ -407,7 +407,7 @@ SwapFree:         8388608 kB
 ";
 
     #[test]
-    fn reads_memory_in_bytes_and_adds_the_reclaimable_parts() {
+    fn test_reads_memory_in_bytes_and_adds_the_reclaimable_parts() {
         let memory = parse_memory(MEMINFO).unwrap();
         assert_eq!(memory.total, 402_653_184 * 1024);
         assert_eq!(memory.available, 92_274_688 * 1024);
@@ -418,7 +418,7 @@ SwapFree:         8388608 kB
     }
 
     #[test]
-    fn does_not_mistake_swap_cached_for_the_page_cache() {
+    fn test_does_not_mistake_swap_cached_for_the_page_cache() {
         // `SwapCached` sits directly under `Cached` and is a different figure.
         // A prefix match here would add it to the reclaimable total.
         let memory =
@@ -428,13 +428,13 @@ SwapFree:         8388608 kB
     }
 
     #[test]
-    fn reports_no_swap_where_none_is_configured() {
+    fn test_reports_no_swap_where_none_is_configured() {
         let memory = parse_memory("MemTotal: 1024 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n").unwrap();
         assert_eq!(memory.swap_total, 0);
     }
 
     #[test]
-    fn refuses_meminfo_without_a_total() {
+    fn test_refuses_meminfo_without_a_total() {
         assert!(parse_memory("MemFree: 100 kB\n").is_none());
     }
 
@@ -446,7 +446,7 @@ SwapFree:         8388608 kB
 ";
 
     #[test]
-    fn reads_the_counters_a_device_line_carries() {
+    fn test_reads_the_counters_a_device_line_carries() {
         let disks = parse_diskstats(DISKSTATS);
         let disk = disks.get("nvme0n1").unwrap();
         assert_eq!(disk.reads, 1000);
@@ -459,7 +459,7 @@ SwapFree:         8388608 kB
     }
 
     #[test]
-    fn keeps_partitions_separate_here_and_folds_them_later() {
+    fn test_keeps_partitions_separate_here_and_folds_them_later() {
         // Both are read; `device_for` is what decides a path on `nvme0n1p1` is
         // reported against `nvme0n1`.
         let disks = parse_diskstats(DISKSTATS);
@@ -468,12 +468,12 @@ SwapFree:         8388608 kB
     }
 
     #[test]
-    fn skips_a_line_too_short_to_carry_the_busy_figure() {
+    fn test_skips_a_line_too_short_to_carry_the_busy_figure() {
         assert!(!parse_diskstats(DISKSTATS).contains_key("loop0"));
     }
 
     #[test]
-    fn turns_sectors_into_bytes_at_five_hundred_and_twelve() {
+    fn test_turns_sectors_into_bytes_at_five_hundred_and_twelve() {
         let disk = DiskCounters {
             read_sectors: 2,
             write_sectors: 4,
@@ -484,7 +484,7 @@ SwapFree:         8388608 kB
     }
 
     #[test]
-    fn subtracts_the_previous_sample() {
+    fn test_subtracts_the_previous_sample() {
         let previous = DiskCounters {
             reads: 10,
             busy_ms: 100,
@@ -501,7 +501,7 @@ SwapFree:         8388608 kB
     }
 
     #[test]
-    fn discards_a_sample_where_a_counter_went_backwards() {
+    fn test_discards_a_sample_where_a_counter_went_backwards() {
         // A device removed and re-added restarts at nought, and an unsigned
         // wrap would read as an enormous burst of work.
         let previous = DiskCounters {
@@ -516,7 +516,7 @@ SwapFree:         8388608 kB
     }
 
     #[test]
-    fn works_out_the_mean_wait_across_reads_and_writes() {
+    fn test_works_out_the_mean_wait_across_reads_and_writes() {
         let delta = DiskCounters {
             reads: 30,
             writes: 70,
@@ -528,13 +528,13 @@ SwapFree:         8388608 kB
     }
 
     #[test]
-    fn has_no_wait_to_report_where_the_device_did_nothing() {
+    fn test_has_no_wait_to_report_where_the_device_did_nothing() {
         // Nought here would read as an idle device being infinitely fast.
         assert_eq!(DiskCounters::default().wait_ms(), None);
     }
 
     #[test]
-    fn reads_busy_as_a_share_of_the_interval() {
+    fn test_reads_busy_as_a_share_of_the_interval() {
         let delta = DiskCounters {
             busy_ms: 340,
             ..DiskCounters::default()
@@ -543,7 +543,7 @@ SwapFree:         8388608 kB
     }
 
     #[test]
-    fn clamps_busy_where_the_kernel_clock_runs_past_the_interval() {
+    fn test_clamps_busy_where_the_kernel_clock_runs_past_the_interval() {
         let delta = DiskCounters {
             busy_ms: 1004,
             ..DiskCounters::default()
