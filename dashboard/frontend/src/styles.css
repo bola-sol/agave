@@ -3929,6 +3929,8 @@ body {
 }
 
 .schedule-leader-when {
+  display: block;
+  min-height: 16px;
   font-size: 11px;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
