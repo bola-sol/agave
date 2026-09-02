@@ -11,15 +11,14 @@
 //! come from different sources, are measured in different units, and a machine
 //! can be in trouble on either one while the other reads perfectly healthy.
 
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::{
     collections::BTreeMap,
     ffi::CString,
     io,
     path::{Path, PathBuf},
 };
-
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 
 /// Bytes in a disk sector, as `/proc/diskstats` counts them.
 ///

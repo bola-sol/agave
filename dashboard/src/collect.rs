@@ -619,7 +619,8 @@ impl Collector {
         self.tips_residual = residual;
         if let Some(lamports) = residual {
             log::info!(
-                "dashboard: {lamports} lamports of tips were paid before the receiver changed and are counted against no turn"
+                "dashboard: {lamports} lamports of tips were paid before the receiver changed and \
+                 are counted against no turn"
             );
         }
     }
@@ -1537,7 +1538,8 @@ impl Collector {
         let covered = (turns.len() as u64).saturating_mul(stride as u64);
         if covered != slots_in_epoch {
             log::warn!(
-                "dashboard: epoch {epoch} leader schedule read as {} turns covering {covered} slots, not {slots_in_epoch}; publishing no schedule for it",
+                "dashboard: epoch {epoch} leader schedule read as {} turns covering {covered} \
+                 slots, not {slots_in_epoch}; publishing no schedule for it",
                 turns.len()
             );
             return (Vec::new(), Vec::new());
