@@ -42,9 +42,9 @@ use {
 /// How often these readings are taken.
 pub const METER_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Samples retained for the transaction and network charts. At one a second
-/// this is twenty-five minutes, against a chart that shows one.
-const CHART_HISTORY: usize = 1500;
+/// Samples retained for the transaction and network charts: five minutes at
+/// one a second, which is what the client keeps.
+const CHART_HISTORY: usize = 300;
 
 /// Window the reported socket drops accumulate over. Long enough that a burst
 /// stays visible for a while after it stops, short enough that it clears.
