@@ -99,6 +99,37 @@ export function SlotDetailsPage() {
  * Over the blocks held, which is what the page shows and what the footnote
  * counts. It is not an average over the epoch and does not claim to be.
  */
+/** An average that sorts its column. Module-level: a component made inside the
+    row is a new type each render, so the buttons remounted under every click. */
+function SortButton({
+  column,
+  className,
+  sort,
+  onSort,
+  children,
+}: {
+  column: SortKey;
+  className: string;
+  sort: { key: SortKey; dir: SortDir } | null;
+  onSort: (key: SortKey) => void;
+  children: ReactNode;
+}) {
+  const on = sort?.key === column;
+  return (
+    <button
+      type="button"
+      className={`${className} produced-sort${on ? " is-on" : ""}`}
+      title={`Sort by ${SORT_WORD[column]}`}
+      onClick={() => onSort(column)}
+    >
+      <span className="produced-sort-arrow" aria-hidden="true">
+        {on ? (sort.dir === "desc" ? "↓" : "↑") : ""}
+      </span>
+      {children}
+    </button>
+  );
+}
+
 const SORT_WORD: Record<SortKey, string> = {
   transactions: "transactions",
   filled: "fullness",
@@ -118,20 +149,6 @@ function AveragesRow({
   onClear: () => void;
 }) {
   const avg = blockAverages(blocks);
-  // Each average heads its column and sorts by it; the arrow marks which.
-  const Sort = ({ column, className, children }: { column: SortKey; className: string; children: ReactNode }) => (
-    <button
-      type="button"
-      className={`${className} produced-sort${sort?.key === column ? " is-on" : ""}`}
-      title={`Sort by ${SORT_WORD[column]}`}
-      onClick={() => onSort(column)}
-    >
-      <span className="produced-sort-arrow" aria-hidden="true">
-        {sort?.key === column ? (sort.dir === "desc" ? "↓" : "↑") : ""}
-      </span>
-      {children}
-    </button>
-  );
   return (
     <div className="produced-averages">
       <span className="produced-id">
@@ -147,13 +164,13 @@ function AveragesRow({
           </button>
         )}
       </span>
-      <Sort column="transactions" className="produced-txns">
+      <SortButton column="transactions" sort={sort} onSort={onSort} className="produced-txns">
         {avg.transactions === null ? "—" : `${count(Math.round(avg.transactions))} txns`}
-      </Sort>
-      <Sort column="filled" className="produced-fill">
+      </SortButton>
+      <SortButton column="filled" sort={sort} onSort={onSort} className="produced-fill">
         {avg.filled === null ? "—" : `${percent(avg.filled, 1)} full`}
-      </Sort>
-      <Sort column="fees" className="produced-fees">
+      </SortButton>
+      <SortButton column="fees" sort={sort} onSort={onSort} className="produced-fees">
         {avg.fees === null ? (
           "—"
         ) : (
@@ -162,10 +179,10 @@ function AveragesRow({
             <span className="produced-fees-unit"> SOL</span>
           </>
         )}
-      </Sort>
-      <Sort column="duration" className="produced-ms">
+      </SortButton>
+      <SortButton column="duration" sort={sort} onSort={onSort} className="produced-ms">
         {avg.durationMillis === null ? "—" : `${Math.round(avg.durationMillis)} ms`}
-      </Sort>
+      </SortButton>
     </div>
   );
 }
