@@ -44,14 +44,10 @@ impl DashboardContext {
         cluster_name(self.bank_forks.read().unwrap().root_bank().cluster_type())
     }
 
-    /// The highest slot the cluster has finalized, as far as this node can
-    /// tell, or `None` before it has seen anything to go on.
-    ///
-    /// The same rule the RPC health check uses. Under Alpenglow that is the
-    /// last certificate votor validated; before the migration it is the
-    /// blockstore's latest optimistic slot, recorded from votes seen in gossip.
-    /// Both keep moving while replay is catching up, which is what makes them
-    /// a yardstick for how far behind this node is.
+    /// The highest slot the cluster has finalized, as far as this node can tell:
+    /// the last certificate votor validated under Alpenglow, and the blockstore's
+    /// latest optimistic slot before the migration. Both keep moving while replay
+    /// catches up, which is what makes them a yardstick.
     pub fn cluster_tip(&self) -> Option<Slot> {
         let migration_status = self.bank_forks.read().unwrap().migration_status();
         if migration_status.is_alpenglow_enabled() {

@@ -1,14 +1,8 @@
-//! A validator small enough to test against.
-//!
-//! The collectors read through eight handles, and every one of them has a test
-//! constructor somewhere in the workspace — they are just scattered. This
-//! gathers them into one `DashboardContext` so that a test can call `tick` and
-//! look at what came out, rather than testing the arithmetic around the edges.
-//!
-//! The node is its own staked leader. That is what makes the fixture useful
-//! rather than merely constructible: a genesis with no stake produces no
-//! leader schedule, so nothing labels a slot, nothing counts a validator, and
-//! the collectors all take their empty paths.
+//! A validator small enough to test against: the handles the collectors read
+//! through, gathered into one `DashboardContext` so a test can call `tick` and
+//! look at what came out. The node is its own staked leader, since a genesis
+//! with no stake produces no leader schedule and every collector takes its
+//! empty path.
 
 use {
     crate::{
@@ -54,9 +48,8 @@ use {
     tempfile::TempDir,
 };
 
-/// Lamports staked to the fixture's validator. Any non-zero amount will do —
-/// `create_genesis_config` proper stakes nothing, and a vote account with no
-/// stake is skipped by every count the dashboard makes.
+/// Lamports staked to the fixture's validator. Any non-zero amount will do; a
+/// vote account with no stake is skipped by every count.
 const VALIDATOR_STAKE: u64 = 1_000_000;
 
 const MINT: u64 = 1_000_000_000;
@@ -81,9 +74,8 @@ pub struct Fixture {
 }
 
 impl Fixture {
-    /// Puts the cluster ahead of this validator, as a node that has fallen
-    /// behind would see it. Before Alpenglow the tip is the blockstore's
-    /// latest optimistic slot, so that is what is written.
+    /// Puts the cluster ahead of this validator. Before Alpenglow the tip is the
+    /// blockstore's latest optimistic slot, so that is what is written.
     pub fn set_cluster_tip(&self, slot: Slot) {
         let hash = self.working_bank().last_blockhash();
         self.ctx
@@ -97,20 +89,14 @@ impl Fixture {
         self.bank_forks.read().unwrap().working_bank()
     }
 
-    /// Freezes the tip and builds a frozen child at `slot`, led by this
-    /// validator.
-    ///
-    /// Slot zero on its own exercises almost nothing: consensus levels,
-    /// durations and the skip rate all need slots to have passed. Both banks
-    /// are frozen because the collector only looks at frozen ones.
+    /// Freezes the tip and builds a frozen child at `slot`, led by this validator.
+    /// Slot zero alone exercises almost nothing.
     pub fn advance_to(&self, slot: Slot) -> Arc<Bank> {
         self.advance_with(slot, &[])
     }
 
-    /// As [`Self::advance_to`], with `accounts` written in the new slot.
-    ///
-    /// Written before the child freezes: a bank asserts against stores once
-    /// freezing has started, so there is no adding to it afterwards.
+    /// As [`Self::advance_to`], with `accounts` written in the new slot before it
+    /// freezes, since a bank asserts against stores afterwards.
     pub fn advance_with(&self, slot: Slot, accounts: &[(Pubkey, AccountSharedData)]) -> Arc<Bank> {
         let parent = self.working_bank();
         if !parent.is_frozen() {
@@ -188,9 +174,8 @@ impl Fixture {
             self.history.clone(),
             self.epochs.clone(),
             running(),
-            // No tip program in the fixture: a bank built here holds no tip
-            // accounts, so a meter over it would read nought for every slot and
-            // say nothing the tests in `tips` do not already say.
+            // No tip program in the fixture; a meter over it would read nought for every
+            // slot.
             None,
             None,
         )
@@ -198,9 +183,8 @@ impl Fixture {
 
     /// The once-a-second readings over this fixture, ready to tick.
     pub fn meters(&self) -> Meters {
-        // A tap of its own rather than the process-wide one: the observer is
-        // installed once per process and the tests share a process, so an
-        // installed tap would carry whatever the rest of the suite measured.
+        // A tap of its own rather than the process-wide one, which would carry
+        // whatever the rest of the suite measured.
         Meters::new(
             self.ctx.clone(),
             self.publisher.clone(),
@@ -229,10 +213,9 @@ pub fn fixture() -> Fixture {
     } = create_genesis_config_with_leader(MINT, &identity, VALIDATOR_STAKE);
     let vote_account = voting_keypair.pubkey();
 
-    // Built with the config program in the account index, which is what the
-    // README tells an operator to switch on and what `validator_info::scan_all`
-    // requires. Without it the name lookup is skipped and the tests covering it
-    // would pass against a code path nobody runs.
+    // With the config program in the account index, which
+    // `validator_info::scan_all` requires; without it the tests covering it would
+    // pass against a path nobody runs.
     let bank = Bank::new_with_paths_for_tests(
         &genesis_config,
         Some(BankTestConfig {
@@ -259,9 +242,8 @@ pub fn fixture() -> Fixture {
     let ledger = get_tmp_ledger_path_auto_delete!();
     let blockstore = Arc::new(Blockstore::open(ledger.path()).unwrap());
 
-    // Localhost contact info: the ingest panel matches gossip-advertised ports
-    // against what the kernel reports, and a node advertising nothing produces
-    // no rows at all.
+    // Localhost contact info: the ingest panel matches advertised ports, and a
+    // node advertising nothing produces no rows.
     let cluster_info = Arc::new(ClusterInfo::new(
         ContactInfo::new_localhost(&identity, 0),
         keypair,
@@ -277,9 +259,7 @@ pub fn fixture() -> Fixture {
             leader_schedule_cache,
             vote_account,
             highest_finalized: Arc::new(RwLock::new(None)),
-            // Nothing in the tests reads the host panel, and the fixture's
-            // ledger is a temporary directory that would report the machine
-            // running the tests.
+            // Nothing in the tests reads the host panel.
             account_paths: Vec::new(),
         },
         publisher: Arc::new(Publisher::new()),
@@ -299,10 +279,8 @@ mod tests {
 
     #[test]
     fn test_the_fixture_builds_a_validator_with_stake() {
-        // A smoke test, and the one worth having: it proves the dependency and
-        // feature wiring before any real test leans on it. A genesis with no
-        // stake compiles and then quietly makes every collector take its empty
-        // path.
+        // Proves the dependency and feature wiring before any real test leans on it:
+        // a genesis with no stake makes every collector take its empty path.
         let harness = fixture();
         let bank = harness.working_bank();
         assert_eq!(bank.slot(), 0);
@@ -327,11 +305,8 @@ mod tests {
 
     #[test]
     fn test_a_tick_publishes_what_a_client_needs_to_render() {
-        // The end-to-end shape: sample a real validator once and look at the
-        // snapshot a browser connecting afterwards would be sent. Asserts the
-        // keys are present rather than their values, which move; what this
-        // catches is a collector wired to publish nothing, which every unit
-        // test around the edges would miss.
+        // The end-to-end shape. Asserts the keys are present rather than their
+        // values; what this catches is a collector wired to publish nothing.
         let harness = fixture();
         harness.advance_to(1);
 
@@ -365,9 +340,8 @@ mod tests {
 
     #[test]
     fn test_the_cluster_wide_tier_waits_for_a_viewer() {
-        // The expensive sampling is skipped while nobody is connected, which is
-        // the whole reason an idle validator costs nothing. Easy to break by
-        // moving a collector into the wrong tier, and invisible if it is.
+        // The expensive sampling is skipped while nobody is connected. Easy to break
+        // by moving a collector into the wrong tier, and invisible if it is.
         let harness = fixture();
         harness.advance_to(1);
         let mut collector = harness.collector();

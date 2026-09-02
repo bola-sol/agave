@@ -1,15 +1,7 @@
-//! Host load, memory, filesystem capacity and disk saturation.
-//!
-//! Read straight from `/proc` and `statvfs` rather than through the metrics
-//! tap, for the same reason the network counters are: nothing here depends on
-//! what the validator chooses to emit or on the log level it emits at, so the
-//! panel keeps working on a node configured quieter than the default.
-//!
-//! Three different questions live in here and must not be run together. How
-//! full a filesystem is says whether the validator will run out of room. How
-//! hard a device is worked says whether it will run out of throughput. They
-//! come from different sources, are measured in different units, and a machine
-//! can be in trouble on either one while the other reads perfectly healthy.
+//! Host load, memory, filesystem capacity and disk saturation, read from
+//! `/proc` and `statvfs` rather than the metrics tap, so the panel works on a
+//! node logging below the default. Capacity and saturation are kept apart: a
+//! machine can be in trouble on one while the other reads healthy.
 
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
@@ -20,10 +12,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// Bytes in a disk sector, as `/proc/diskstats` counts them.
-///
-/// Always 512 whatever the device's own sector size is: the kernel reports
-/// these in traditional sectors rather than in the hardware's units.
+/// Bytes in a disk sector as `/proc/diskstats` counts them: always 512,
+/// whatever the device's own sector size.
 const SECTOR_BYTES: u64 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -44,9 +34,8 @@ pub struct Memory {
     pub available: u64,
     /// Page cache and buffers, the part of "used" the kernel will give back.
     pub reclaimable: u64,
-    /// Untouched memory. Needed as well as `available`, because the two answer
-    /// different questions: what is spoken for is `total - free - reclaimable`,
-    /// and `available` is larger than `free` by most of the page cache.
+    /// Untouched memory. What is spoken for is `total - free - reclaimable`;
+    /// `available` is larger than `free` by most of the page cache.
     pub free: u64,
     pub swap_total: u64,
     pub swap_free: u64,
@@ -61,18 +50,14 @@ pub struct DiskCounters {
     pub writes: u64,
     pub write_sectors: u64,
     pub write_ms: u64,
-    /// Milliseconds the device had at least one request in flight. This is what
-    /// `iostat` turns into `%util`, and it is a duty cycle rather than a level:
-    /// a device can sit at its ceiling here with the filesystem nearly empty.
+    /// Milliseconds the device had at least one request in flight, which is what
+    /// `iostat` turns into `%util`. A duty cycle, not a level.
     pub busy_ms: u64,
 }
 
 impl DiskCounters {
-    /// This sample less the one before it, or `None` if a counter went
-    /// backwards.
-    ///
-    /// Counters reset when a device is removed and re-added, and an unsigned
-    /// wrap would otherwise read as an enormous burst of work.
+    /// This sample less the one before, or `None` if a counter went backwards, as
+    /// it does when a device is re-added.
     pub fn since(&self, previous: &Self) -> Option<Self> {
         Some(Self {
             reads: self.reads.checked_sub(previous.reads)?,
@@ -97,10 +82,8 @@ impl DiskCounters {
         self.reads.saturating_add(self.writes)
     }
 
-    /// Mean milliseconds a request spent queued and serviced.
-    ///
-    /// `None` where the device did nothing in the interval, because no request
-    /// waited and a nought would read as an idle device being fast.
+    /// Mean milliseconds a request spent queued and serviced. `None` where the
+    /// device did nothing, since nought would read as fast.
     pub fn wait_ms(&self) -> Option<f64> {
         let operations = self.operations();
         if operations == 0 {
@@ -110,10 +93,8 @@ impl DiskCounters {
         Some(waited as f64 / operations as f64)
     }
 
-    /// Share of the interval the device had work in flight, in `[0, 1]`.
-    ///
-    /// Clamped because `busy_ms` is accumulated by the kernel on its own clock
-    /// and can exceed a wall-clock interval by a millisecond or two.
+    /// Share of the interval the device had work in flight, clamped because the
+    /// kernel accumulates `busy_ms` on its own clock.
     pub fn busy(&self, interval_ms: f64) -> Option<f64> {
         if interval_ms <= 0.0 {
             return None;
@@ -191,12 +172,8 @@ pub fn filesystem(_path: &Path) -> io::Result<Filesystem> {
     ))
 }
 
-/// Which filesystem `path` is on, as an opaque identity for grouping.
-///
-/// Two paths on the same filesystem must be reported once rather than twice,
-/// and comparing the strings will not do it: a validator given four accounts
-/// directories under one mount would otherwise show one filesystem four times,
-/// each claiming the whole of its free space.
+/// Which filesystem `path` is on, for grouping: four accounts directories
+/// under one mount are one filesystem, not four.
 #[cfg(target_os = "linux")]
 pub fn filesystem_id(path: &Path) -> io::Result<u64> {
     use std::os::linux::fs::MetadataExt;
@@ -211,17 +188,9 @@ pub fn filesystem_id(_path: &Path) -> io::Result<u64> {
     ))
 }
 
-/// The block device behind `path`, named as `/proc/diskstats` names it.
-///
-/// Resolved through `/sys/dev/block`, and folded up to the parent disk when the
-/// path sits on a partition: `nvme0n1p1` keeps its own counters, but what an
-/// operator wants to know is whether `nvme0n1` is saturated, and every
-/// partition on it competes for the same queue.
-///
-/// `None` rather than an error where there is no block device at all, which is
-/// the case for a validator keeping accounts on tmpfs. That is a filesystem
-/// with no device to be worked hard, so it belongs in the capacity rows and
-/// nowhere else.
+/// The block device behind `path`, named as `/proc/diskstats` names it, folded
+/// up to the parent disk for a partition since every partition competes for
+/// the same queue. `None` where there is no block device at all, as on tmpfs.
 #[cfg(target_os = "linux")]
 pub fn device_for(path: &Path) -> io::Result<Option<String>> {
     use std::os::linux::fs::MetadataExt;
@@ -327,12 +296,9 @@ fn parse_memory(contents: &str) -> Option<Memory> {
     seen_total.then_some(memory)
 }
 
-/// `259 0 nvme0n1 12345 0 987654 3210 ...`
-///
-/// Fields after the name are the ones the kernel has reported since 2.6: reads,
-/// reads merged, sectors read, milliseconds reading, then the same four for
-/// writes, then requests in flight, then milliseconds spent doing any I/O.
-/// Later kernels append discard and flush counters, which are ignored.
+/// `259 0 nvme0n1 12345 0 987654 3210 ...`: reads, reads merged, sectors read,
+/// milliseconds reading, the same four for writes, requests in flight, then
+/// milliseconds doing any I/O. Later discard and flush counters are ignored.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_diskstats(contents: &str) -> BTreeMap<String, DiskCounters> {
     let mut disks = BTreeMap::new();

@@ -1,8 +1,5 @@
-//! Publishing the validator's boot phase.
-//!
-//! Shared by the boot thread, which runs before the validator is assembled,
-//! and by the collector, which takes over once it is, so the handover does not
-//! change what the client sees.
+//! Publishing the validator's boot phase. Shared by the boot thread and the
+//! collector, so the handover between them is invisible to the client.
 
 use {
     crate::proto::{Debounced, Publisher, TOPIC_SUMMARY},
@@ -28,8 +25,7 @@ pub struct StartupProgress {
     /// supermajority, from 0 to 1.
     pub stake_percent: Option<f64>,
     /// How long the validator has been in this phase, and how long each phase
-    /// before it took. Most phases cannot say how far along they are, so what
-    /// is offered instead is how long they have been going.
+    /// before it took, since most phases cannot say how far along they are.
     pub phase_elapsed_nanos: u64,
     pub phases_taken: Vec<PhaseTiming>,
 }
@@ -103,9 +99,8 @@ impl StartupPublisher {
     fn fraction(&mut self, slots: Option<(Slot, Slot)>) -> Option<f64> {
         let (current, target) = slots?;
         let origin = *self.replay_origin.get_or_insert(current);
-        // Replay can be handed a target it has already passed, and the origin
-        // is only an estimate of where it began. Neither should produce a
-        // meter that runs backwards or past the end.
+        // Replay can be handed a target it has already passed, and the origin is
+        // only an estimate; neither may run the meter backwards or past the end.
         let span = target.checked_sub(origin)?;
         if span == 0 {
             return Some(1.0);
@@ -244,9 +239,8 @@ mod tests {
 
     #[test]
     fn test_a_phase_entered_twice_adds_to_its_own_total() {
-        // `loading_ledger` is entered once to load a snapshot and again if the
-        // blockstore still has slots to process. Two rows for one phase would
-        // read as two different steps of the boot.
+        // `loading_ledger` is entered once for the snapshot and again if the
+        // blockstore has slots to process.
         let mut publisher = StartupPublisher::default();
         let base = Instant::now();
         publisher.elapsed("loading_ledger", base);
