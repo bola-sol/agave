@@ -56,14 +56,14 @@ pub struct StartupPublisher {
 
 impl StartupPublisher {
     pub fn publish(&mut self, publisher: &Publisher, progress: ValidatorStartProgress) {
-        let (phase, detail, replay_slots, stake_percent) = describe(progress);
+        let phase = describe(progress);
         let progress = StartupProgress {
-            phase: phase.to_string(),
-            detail,
+            phase: phase.name.to_string(),
+            detail: phase.detail,
             running: matches!(progress, ValidatorStartProgress::Running),
-            fraction: self.fraction(replay_slots),
-            stake_percent,
-            phase_elapsed_nanos: self.elapsed(phase, Instant::now()),
+            fraction: self.fraction(phase.replay_slots),
+            stake_percent: phase.stake_percent,
+            phase_elapsed_nanos: self.elapsed(phase.name, Instant::now()),
             phases_taken: self.taken.clone(),
         };
         self.debounce
@@ -115,17 +115,16 @@ impl StartupPublisher {
     }
 }
 
-/// The phase name, its detail line, the replay slots and the stake share, as
-/// far as the phase reports them.
-fn describe(
-    progress: ValidatorStartProgress,
-) -> (
-    &'static str,
-    Option<String>,
-    Option<(Slot, Slot)>,
-    Option<f64>,
-) {
-    match progress {
+/// What a phase reports about itself, as far as it reports anything.
+struct Phase {
+    name: &'static str,
+    detail: Option<String>,
+    replay_slots: Option<(Slot, Slot)>,
+    stake_percent: Option<f64>,
+}
+
+fn describe(progress: ValidatorStartProgress) -> Phase {
+    let (name, detail, replay_slots, stake_percent) = match progress {
         ValidatorStartProgress::Initializing => ("initializing", None, None, None),
         ValidatorStartProgress::SearchingForRpcService => {
             ("searching_for_rpc_service", None, None, None)
@@ -157,6 +156,12 @@ fn describe(
             Some(gossip_stake_percent as f64 / 100.0),
         ),
         ValidatorStartProgress::Running => ("running", None, None, None),
+    };
+    Phase {
+        name,
+        detail,
+        replay_slots,
+        stake_percent,
     }
 }
 
