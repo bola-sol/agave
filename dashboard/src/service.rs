@@ -318,3 +318,39 @@ async fn wait_for_exit(exit: Arc<AtomicBool>) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*, crate::fixture::fixture, solana_core::validator::ValidatorStartProgress,
+        std::sync::mpsc,
+    };
+
+    #[test]
+    fn test_service_exit() {
+        let harness = fixture();
+        let exit = Arc::new(AtomicBool::new(false));
+        let config = DashboardConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            allowed_hosts: Vec::new(),
+            tip_payment_program_id: None,
+            commission_bps: None,
+        };
+        let mut service = DashboardService::start(
+            config,
+            Arc::new(RwLock::new(ValidatorStartProgress::Running)),
+            exit.clone(),
+        )
+        .unwrap();
+        service.attach(harness.ctx.clone()).unwrap();
+
+        exit.store(true, Ordering::Relaxed);
+        // Joined on a helper thread so a regression fails instead of hanging.
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || sender.send(service.join()));
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the dashboard did not stop within ten seconds")
+            .unwrap();
+    }
+}
