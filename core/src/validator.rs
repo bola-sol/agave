@@ -1911,7 +1911,7 @@ impl Validator {
                 account_paths: config.account_paths.clone(),
             };
             dashboard_service
-                .attach(context, exit.clone())
+                .attach(context)
                 .map_err(|err| anyhow!("Failed to start the dashboard collector: {err}"))?;
         }
 

@@ -62,12 +62,6 @@ const BOOT_POLL: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct DashboardService {
-    /// The dashboard's own stop signal.
-    ///
-    /// Deliberately not the validator's `exit`: the dashboard now starts before
-    /// the validator is assembled, so a failure part-way through startup drops
-    /// this service, and signalling the shared flag from `Drop` would tell the
-    /// whole validator to shut down.
     exit: Arc<AtomicBool>,
     /// Stops the boot thread once the collector has taken over reporting.
     attached: Arc<AtomicBool>,
@@ -114,10 +108,9 @@ impl DashboardService {
     pub fn start(
         config: DashboardConfig,
         startup_progress: StartupProgressFn,
-        validator_exit: Arc<AtomicBool>,
+        exit: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let publisher = Arc::new(Publisher::new());
-        let exit = Arc::new(AtomicBool::new(false));
         // Installed with the service rather than with the collector, so that
         // the points submitted during the boot sequence — which is most of a
         // cold start — are counted too. A validator with no dashboard installs
@@ -154,14 +147,13 @@ impl DashboardService {
             let info_cache = info_cache.clone();
             let epochs = epochs.clone();
             let exit = exit.clone();
-            let validator_exit = validator_exit.clone();
             thread::Builder::new()
                 .name("solDashSrv".to_string())
                 .spawn(move || {
                     runtime.block_on(async move {
                         tokio::select! {
                             _ = server::serve(listener, publisher, history, info_cache, epochs, allowed_hosts) => {}
-                            _ = wait_for_exit(exit, validator_exit) => {}
+                            _ = wait_for_exit(exit) => {}
                         }
                     });
                 })?
@@ -171,16 +163,12 @@ impl DashboardService {
             let publisher = publisher.clone();
             let exit = exit.clone();
             let attached = attached.clone();
-            let validator_exit = validator_exit.clone();
             let startup_progress = startup_progress.clone();
             thread::Builder::new()
                 .name("solDashBoot".to_string())
                 .spawn(move || {
                     let mut startup = StartupPublisher::default();
-                    while !attached.load(Ordering::Relaxed)
-                        && !exit.load(Ordering::Relaxed)
-                        && !validator_exit.load(Ordering::Relaxed)
-                    {
+                    while !attached.load(Ordering::Relaxed) && !exit.load(Ordering::Relaxed) {
                         let progress = (startup_progress)();
                         startup.publish(&publisher, progress);
                         thread::sleep(BOOT_POLL);
@@ -212,11 +200,7 @@ impl DashboardService {
     /// Reporting passes from the boot thread to the collector here, which is
     /// why both publish startup progress through the same
     /// [`StartupPublisher`]: the handover must not be visible to a client.
-    pub fn attach(
-        &mut self,
-        context: DashboardContext,
-        validator_exit: Arc<AtomicBool>,
-    ) -> io::Result<()> {
+    pub fn attach(&mut self, context: DashboardContext) -> io::Result<()> {
         let info_cache = self.info_cache.clone();
 
         // Validator names are read once here rather than on the collector's
@@ -251,13 +235,12 @@ impl DashboardService {
             let publisher = self.publisher.clone();
             let startup_progress = self.startup_progress.clone();
             let context = context.clone();
-            let validator_exit = validator_exit.clone();
             let metrics_tap = self.metrics_tap.clone();
             thread::Builder::new()
                 .name("solDashMeter".to_string())
                 .spawn(move || {
                     let mut meters = Meters::new(context, publisher, startup_progress, metrics_tap);
-                    while !exit.load(Ordering::Relaxed) && !validator_exit.load(Ordering::Relaxed) {
+                    while !exit.load(Ordering::Relaxed) {
                         meters.tick();
                         thread::sleep(METER_INTERVAL);
                     }
@@ -288,7 +271,7 @@ impl DashboardService {
                         commission_bps,
                     );
                     collector.publish_static();
-                    while !exit.load(Ordering::Relaxed) && !validator_exit.load(Ordering::Relaxed) {
+                    while !exit.load(Ordering::Relaxed) {
                         collector.tick();
                         thread::sleep(POLL_INTERVAL);
                     }
@@ -302,7 +285,6 @@ impl DashboardService {
     }
 
     pub fn join(mut self) -> thread::Result<()> {
-        self.exit.store(true, Ordering::Relaxed);
         for handle in [
             self.collector.take(),
             self.meters.take(),
@@ -319,17 +301,8 @@ impl DashboardService {
     }
 }
 
-impl Drop for DashboardService {
-    /// Startup can fail after the dashboard is up, in which case this is
-    /// dropped without `join`. Signal the threads so they do not outlive the
-    /// validator that owns them.
-    fn drop(&mut self) {
-        self.exit.store(true, Ordering::Relaxed);
-    }
-}
-
-async fn wait_for_exit(exit: Arc<AtomicBool>, validator_exit: Arc<AtomicBool>) {
-    while !exit.load(Ordering::Relaxed) && !validator_exit.load(Ordering::Relaxed) {
+async fn wait_for_exit(exit: Arc<AtomicBool>) {
+    while !exit.load(Ordering::Relaxed) {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
