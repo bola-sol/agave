@@ -29,6 +29,7 @@ solana-accounts-db = { workspace = true }
 solana-clock = { workspace = true }
 solana-cluster-type = { workspace = true }
 solana-config-interface = { workspace = true }
+solana-core = { workspace = true }
 solana-gossip = { workspace = true }
 solana-leader-schedule = { workspace = true }
 solana-ledger = { workspace = true }

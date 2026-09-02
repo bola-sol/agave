@@ -15,7 +15,7 @@
 
 use {
     crate::{
-        context::{DashboardContext, StartupProgressFn},
+        context::{DashboardContext, StartProgress},
         history::SlotHistory,
         produced::{ProducedBlock, ProducedRing},
         proto::{Debounced, Publisher, TOPIC_EPOCH, TOPIC_PEERS, TOPIC_SLOT, TOPIC_SUMMARY},
@@ -309,7 +309,7 @@ pub struct Collector {
     publisher: Arc<Publisher>,
     /// Supplied by the service rather than the context, since the boot
     /// thread reports progress long before a context can be built.
-    startup_progress: StartupProgressFn,
+    startup_progress: StartProgress,
 
     debounces: Debounces,
     slots: SlotRing,
@@ -425,7 +425,7 @@ impl Collector {
         info_cache: Arc<RwLock<ValidatorInfoCache>>,
         history: Arc<RwLock<SlotHistory>>,
         epochs: Arc<RwLock<Vec<EpochInfo>>>,
-        startup_progress: StartupProgressFn,
+        startup_progress: StartProgress,
         tips: Option<TipMeter>,
         commission_bps: Option<u16>,
     ) -> Self {
@@ -517,11 +517,6 @@ impl Collector {
             TOPIC_SUMMARY,
             "shred_version",
             &self.ctx.cluster_info.my_shred_version(),
-        );
-        self.publisher.publish(
-            TOPIC_SUMMARY,
-            "startup_time_nanos",
-            &system_time_nanos(self.ctx.start_time),
         );
     }
 
@@ -1268,8 +1263,10 @@ impl Collector {
         //
         // `collect_slot_positions` runs earlier in the same tick, so the
         // completed slot is already current.
-        let behind_cluster =
-            (self.ctx.cluster_tip)().map(|tip| tip.saturating_sub(self.last_completed_slot));
+        let behind_cluster = self
+            .ctx
+            .cluster_tip()
+            .map(|tip| tip.saturating_sub(self.last_completed_slot));
         self.debounces.behind_cluster.publish(
             &self.publisher,
             TOPIC_SUMMARY,
@@ -1772,7 +1769,7 @@ impl Collector {
     }
 
     fn collect_startup_progress(&mut self) {
-        let progress = (self.startup_progress)();
+        let progress = *self.startup_progress.read().unwrap();
         self.startup.publish(&self.publisher, progress);
     }
 }
@@ -2600,7 +2597,7 @@ mod tests {
         // so it read nought however far back the node was.
         let harness = fixture();
         harness.advance_to(64);
-        harness.set_cluster_tip(Some(10_000));
+        harness.set_cluster_tip(10_000);
         harness.collector().tick();
 
         let completed = published_number(&harness, "completed_slot").unwrap();
@@ -2617,7 +2614,7 @@ mod tests {
         // seen is ordinary, and is not a distance.
         let harness = fixture();
         harness.advance_to(64);
-        harness.set_cluster_tip(Some(1));
+        harness.set_cluster_tip(1);
         harness.collector().tick();
 
         assert_eq!(published_number(&harness, "behind_cluster"), Some(0));

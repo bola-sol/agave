@@ -14,13 +14,13 @@
 
 use {
     crate::{
-        collect::{Collector, EpochInfo},
+        collect::{Collector, EpochInfo, system_time_nanos},
         config::DashboardConfig,
-        context::{DashboardContext, StartupProgressFn},
+        context::{DashboardContext, StartProgress},
         history::{PACKED_SLOTS, SlotHistory},
         meters::{METER_INTERVAL, Meters},
         metrics_tap::MetricsTap,
-        proto::Publisher,
+        proto::{Publisher, TOPIC_SUMMARY},
         server,
         startup::StartupPublisher,
         tips::TipMeter,
@@ -34,7 +34,7 @@ use {
             atomic::{AtomicBool, Ordering},
         },
         thread::{self, JoinHandle},
-        time::Duration,
+        time::{Duration, SystemTime},
     },
     tokio::{net::TcpListener, runtime::Builder},
 };
@@ -69,7 +69,10 @@ pub struct DashboardService {
     /// Retained from `start` and handed to the collector at `attach`, so the
     /// caller supplies it once. The validator cannot supply it a second time
     /// anyway: translating its startup enum lives in the binary that owns it.
-    startup_progress: StartupProgressFn,
+    startup_progress: StartProgress,
+    /// When the dashboard came up, which is as near to when the process did as
+    /// anything reports. For the uptime readout.
+    started: SystemTime,
     /// Counters lifted from the measurements the validator submits about
     /// itself, watched from `start` so the boot sequence is counted too.
     metrics_tap: Arc<MetricsTap>,
@@ -107,10 +110,16 @@ impl DashboardService {
     /// assembled enough state for the collector to read.
     pub fn start(
         config: DashboardConfig,
-        startup_progress: StartupProgressFn,
+        startup_progress: StartProgress,
         exit: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let publisher = Arc::new(Publisher::new());
+        let started = SystemTime::now();
+        publisher.publish(
+            TOPIC_SUMMARY,
+            "startup_time_nanos",
+            &system_time_nanos(started),
+        );
         // Installed with the service rather than with the collector, so that
         // the points submitted during the boot sequence — which is most of a
         // cold start — are counted too. A validator with no dashboard installs
@@ -169,7 +178,7 @@ impl DashboardService {
                 .spawn(move || {
                     let mut startup = StartupPublisher::default();
                     while !attached.load(Ordering::Relaxed) && !exit.load(Ordering::Relaxed) {
-                        let progress = (startup_progress)();
+                        let progress = *startup_progress.read().unwrap();
                         startup.publish(&publisher, progress);
                         thread::sleep(BOOT_POLL);
                     }
@@ -181,6 +190,7 @@ impl DashboardService {
             attached,
             publisher,
             startup_progress,
+            started,
             metrics_tap,
             tip_payment_program_id: config.tip_payment_program_id,
             commission_bps: config.commission_bps,
@@ -234,12 +244,14 @@ impl DashboardService {
             let exit = self.exit.clone();
             let publisher = self.publisher.clone();
             let startup_progress = self.startup_progress.clone();
+            let started = self.started;
             let context = context.clone();
             let metrics_tap = self.metrics_tap.clone();
             thread::Builder::new()
                 .name("solDashMeter".to_string())
                 .spawn(move || {
-                    let mut meters = Meters::new(context, publisher, startup_progress, metrics_tap);
+                    let mut meters =
+                        Meters::new(context, publisher, startup_progress, started, metrics_tap);
                     while !exit.load(Ordering::Relaxed) {
                         meters.tick();
                         thread::sleep(METER_INTERVAL);

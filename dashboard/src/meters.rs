@@ -15,7 +15,7 @@
 use {
     crate::{
         collect::{CATCH_UP_SLOTS_PER_SECOND, system_time_nanos},
-        context::{DashboardContext, StartupProgressFn},
+        context::{DashboardContext, StartProgress},
         host_stats::{self, HostSnapshot},
         metrics_tap::{
             AccountsTotals, BundleTotals, ExecutedTotals, MetricsTap, ProgramCacheTotals,
@@ -28,6 +28,7 @@ use {
     },
     serde::Serialize,
     solana_clock::{Epoch, Slot},
+    solana_core::validator::ValidatorStartProgress,
     solana_gossip::contact_info::Protocol,
     solana_program_runtime::loaded_programs::MAX_LOADED_ENTRY_COUNT,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -774,7 +775,9 @@ pub struct Meters {
     publisher: Arc<Publisher>,
     /// Read directly rather than shared with the collector, so the two threads
     /// need nothing between them.
-    startup_progress: StartupProgressFn,
+    startup_progress: StartProgress,
+    /// When the dashboard came up, for the uptime readout.
+    started: SystemTime,
 
     last_counters: Option<TxnCounters>,
     /// Failed transactions summed over frozen banks, and the slot summed to.
@@ -899,13 +902,15 @@ impl Meters {
     pub fn new(
         ctx: DashboardContext,
         publisher: Arc<Publisher>,
-        startup_progress: StartupProgressFn,
+        startup_progress: StartProgress,
+        started: SystemTime,
         metrics_tap: Arc<MetricsTap>,
     ) -> Self {
         Self {
             ctx,
             publisher,
             startup_progress,
+            started,
             last_counters: None,
             errors_total: 0,
             errors_counted_to: None,
@@ -1355,7 +1360,7 @@ impl Meters {
         self.publisher
             .publish(TOPIC_SUMMARY, "server_time_nanos", &system_time_nanos(now));
         let uptime = now
-            .duration_since(self.ctx.start_time)
+            .duration_since(self.started)
             .unwrap_or_default()
             .as_nanos() as u64;
         self.publisher
@@ -1752,7 +1757,12 @@ impl Meters {
         // from when the dashboard began watching — the spans would differ by
         // however long the validator took to start, and the share would come
         // out too low by exactly the amount nobody could see.
-        if self.drops_baseline.is_none() && (self.startup_progress)().running {
+        if self.drops_baseline.is_none()
+            && matches!(
+                *self.startup_progress.read().unwrap(),
+                ValidatorStartProgress::Running
+            )
+        {
             self.drops_baseline = Some(drops.clone());
             self.received_baseline = Some(received.clone());
         }

@@ -13,7 +13,7 @@
 use {
     crate::{
         collect::{Collector, EpochInfo},
-        context::{DashboardContext, StartupProgress, StartupProgressFn},
+        context::{DashboardContext, StartProgress},
         history::{PACKED_SLOTS, SlotHistory},
         meters::Meters,
         metrics_tap::MetricsTap,
@@ -28,6 +28,7 @@ use {
         },
     },
     solana_clock::Slot,
+    solana_core::validator::ValidatorStartProgress,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_keypair::Keypair,
     solana_leader_schedule::SlotLeader,
@@ -47,7 +48,7 @@ use {
     solana_system_transaction as system_transaction,
     std::{
         collections::HashSet,
-        sync::{Arc, Mutex, RwLock},
+        sync::{Arc, RwLock},
         time::SystemTime,
     },
     tempfile::TempDir,
@@ -74,10 +75,6 @@ pub struct Fixture {
     pub history: Arc<RwLock<SlotHistory>>,
     /// This epoch and the one before it, as the collector leaves them.
     pub epochs: Arc<RwLock<Vec<EpochInfo>>>,
-    /// The cluster's tip as the context's closure will report it. Shared with
-    /// that closure so a test can move the cluster on without rebuilding the
-    /// fixture.
-    cluster_tip: Arc<Mutex<Option<Slot>>>,
     /// Held, not used. Dropping it deletes the directory the blockstore has
     /// open, and the failures that follow look like blockstore bugs.
     _ledger: TempDir,
@@ -85,9 +82,14 @@ pub struct Fixture {
 
 impl Fixture {
     /// Puts the cluster ahead of this validator, as a node that has fallen
-    /// behind would see it.
-    pub fn set_cluster_tip(&self, slot: Option<Slot>) {
-        *self.cluster_tip.lock().unwrap() = slot;
+    /// behind would see it. Before Alpenglow the tip is the blockstore's
+    /// latest optimistic slot, so that is what is written.
+    pub fn set_cluster_tip(&self, slot: Slot) {
+        let hash = self.working_bank().last_blockhash();
+        self.ctx
+            .blockstore
+            .insert_optimistic_slot(slot, &hash, 0)
+            .unwrap();
     }
 
     /// The bank at the tip.
@@ -203,6 +205,7 @@ impl Fixture {
             self.ctx.clone(),
             self.publisher.clone(),
             running(),
+            SystemTime::now(),
             Arc::new(MetricsTap::default()),
         )
     }
@@ -210,23 +213,13 @@ impl Fixture {
 
 /// Startup progress for a validator that has finished starting, which is what
 /// both threads report against for all but the boot sequence itself.
-fn running() -> StartupProgressFn {
-    Arc::new(|| StartupProgress {
-        phase: "running".to_string(),
-        detail: None,
-        running: true,
-        fraction: None,
-        replay_slots: None,
-        stake_percent: None,
-        phase_elapsed_nanos: 0,
-        phases_taken: Vec::new(),
-    })
+fn running() -> StartProgress {
+    Arc::new(RwLock::new(ValidatorStartProgress::Running))
 }
 
 pub fn fixture() -> Fixture {
     let keypair = Arc::new(Keypair::new());
     let identity = keypair.pubkey();
-    let cluster_tip: Arc<Mutex<Option<Slot>>> = Arc::new(Mutex::new(None));
 
     let GenesisConfigInfo {
         genesis_config,
@@ -260,7 +253,6 @@ pub fn fixture() -> Fixture {
     // Taken before the bank moves into bank forks, and from the same bank, so
     // the schedule the collector resolves against is the one it is reading.
     let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-    let cluster_type = genesis_config.cluster_type;
     bank.freeze();
     let bank_forks = BankForks::new_rw_arc(bank);
 
@@ -284,21 +276,12 @@ pub fn fixture() -> Fixture {
             blockstore,
             leader_schedule_cache,
             vote_account,
-            cluster_type,
-            start_time: SystemTime::now(),
-            // The tests drive this through `Fixture::set_cluster_tip` where
-            // they care; a fixture with no cluster to speak of reports none,
-            // which is what a validator that has seen no certificate does.
-            cluster_tip: {
-                let tip = cluster_tip.clone();
-                Arc::new(move || *tip.lock().unwrap())
-            },
+            highest_finalized: Arc::new(RwLock::new(None)),
             // Nothing in the tests reads the host panel, and the fixture's
             // ledger is a temporary directory that would report the machine
             // running the tests.
             account_paths: Vec::new(),
         },
-        cluster_tip,
         publisher: Arc::new(Publisher::new()),
         bank_forks,
         identity,

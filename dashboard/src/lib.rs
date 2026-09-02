@@ -28,8 +28,4 @@ pub mod tips;
 pub mod udp_drops;
 pub mod validator_info;
 
-pub use {
-    config::DashboardConfig,
-    context::{DashboardContext, StartupProgress, StartupProgressFn},
-    service::DashboardService,
-};
+pub use {config::DashboardConfig, context::DashboardContext, service::DashboardService};

@@ -96,9 +96,11 @@ core/src/validator.rs ──► DashboardService
                             └── info loader       (validator names, read once at attach)
 ```
 
-`context.rs` holds the handles the dashboard reads through. The crate does not
-depend on `solana-core`; anything core-only, such as startup progress, arrives
-behind a closure, which keeps the wiring in `validator.rs` down to a few lines.
+`context.rs` holds the handles the dashboard reads through. The validator binary
+starts the service before the snapshot download, so the page is up through the
+slowest part of a cold start, and builds the context from the `Validator` once
+`Validator::new` returns. `solana-core` itself is untouched beyond exposing
+three handles.
 
 `collect.rs` samples five times a second but publishes only what changed, so an
 idle validator produces almost no websocket traffic. `proto.rs` defines the
