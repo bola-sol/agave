@@ -53,6 +53,7 @@ solana-ledger = { workspace = true, features = ["dev-context-only-utils"] }
 solana-net-utils = { workspace = true }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 solana-signer = { workspace = true }
+solana-system-transaction = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

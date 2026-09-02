@@ -44,6 +44,7 @@ use {
         genesis_utils::{GenesisConfigInfo, create_genesis_config_with_leader},
     },
     solana_signer::Signer,
+    solana_system_transaction as system_transaction,
     std::{
         collections::HashSet,
         sync::{Arc, Mutex, RwLock},
@@ -66,6 +67,8 @@ pub struct Fixture {
     /// This validator's identity, which is also the staked leader.
     pub identity: Pubkey,
     pub vote_account: Pubkey,
+    /// Funds the transactions a test sends.
+    mint: Keypair,
     /// The packed history the collector fills, exposed so a test can read back
     /// what a tick recorded without going through the server.
     pub history: Arc<RwLock<SlotHistory>>,
@@ -121,6 +124,35 @@ impl Fixture {
         );
         for (pubkey, account) in accounts {
             bank.store_account(pubkey, account);
+        }
+        bank.freeze();
+        self.bank_forks.write().unwrap().insert(bank);
+        self.bank_forks.read().unwrap().get(slot).unwrap()
+    }
+
+    /// As [`Self::advance_to`], with `failures` transactions that execute and
+    /// fail in the new slot: transfers of more than the mint holds.
+    pub fn advance_with_failures(&self, slot: Slot, failures: usize) -> Arc<Bank> {
+        let parent = self.working_bank();
+        if !parent.is_frozen() {
+            parent.freeze();
+        }
+        let bank = Bank::new_from_parent(
+            parent,
+            SlotLeader {
+                id: self.identity,
+                vote_address: self.vote_account,
+            },
+            slot,
+        );
+        for _ in 0..failures {
+            let transfer = system_transaction::transfer(
+                &self.mint,
+                &Pubkey::new_unique(),
+                MINT.saturating_mul(2),
+                bank.last_blockhash(),
+            );
+            assert!(bank.process_transaction(&transfer).is_err());
         }
         bank.freeze();
         self.bank_forks.write().unwrap().insert(bank);
@@ -198,6 +230,7 @@ pub fn fixture() -> Fixture {
 
     let GenesisConfigInfo {
         genesis_config,
+        mint_keypair,
         voting_keypair,
         ..
     } = create_genesis_config_with_leader(MINT, &identity, VALIDATOR_STAKE);
@@ -270,6 +303,7 @@ pub fn fixture() -> Fixture {
         bank_forks,
         identity,
         vote_account,
+        mint: mint_keypair,
         history: Arc::new(RwLock::new(SlotHistory::new(PACKED_SLOTS))),
         epochs: Arc::new(RwLock::new(Vec::new())),
         _ledger: ledger,

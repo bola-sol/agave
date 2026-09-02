@@ -30,7 +30,7 @@ use {
     solana_clock::{Epoch, Slot},
     solana_gossip::contact_info::Protocol,
     solana_program_runtime::loaded_programs::MAX_LOADED_ENTRY_COUNT,
-    solana_runtime::bank::Bank,
+    solana_runtime::{bank::Bank, bank_forks::BankForks},
     std::{
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
         path::PathBuf,
@@ -619,9 +619,12 @@ struct IngestPort {
     quic: bool,
 }
 
-/// Cumulative transaction counters read off a bank, used to derive per-slot
-/// deltas. Bank counters are cumulative along a fork, so the difference between
-/// two banks on the same fork is the work done between them.
+/// Cumulative transaction counters, differenced between samples for a rate.
+///
+/// The bank's total and non-vote counts are inherited from the parent, so the
+/// working bank carries the fork's running total. Its error count is not: it
+/// resets for every bank, so `errors` is a running sum the caller keeps, added
+/// to as banks freeze.
 #[derive(Clone, Copy)]
 struct TxnCounters {
     slot: Slot,
@@ -632,15 +635,32 @@ struct TxnCounters {
 }
 
 impl TxnCounters {
-    fn read(bank: &Bank) -> Self {
+    fn read(bank: &Bank, errors: u64) -> Self {
         Self {
             slot: bank.slot(),
             total: bank.transaction_count(),
             non_vote: bank.non_vote_transaction_count_since_restart(),
-            errors: bank.transaction_error_count(),
+            errors,
             sampled_at: Instant::now(),
         }
     }
+}
+
+/// Failed transactions in frozen banks newer than `counted_to`, and the newest
+/// frozen slot. With no `counted_to` yet nothing is counted, and the newest
+/// slot becomes the baseline.
+fn frozen_errors(bank_forks: &BankForks, counted_to: Option<Slot>) -> (u64, Option<Slot>) {
+    let mut errors = 0u64;
+    let mut newest = counted_to;
+    for (slot, bank) in bank_forks.frozen_banks() {
+        if counted_to.is_some_and(|counted_to| slot > counted_to) {
+            errors = errors.saturating_add(bank.transaction_error_count());
+        }
+        if newest.is_none_or(|newest| slot > newest) {
+            newest = Some(slot);
+        }
+    }
+    (errors, newest)
 }
 
 /// One path the validator writes to, and what it is for.
@@ -757,6 +777,9 @@ pub struct Meters {
     startup_progress: StartupProgressFn,
 
     last_counters: Option<TxnCounters>,
+    /// Failed transactions summed over frozen banks, and the slot summed to.
+    errors_total: u64,
+    errors_counted_to: Option<Slot>,
     tps_history: Vec<TpsSample>,
 
     last_net: Option<(NetCounters, Instant)>,
@@ -884,6 +907,8 @@ impl Meters {
             publisher,
             startup_progress,
             last_counters: None,
+            errors_total: 0,
+            errors_counted_to: None,
             tps_history: Vec::with_capacity(CHART_HISTORY),
             last_net: None,
             last_host: None,
@@ -936,12 +961,15 @@ impl Meters {
         // Taken without waiting. Replay holds bank forks to advance, and this
         // thread exists so that the readings below survive a validator too busy
         // to answer: blocking here would give that up for one sample.
-        let working_bank = self
-            .ctx
-            .bank_forks
-            .try_read()
-            .ok()
-            .map(|bank_forks| bank_forks.working_bank());
+        let working_bank = match self.ctx.bank_forks.try_read() {
+            Ok(bank_forks) => {
+                let (errors, counted_to) = frozen_errors(&bank_forks, self.errors_counted_to);
+                self.errors_total = self.errors_total.saturating_add(errors);
+                self.errors_counted_to = counted_to;
+                Some(bank_forks.working_bank())
+            }
+            Err(_) => None,
+        };
         if let Some(working_bank) = working_bank {
             self.collect_tps(&working_bank);
             self.note_epoch(&working_bank);
@@ -1410,7 +1438,7 @@ impl Meters {
     }
 
     fn collect_tps(&mut self, working_bank: &Bank) {
-        let current = TxnCounters::read(working_bank);
+        let current = TxnCounters::read(working_bank, self.errors_total);
         let Some(previous) = self.last_counters.replace(current) else {
             return;
         };
@@ -1438,9 +1466,8 @@ impl Meters {
 
         let total = current.total.saturating_sub(previous.total) as f64 / seconds;
         let non_vote = current.non_vote.saturating_sub(previous.non_vote) as f64 / seconds;
-        // Bank counters do not split errors by vote/non-vote. Votes that fail
-        // are rare enough that attributing all failures to non-vote traffic is
-        // the honest approximation.
+        // Errors are not split by vote and non-vote. Failed votes are rare
+        // enough that attributing every failure to non-vote traffic is close.
         let failed = current.errors.saturating_sub(previous.errors) as f64 / seconds;
         let tps = Tps {
             total,
@@ -2540,6 +2567,36 @@ mod tests {
         assert!(
             harness.published_key("summary", "tps_history").is_some(),
             "the chart series is retained for a client connecting later"
+        );
+    }
+
+    #[test]
+    fn test_failures_are_summed_as_banks_freeze() {
+        // The error counter resets for each bank. Differenced like the total,
+        // it read nought whenever a bank froze with fewer failures than the one
+        // before it, which on mainnet was nearly always.
+        let harness = fixture();
+        let mut meters = harness.meters();
+
+        meters.tick();
+        sleep(Duration::from_millis(250));
+        harness.advance_with_failures(1, 3);
+        meters.tick();
+        sleep(Duration::from_millis(250));
+        harness.advance_with_failures(2, 1);
+        meters.tick();
+
+        let message = harness.published_key("summary", "estimated_tps").unwrap();
+        let tps: serde_json::Value = serde_json::from_str(&message).unwrap();
+        let failed = tps["value"]["non_vote_failed"].as_f64().unwrap();
+        let non_vote = failed + tps["value"]["non_vote_success"].as_f64().unwrap();
+        assert!(
+            failed > 0.0,
+            "one failure in the last slot was reported as none"
+        );
+        assert!(
+            (failed - non_vote).abs() < 1e-9,
+            "every non-vote transaction failed, so the two rates should agree: {message}"
         );
     }
 

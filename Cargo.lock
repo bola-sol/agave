@@ -163,6 +163,7 @@ dependencies = [
  "solana-runtime",
  "solana-sdk-ids",
  "solana-signer",
+ "solana-system-transaction",
  "solana-version",
  "tempfile",
  "thiserror 2.0.19",
