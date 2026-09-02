@@ -863,10 +863,6 @@ impl Meters {
         self.tpu.collect_xdp(&self.metrics_tap, &self.publisher);
     }
 
-    fn ingest_ports(&self, tap: &TapCounters) -> Vec<IngestPort> {
-        ingest_ports(&self.ctx, tap)
-    }
-
     fn collect_ingest_paths(&mut self) {
         let running = matches!(
             *self.startup_progress.read().unwrap(),
@@ -2101,13 +2097,15 @@ mod tests {
         // thread that read them, and nothing else in the dashboard knows that
         // `shred_fetch_receiver` is the socket gossip advertises as `tvu`.
         let harness = fixture();
-        let meters = harness.meters();
-        let counted = meters.ingest_ports(&TapCounters {
-            shreds_turbine: 900,
-            packets_gossip: 40,
-            packets_tpu_vote: 70,
-            ..TapCounters::default()
-        });
+        let counted = ingest_ports(
+            &harness.ctx,
+            &TapCounters {
+                shreds_turbine: 900,
+                packets_gossip: 40,
+                packets_tpu_vote: 70,
+                ..TapCounters::default()
+            },
+        );
         let by_name: HashMap<&str, Option<u64>> = counted
             .iter()
             .map(|port| (port.name, port.received))
@@ -2139,8 +2137,7 @@ mod tests {
         // datagrams and belongs on the socket card, and the QUIC vote endpoint
         // is a different socket on a different number.
         let harness = fixture();
-        let meters = harness.meters();
-        let ports = meters.ingest_ports(&TapCounters::default());
+        let ports = ingest_ports(&harness.ctx, &TapCounters::default());
         let quic: HashMap<&str, bool> = ports.iter().map(|port| (port.name, port.quic)).collect();
 
         assert_eq!(quic.get("tpu"), Some(&true));
