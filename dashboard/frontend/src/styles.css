@@ -413,6 +413,37 @@ body {
   font-weight: 400;
 }
 
+.boot-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.boot-row b {
+  font-weight: 500;
+}
+
+.boot-row > span:last-child {
+  font-family: ui-monospace, monospace;
+}
+
+.boot-sub {
+  padding-left: 12px;
+  color: var(--text-faint);
+}
+
+.boot-rule {
+  border-top: 1px solid var(--border);
+  margin: 2px 0;
+}
+
+.boot-note {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
 .connection {
   display: flex;
   align-items: center;
