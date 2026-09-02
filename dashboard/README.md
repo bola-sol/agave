@@ -49,8 +49,8 @@ the domain in the site block is the name to allow, and nothing else is needed.
 - **Checks `Origin`** on the websocket. Websockets are exempt from the
   same-origin policy, so without this any page open in a viewer's browser could
   connect to a dashboard that viewer can reach.
-- **Caps websockets** at 64 at once. HTTP is deliberately uncapped: refusing it
-  would stop the page loading under exactly the conditions where a cap matters.
+- **Caps connections** at 256 being served at once, and websockets at 64 of
+  those. A refused request gets a 503 rather than a dropped socket.
 - **Sends a content security policy** that permits no external code, styles,
   fonts or connections. Images are the one exception, because validator icons
   come from URLs operators publish on chain, and those are limited to `https`.
@@ -89,9 +89,11 @@ skipped entirely on a validator whose index does not cover that program. See
 
 ```
 core/src/validator.rs ──► DashboardService
-                            ├── collector thread  (samples state, diffs, publishes)
-                            ├── info loader       (validator names, read once at attach)
-                            └── server thread     (HTTP + websocket on one port)
+                            ├── server thread     (HTTP + websocket on one port)
+                            ├── boot thread       (startup progress until the collector attaches)
+                            ├── collector thread  (samples state at 5Hz, diffs, publishes)
+                            ├── meters thread     (once-a-second readings: TPS, host, network)
+                            └── info loader       (validator names, read once at attach)
 ```
 
 `context.rs` holds the handles the dashboard reads through. The crate does not
@@ -125,7 +127,10 @@ Topics currently published:
 | `peers`   | `all` |
 | `slot`    | `overview`, `update`, `upcoming` |
 
-The only request a client can make today is `summary.ping`.
+A client can also send a request carrying an `id`, and the reply goes back to
+that `id` alone: `summary.ping`, `summary.displays` for the whole name table,
+`epoch.query` for a held epoch's schedule, and `slot.range` for a run of slots
+out of the packed history.
 
 ## Building the frontend
 
