@@ -799,10 +799,10 @@ impl MetricsTap {
     fn observe(&self, point: &DataPoint) {
         match point.name {
             ACCOUNTS_DB_TIMINGS => {
+                // The same point carries the cache's size and entry count,
+                // which are levels rather than counts.
+                self.accounts.add_point(point);
                 for (name, value) in &point.fields {
-                    // The same point carries the cache's size and entry
-                    // count, which are levels rather than counts.
-                    self.accounts.add_point(point);
                     let counter = match *name {
                         "read_only_accounts_cache_hits" => &self.accounts_cache_hits,
                         "read_only_accounts_cache_misses" => &self.accounts_cache_misses,
