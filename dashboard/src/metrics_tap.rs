@@ -115,6 +115,11 @@ const SHRED_FULL: &str = "shred_insert_is_full";
 /// with whether it was ours; only ours are kept.
 const COST_TRACKER: &str = "cost_tracker_stats";
 
+/// The stake the validator could see in gossip while it waited for a
+/// supermajority, in lamports. Submitted every tenth check, so about every
+/// ten seconds, and only during that wait.
+const WFSM_GOSSIP: &str = "wfsm_gossip";
+
 /// The tag saying whether the reporting node produced the block.
 const IS_LEADER: &str = "is_leader";
 
@@ -385,6 +390,20 @@ pub struct MetricsTap {
     /// process runs, and a config that stops being reported has not been turned
     /// off.
     xdp: Mutex<Option<XdpConfig>>,
+
+    /// The last count of stake seen in gossip during the supermajority wait.
+    /// The boot thread reads it; nothing after the wait does.
+    stake_in_gossip: Mutex<Option<StakeInGossip>>,
+}
+
+/// Stake the validator could see in gossip when it last counted, in lamports.
+/// The validator's own figure for the supermajority wait, exact where the
+/// progress report carries a whole percent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct StakeInGossip {
+    pub online: u64,
+    pub offline: u64,
+    pub total: u64,
 }
 
 /// How the XDP transmit path is configured, as the validator resolved it.
@@ -834,6 +853,7 @@ impl MetricsTap {
             REPLAY_SLOT_STATS => self.remember_replay(point),
             SHRED_FULL => self.remember_fill(point),
             XDP_NETWORK_CONFIG => self.remember_xdp(point),
+            WFSM_GOSSIP => self.remember_stake_in_gossip(point),
             COST_TRACKER => self.remember_cost(point),
             ACCOUNTS_LOADS | ACCOUNTS_STORES | ACCOUNTS_FLUSH => self.accounts.add_point(point),
             PROGRAM_CACHE => self.program_cache.add_point(point),
@@ -1118,6 +1138,38 @@ impl MetricsTap {
             .lock()
             .map(|costs| costs.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Keeps the latest count of stake seen in gossip. A point without a total
+    /// has nothing to divide by and is dropped.
+    fn remember_stake_in_gossip(&self, point: &DataPoint) {
+        let mut seen = StakeInGossip {
+            online: 0,
+            offline: 0,
+            total: 0,
+        };
+        for (name, value) in &point.fields {
+            let Some(number) = field_u64(value) else {
+                continue;
+            };
+            match *name {
+                "online_stake" => seen.online = number,
+                "offline_stake" => seen.offline = number,
+                "total_activated_stake" => seen.total = number,
+                _ => (),
+            }
+        }
+        if seen.total == 0 {
+            return;
+        }
+        if let Ok(mut held) = self.stake_in_gossip.lock() {
+            *held = Some(seen);
+        }
+    }
+
+    /// The last count of stake seen in gossip, or nothing before the first.
+    pub fn stake_in_gossip(&self) -> Option<StakeInGossip> {
+        self.stake_in_gossip.lock().ok().and_then(|held| *held)
     }
 
     /// How the XDP transmit path is configured, or nothing where it is not.
@@ -2922,5 +2974,48 @@ mod tests {
         assert_eq!(field_str(r#""6.8.0""#), "6.8.0");
         assert_eq!(field_str(r#""a \"b\" c""#), r#"a "b" c"#);
         assert_eq!(field_str("unquoted"), "unquoted");
+    }
+
+    #[test]
+    fn test_the_stake_seen_in_gossip_is_read_in_lamports() {
+        // The exact figure behind the whole percent the progress report carries.
+        let tap = MetricsTap::default();
+        assert!(tap.stake_in_gossip().is_none());
+        tap.observe(&named(
+            WFSM_GOSSIP,
+            &[
+                ("online_stake", "2350000000000000i"),
+                ("offline_stake", "401650000000000000i"),
+                ("total_activated_stake", "404000000000000000i"),
+            ],
+        ));
+        assert_eq!(
+            tap.stake_in_gossip(),
+            Some(StakeInGossip {
+                online: 2_350_000_000_000_000,
+                offline: 401_650_000_000_000_000,
+                total: 404_000_000_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn test_a_stake_point_without_a_total_is_dropped() {
+        let tap = MetricsTap::default();
+        tap.observe(&named(WFSM_GOSSIP, &[("online_stake", "5i")]));
+        assert!(tap.stake_in_gossip().is_none());
+    }
+
+    #[test]
+    fn test_the_latest_stake_count_stands() {
+        // A level: the newest count replaces the last rather than adding to it.
+        let tap = MetricsTap::default();
+        for online in ["1i", "2i"] {
+            tap.observe(&named(
+                WFSM_GOSSIP,
+                &[("online_stake", online), ("total_activated_stake", "10i")],
+            ));
+        }
+        assert_eq!(tap.stake_in_gossip().unwrap().online, 2);
     }
 }

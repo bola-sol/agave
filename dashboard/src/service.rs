@@ -151,12 +151,17 @@ impl DashboardService {
             let attached = attached.clone();
             let startup_progress = startup_progress.clone();
             let startup = startup.clone();
+            let metrics_tap = metrics_tap.clone();
             thread::Builder::new()
                 .name("solDashBoot".to_string())
                 .spawn(move || {
                     while !attached.load(Ordering::Relaxed) && !exit.load(Ordering::Relaxed) {
                         let progress = *startup_progress.read().unwrap();
-                        startup.lock().unwrap().publish(&publisher, progress);
+                        startup.lock().unwrap().publish(
+                            &publisher,
+                            progress,
+                            metrics_tap.stake_in_gossip(),
+                        );
                         thread::sleep(BOOT_POLL);
                     }
                 })?

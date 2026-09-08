@@ -1206,6 +1206,38 @@ body {
   color: var(--text-dim);
 }
 
+/* The bar with the share the wait ends at marked on it. */
+.startup-meter {
+  position: relative;
+}
+
+.startup-meter .meter {
+  margin-top: 0;
+}
+
+.startup-target {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 10px;
+  background: var(--warn);
+  transform: translateX(-1px);
+}
+
+.startup-measure-sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.startup-measure-sub b {
+  font-family: ui-monospace, monospace;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
 .startup-detail {
   color: var(--text-faint);
   font-weight: 400;

@@ -1579,10 +1579,11 @@ impl Collector {
 
     fn collect_startup_progress(&mut self) {
         let progress = *self.startup_progress.read().unwrap();
-        self.startup
-            .lock()
-            .unwrap()
-            .publish(&self.publisher, progress);
+        self.startup.lock().unwrap().publish(
+            &self.publisher,
+            progress,
+            self.metrics_tap.stake_in_gossip(),
+        );
     }
 }
 
@@ -2712,14 +2713,15 @@ mod tests {
         // startup as nought and put the whole boot into catching up.
         let harness = fixture();
         let shared = Arc::new(Mutex::new(StartupPublisher::default()));
+        shared.lock().unwrap().publish(
+            &harness.publisher,
+            ValidatorStartProgress::CleaningAccounts,
+            None,
+        );
         shared
             .lock()
             .unwrap()
-            .publish(&harness.publisher, ValidatorStartProgress::CleaningAccounts);
-        shared
-            .lock()
-            .unwrap()
-            .publish(&harness.publisher, ValidatorStartProgress::Running);
+            .publish(&harness.publisher, ValidatorStartProgress::Running, None);
 
         let mut collector = harness.collector_with_startup(shared);
         collector.tick();
