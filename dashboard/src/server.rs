@@ -724,7 +724,8 @@ mod tests {
     }
 
     #[test]
-    fn test_an_epoch_the_validator_still_holds_is_answered_with_its_arrays() {
+    fn test_held_epoch_is_answered_with_its_arrays() {
+        // An epoch the validator still holds is answered with its arrays.
         let epochs = RwLock::new(vec![epoch_record(841), epoch_record(842)]);
         let reply = respond(
             br#"{"topic":"epoch","key":"query","id":11,"params":{"epoch":841}}"#,
@@ -739,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn test_an_epoch_older_than_the_validator_kept_is_answered_with_nothing() {
+    fn test_dropped_epoch_is_answered_with_nothing() {
         // Not an error. A validator that has not been up that long has no schedule
         // for it, and the page draws those turns without a leader.
         let epochs = RwLock::new(vec![epoch_record(842)]);
@@ -779,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_validator_that_published_nothing_takes_no_room_in_the_table() {
+    fn test_unnamed_validator_takes_no_room() {
         // Most of a cluster publishes neither a name nor an icon. Carrying them
         // as a key and two nulls each would be most of the table saying nothing.
         use crate::validator_info::ValidatorInfo;
@@ -815,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_range_with_unusable_parameters_is_answered_rather_than_dropped() {
+    fn test_bad_range_parameters_are_answered() {
         // Silence and a slow answer look the same to a client waiting on an id,
         // so every request that parses as one gets something back.
         let reply = respond(
@@ -930,7 +931,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rebinding_defeats_the_origin_check_and_is_caught_by_the_host_check() {
+    fn test_rebinding_is_caught_by_the_host_check() {
+        // Rebinding defeats the origin check and is caught by the host check.
         let rebound = req("Host: rebind.evil:10999\r\nOrigin: http://rebind.evil");
         assert!(
             origin_is_allowed(&rebound),
@@ -948,7 +950,8 @@ mod tests {
     }
 
     #[test]
-    fn test_headers_are_read_case_insensitively_and_stop_at_the_body() {
+    fn test_headers_are_case_insensitive_and_end_at_body() {
+        // Headers are read case insensitively and stop at the body.
         let head = "GET / HTTP/1.1\r\nHOST: x\r\n\r\nHost: injected\r\n";
         assert_eq!(header(head, "host"), Some("x"));
         assert_eq!(header(head, "missing"), None);
@@ -1036,7 +1039,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unrecognised_host_is_turned_away_before_anything_is_served() {
+    async fn test_unrecognised_host_is_turned_away() {
+        // Unrecognised host is turned away before anything is served.
         let reply = request_with_hosts(
             b"GET / HTTP/1.1\r\nHost: rebind.evil\r\n\r\n",
             vec!["dash.example.com".to_string()],
@@ -1191,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hashed_assets_are_cached_forever_and_the_document_never_is() {
+    fn test_only_hashed_assets_are_cached() {
         // Asset filenames carry a content hash; index.html does not, and caching it
         // would hide a redeploy.
         assert!(

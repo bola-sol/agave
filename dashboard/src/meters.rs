@@ -1964,7 +1964,7 @@ mod tests {
     }
 
     #[test]
-    fn test_only_the_ports_counted_in_datagrams_carry_a_received_figure() {
+    fn test_received_figure_only_on_datagram_ports() {
         // The kernel keys drops by port and the validator keys packets by thread
         // name, and only this join knows `shred_fetch_receiver` is the socket gossip
         // advertises as `tvu`.
@@ -2029,7 +2029,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_waterfall_reports_the_window_and_not_the_running_total() {
+    fn test_waterfall_reports_the_window() {
         // The tap's counters only climb; published as they stand they would present
         // every transaction since startup as the last five minutes.
         let harness = fixture();
@@ -2062,7 +2062,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_scheduler_with_no_traffic_reports_nothing_rather_than_noughts() {
+    fn test_idle_scheduler_reports_nothing() {
         // An empty window is a validator nothing was sent, not one throwing
         // everything away.
         let harness = fixture();
@@ -2141,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_bundles_are_summed_over_the_epoch_beside_the_stage_they_annotate() {
+    fn test_bundles_are_summed_over_the_epoch() {
         // Printed on Executed's heading, so they have to cover what Executed covers.
         let mut totals = LeaderTotals::default();
         totals.add(at(842, 10), verified(100), attempted(40), bundled(6, 21));
@@ -2153,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_bundles_start_over_with_the_stage_they_are_printed_against() {
+    fn test_bundles_start_over_with_the_stage() {
         // Reset on the same tick as the stages they annotate.
         let mut totals = LeaderTotals::default();
         totals.add(
@@ -2169,7 +2169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_leader_totals_add_every_sample_of_the_epoch_rather_than_a_window() {
+    fn test_leader_totals_add_the_whole_epoch() {
         // A stage that fires for a few slots every few hours has nothing to say about
         // the last five minutes.
         let mut totals = LeaderTotals::default();
@@ -2226,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_span_says_how_much_of_the_epoch_was_actually_counted() {
+    fn test_span_reports_the_counted_slots() {
         // A validator restarted part way through an epoch has totals honest about a
         // shorter span than the heading.
         let mut totals = LeaderTotals::default();
@@ -2244,7 +2244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_counted_span_never_runs_past_the_epoch_it_is_counted_against() {
+    fn test_counted_span_stays_within_the_epoch() {
         // A bank read can land either side of the one that turned the epoch over.
         let totals = LeaderTotals {
             epoch: Some(842),
@@ -2258,7 +2258,8 @@ mod tests {
     }
 
     #[test]
-    fn test_the_two_leader_stages_are_published_against_the_epoch_they_ran_in() {
+    fn test_leader_stages_carry_their_epoch() {
+        // The two leader stages are published against the epoch they ran in.
         let harness = fixture();
         let mut meters = harness.meters();
         meters.tpu.epoch_now = Some(at(842, 216_000));
@@ -2281,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nothing_is_published_for_a_stage_until_a_bank_has_said_which_epoch() {
+    fn test_leader_stages_wait_for_an_epoch() {
         // A total with no epoch against it cannot be labelled, and one drawn
         // under a heading it was not counted for is worse than none at all.
         let harness = fixture();
@@ -2299,7 +2300,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_epoch_position_is_read_from_the_bank_the_validator_is_building_on() {
+    fn test_epoch_position_comes_from_the_working_bank() {
         // The working bank, not the root: the counters are reported as the work
         // happens.
         let harness = fixture();
@@ -2365,7 +2366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_path_card_where_no_port_has_ever_been_offered_anything() {
+    fn test_no_path_card_before_any_offer() {
         // Also what a validator logging below `solana=info` looks like: the tap sees
         // nothing.
         let harness = fixture();
@@ -2395,7 +2396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_host_whose_sockets_cannot_be_read_is_not_told_its_tpu_moved() {
+    fn test_unreadable_sockets_do_not_say_tpu_moved() {
         // Once the socket table is unreadable every port looks absent, and the honest
         // answer is that we cannot tell.
         let harness = fixture();

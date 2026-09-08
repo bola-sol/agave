@@ -290,7 +290,8 @@ mod tests {
     }
 
     #[test]
-    fn test_every_phase_has_a_name_and_running_is_the_only_running_one() {
+    fn test_every_phase_is_named_and_only_running_runs() {
+        // Every phase has a name and running is the only running one.
         let phases = [
             ValidatorStartProgress::Initializing,
             ValidatorStartProgress::SearchingForRpcService,

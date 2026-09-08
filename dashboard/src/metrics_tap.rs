@@ -1867,7 +1867,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_filled_slot_is_read_as_a_shred_count_and_a_repair_count() {
+    fn test_filled_slot_is_read_as_counts() {
         // Names from `ledger/src/slot_stats.rs`. The last index is the highest
         // shred, so the count is one more.
         let tap = MetricsTap::default();
@@ -2269,7 +2269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_slot_is_read_by_the_same_rule_as_every_other_integer() {
+    fn test_slot_is_read_as_an_integer_field() {
         // `add_field_i64` writes "430789128i", not "430789128". A change upstream
         // fails here rather than quietly emptying the panel.
         let tap = MetricsTap::default();
@@ -2307,7 +2307,7 @@ mod tests {
     }
 
     #[test]
-    fn test_an_idle_scheduler_does_not_empty_a_slot_it_did_not_build() {
+    fn test_idle_scheduler_does_not_empty_a_slot() {
         // Two schedulers report every leader slot, and only the enabled one did the
         // work. Keeping the last to arrive emptied the panel on half of all slots.
         for order in [["10000", "0"], ["0", "10000"]] {
@@ -2690,7 +2690,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_cache_counter_named_differently_from_its_field_still_lands() {
+    fn test_replace_entry_lands_on_replacements() {
         // The point calls it `replace_entry` where the counter is `replacements`.
         let tap = MetricsTap::default();
         tap.observe(&named(
@@ -2753,7 +2753,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_reasons_a_worker_dropped_a_transaction_join_its_counts() {
+    fn test_worker_error_reasons_join_its_counts() {
         // Two points from the same worker on the same tick: what became of the work
         // and why. Read into one set of counters.
         let tap = MetricsTap::default();
@@ -2852,7 +2852,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_xdp_config_is_read_from_the_tags_and_the_fields_alike() {
+    fn test_xdp_config_is_read_from_tags_and_fields() {
         // A tag keeps its value; a string field arrives wrapped in quotes for the line
         // protocol.
         let tap = MetricsTap::default();
@@ -2882,7 +2882,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_missing_zero_copy_tag_reads_as_copy_rather_than_dropping_the_report() {
+    fn test_missing_zero_copy_tag_reads_as_copy() {
         // Everything else on the point is still worth having, and copy is the
         // reading that claims least.
         let mut point = DataPoint::new(XDP_NETWORK_CONFIG);

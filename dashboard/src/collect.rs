@@ -1898,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_rooted_slot_is_not_demoted_when_confirmed_lags_the_root() {
+    fn test_rooted_slot_not_demoted_by_lagging_confirmed() {
         // During startup the commitment cache trails the root bank, so `confirmed`
         // can sit below a rooted slot.
         assert_eq!(level_for(100, 100, 50, 0), SlotLevel::Rooted);
@@ -2051,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_mismatched_stride_publishes_nothing_rather_than_a_wrong_schedule() {
+    fn test_mismatched_stride_publishes_no_schedule() {
         // Asking for the real epoch against the wrong length is the same failure as
         // the schedule's repeat drifting from the constant.
         let harness = fixture();
@@ -2114,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_swapped_identity_rebuilds_the_epoch_rather_than_keeping_the_old_answer() {
+    fn test_swapped_identity_rebuilds_the_epoch() {
         // A validator that boots on a dummy identity and swaps had the dummy's leader
         // slots, none, latched for the epoch while the countdown beside it kept
         // working.
@@ -2580,7 +2580,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_epoch_rate_is_its_own_elapsed_time_over_its_own_slots() {
+    fn test_epoch_rate_is_elapsed_time_over_slots() {
         // Six hours across sixty thousand slots is 360ms a slot.
         let nanos = epoch_anchored_nanos(&clock_at(21_600), 100, 60_100);
         assert_eq!(nanos, Some(360_000_000));
@@ -2606,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn test_an_estimate_that_barely_moved_does_not_move_the_countdown() {
+    fn test_small_drift_does_not_move_the_countdown() {
         // Half a minute either way, on a figure hours out. Following this is
         // what made the readout restless while telling nobody anything.
         let held = at(10_000);
@@ -2736,7 +2736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_stale_tip_below_the_snapshot_does_not_count_as_caught_up() {
+    fn test_stale_tip_is_not_caught_up() {
         // The blockstore keeps optimistic slots from before a restart, so the
         // first tip read is below what replay started from. That stamped catch-up
         // at nought seconds on a node still twenty-five slots behind.
@@ -2779,7 +2779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_marker_is_set_once_and_falling_behind_does_not_move_it() {
+    fn test_marker_is_set_once() {
         // Re-testing the rate continuously and clearing the window fed back on
         // itself: a shorter window trips more easily.
         let mut collector = collector_following(300_000_000, CAUGHT_UP_MIN_SAMPLES as u64);
