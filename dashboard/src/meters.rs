@@ -724,11 +724,11 @@ impl Meters {
         };
         if let Some(working_bank) = working_bank {
             self.throughput.tick(&working_bank, &self.publisher);
-            self.note_epoch(&working_bank);
+            self.tpu.note_epoch(&working_bank);
         }
 
         self.network.tick(&self.publisher);
-        self.collect_xdp();
+        self.tpu.collect_xdp(&self.metrics_tap, &self.publisher);
         // The three readings that walk `/proc` run only while somebody is
         // watching: the thread walk alone is two files per thread every second.
         // The rest is a small file or a set of atomics, and keeps running so the
@@ -736,7 +736,16 @@ impl Meters {
         if self.publisher.subscriber_count() > 0 {
             self.host.tick(&self.ctx, &self.publisher);
             self.threads.tick(&self.publisher);
-            self.collect_ingest_paths();
+            let running = matches!(
+                *self.startup_progress.read().unwrap(),
+                ValidatorStartProgress::Running
+            );
+            self.sockets.tick(
+                &self.ctx,
+                &self.metrics_tap.counters(),
+                running,
+                &self.publisher,
+            );
         }
         self.collect_from_metrics();
     }
@@ -751,27 +760,6 @@ impl Meters {
             .as_nanos() as u64;
         self.publisher
             .publish(TOPIC_SUMMARY, "uptime_nanos", &uptime);
-    }
-
-    fn note_epoch(&mut self, working_bank: &Bank) {
-        self.tpu.note_epoch(working_bank);
-    }
-
-    fn collect_xdp(&mut self) {
-        self.tpu.collect_xdp(&self.metrics_tap, &self.publisher);
-    }
-
-    fn collect_ingest_paths(&mut self) {
-        let running = matches!(
-            *self.startup_progress.read().unwrap(),
-            ValidatorStartProgress::Running
-        );
-        self.sockets.tick(
-            &self.ctx,
-            &self.metrics_tap.counters(),
-            running,
-            &self.publisher,
-        );
     }
 
     /// The readings from the metrics tap, each the difference against the last.
@@ -879,7 +867,13 @@ impl Throughput {
         };
         publisher.publish_ephemeral(TOPIC_SUMMARY, "tps_sample", &sample);
 
-        push_history(&mut self.history, sample, publisher, "tps_history");
+        push_history(
+            &mut self.history,
+            sample,
+            CHART_HISTORY,
+            publisher,
+            "tps_history",
+        );
     }
 }
 
@@ -938,7 +932,13 @@ impl NetworkMeter {
         };
         publisher.publish_ephemeral(TOPIC_SUMMARY, "network_sample", &sample);
 
-        push_history(&mut self.history, sample, publisher, "network_history");
+        push_history(
+            &mut self.history,
+            sample,
+            CHART_HISTORY,
+            publisher,
+            "network_history",
+        );
     }
 }
 
@@ -1098,7 +1098,7 @@ impl ThreadMeter {
             groups: thread_stats::select_rows(groups, &means, THREAD_ROWS),
         };
         publisher.publish_ephemeral(TOPIC_SUMMARY, "threads_sample", &sample);
-        push_history_of(
+        push_history(
             &mut self.history,
             sample,
             THREADS_HISTORY,
@@ -1825,14 +1825,9 @@ fn at_baseline(baseline: Option<&HashMap<u16, u64>>, port: u16) -> u64 {
         .unwrap_or(0)
 }
 
-/// Appends a chart sample and republishes the retained series, which a
-/// connecting client needs whole.
-fn push_history<T: Serialize>(history: &mut Vec<T>, sample: T, publisher: &Publisher, key: &str) {
-    push_history_of(history, sample, CHART_HISTORY, publisher, key);
-}
-
-/// The same, keeping `keep` samples.
-fn push_history_of<T: Serialize>(
+/// Appends a chart sample, keeping `keep` of them, and republishes the retained
+/// series, which a connecting client needs whole.
+fn push_history<T: Serialize>(
     history: &mut Vec<T>,
     sample: T,
     keep: usize,
