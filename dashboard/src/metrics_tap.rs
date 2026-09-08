@@ -7,7 +7,10 @@
 //! points take a lock, and those arrive once per leader slot.
 //!
 //! The points carry deltas, so accumulating them gives totals that only climb
-//! and can be differenced between readings like every other rate here.
+//! and can be differenced between readings like every other rate here. A few
+//! fields are levels instead: how something stands at the instant of the
+//! point. Those are replaced by the latest reading and never summed or
+//! differenced.
 
 use {
     serde::Serialize,
@@ -115,7 +118,6 @@ const COST_TRACKER: &str = "cost_tracker_stats";
 /// The tag saying whether the reporting node produced the block.
 const IS_LEADER: &str = "is_leader";
 
-/// The field naming the slot a point covers.
 const SLOT: &str = "slot";
 
 /// Replayed slots kept, about a minute and a half. Shorter samples missed the
@@ -151,8 +153,8 @@ pub struct AccountsCounters {
     pub stored_accounts: AtomicU64,
     pub stored_bytes: AtomicU64,
 
-    /// Levels, not counts: storage that exists and storage still live. The
-    /// difference is what shrink reclaims.
+    /// Levels: storage that exists and storage still live. The difference is
+    /// what shrink reclaims.
     pub storage_bytes: AtomicU64,
     pub storage_alive_bytes: AtomicU64,
     pub storage_count: AtomicU64,
@@ -253,9 +255,9 @@ pub struct QuicCounters {
     /// Thrown away because that queue had gone.
     pub disconnected: AtomicU64,
 
-    /// Connections open at the moment of the last point. A level.
+    /// Connections open at the moment of the last point.
     pub open: AtomicU64,
-    /// Streams in flight at that same moment. A level.
+    /// Streams in flight at that same moment.
     pub active_streams: AtomicU64,
 }
 
@@ -654,8 +656,8 @@ pub struct QuicTotals {
     pub disconnected: u64,
 }
 
-/// How one QUIC port stands at this instant. Levels, kept apart from the
-/// counters because a window of them can be neither summed nor differenced.
+/// How one QUIC port stands at this instant, kept apart from the counters so
+/// a window cannot sum them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct QuicLevels {
     pub open: u64,
@@ -751,21 +753,19 @@ pub struct TapCounters {
     pub repair_sent_millis: u64,
     pub scheduler: SchedulerTotals,
     pub accounts: AccountsTotals,
-    /// Levels, read as they stand rather than differenced.
+    /// Levels.
     pub accounts_storage_bytes: u64,
     pub accounts_storage_alive_bytes: u64,
     pub accounts_storage_count: u64,
     pub accounts_cache_bytes: u64,
     pub accounts_cache_entries: u64,
     pub program_cache: ProgramCacheTotals,
-    /// Entries loaded when an eviction last ran. A level, so it is read as it
-    /// stands rather than differenced.
+    /// Entries loaded when an eviction last ran. A level.
     pub program_cache_water_level: u64,
     pub quic: QuicTotals,
     pub quic_forwards: QuicTotals,
     pub quic_vote: QuicTotals,
-    /// Levels rather than counts, one set per port, in the same order the
-    /// totals above are named.
+    /// One set of levels per port, in the same order the totals above are named.
     pub quic_levels: QuicLevels,
     pub quic_forwards_levels: QuicLevels,
     pub quic_vote_levels: QuicLevels,
@@ -801,8 +801,7 @@ impl MetricsTap {
     fn observe(&self, point: &DataPoint) {
         match point.name {
             ACCOUNTS_DB_TIMINGS => {
-                // The same point carries the cache's size and entry count,
-                // which are levels rather than counts.
+                // The same point carries the cache's size and entry count, which are levels.
                 self.accounts.add_point(point);
                 for (name, value) in &point.fields {
                     let counter = match *name {
@@ -1371,7 +1370,7 @@ impl QuicCounters {
         }
     }
 
-    /// The two levels, which are read as they stand and never windowed.
+    /// The two levels.
     fn levels(&self) -> QuicLevels {
         QuicLevels {
             open: self.open.load(Ordering::Relaxed),

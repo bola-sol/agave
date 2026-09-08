@@ -35,7 +35,6 @@ use {
     },
 };
 
-/// How often these readings are taken.
 pub const METER_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Samples retained for the transaction and network charts: five minutes at
