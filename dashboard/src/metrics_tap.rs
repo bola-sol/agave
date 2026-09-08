@@ -14,7 +14,7 @@ use {
     solana_clock::Slot,
     solana_metrics::datapoint::DataPoint,
     std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -370,12 +370,14 @@ pub struct MetricsTap {
     /// waterfalls.
     slot_costs: Mutex<VecDeque<SlotCost>>,
 
-    /// The last few hundred replayed slots, kept as arrivals rather than totals
-    /// because the panel wants the worst slot as well as the mean.
-    replay_slots: Mutex<VecDeque<ReplaySlotTimes>>,
+    /// The last few hundred replayed slots, kept one by one rather than as
+    /// totals because the panel wants the worst slot as well as the mean. Keyed
+    /// by slot: the collector asks for one slot at a time, on the thread the
+    /// replay stage also takes this lock from.
+    replay_slots: Mutex<BTreeMap<Slot, ReplaySlotTimes>>,
 
-    /// How each recent slot's shreds arrived, oldest first.
-    shred_fills: Mutex<VecDeque<ShredFill>>,
+    /// How each recent slot's shreds arrived, keyed by slot for the same reason.
+    shred_fills: Mutex<BTreeMap<Slot, ShredFill>>,
 
     /// How the XDP transmit path is configured. Latched: it cannot change while the
     /// process runs, and a config that stops being reported has not been turned
@@ -1009,9 +1011,11 @@ impl MetricsTap {
         let Ok(mut slots) = self.replay_slots.lock() else {
             return;
         };
-        slots.push_back(slot);
+        // A slot replayed twice keeps the later report. Bounded from the lowest
+        // slot, which is the oldest during ordinary running.
+        slots.insert(slot.slot, slot);
         while slots.len() > REPLAY_SLOTS {
-            slots.pop_front();
+            slots.pop_first();
         }
     }
 
@@ -1042,9 +1046,9 @@ impl MetricsTap {
         let Ok(mut fills) = self.shred_fills.lock() else {
             return;
         };
-        fills.push_back(fill);
+        fills.insert(slot, fill);
         while fills.len() > SHRED_FILLS {
-            fills.pop_front();
+            fills.pop_first();
         }
     }
 
@@ -1122,24 +1126,21 @@ impl MetricsTap {
         self.xdp.lock().ok().and_then(|held| held.clone())
     }
 
-    /// The replay record for `slot`, while it is still held. Newest first, in
-    /// case a slot was replayed twice.
+    /// The replay record for `slot`, while it is still held.
     pub fn replayed(&self, slot: Slot) -> Option<ReplaySlotTimes> {
-        let slots = self.replay_slots.lock().ok()?;
-        slots.iter().rev().find(|times| times.slot == slot).copied()
+        self.replay_slots.lock().ok()?.get(&slot).copied()
     }
 
     /// How `slot`'s shreds arrived, while the record is still held.
     pub fn shred_fill(&self, slot: Slot) -> Option<ShredFill> {
-        let fills = self.shred_fills.lock().ok()?;
-        fills.iter().rev().find(|fill| fill.slot == slot).copied()
+        self.shred_fills.lock().ok()?.get(&slot).copied()
     }
 
-    /// The replayed slots held, oldest first.
+    /// The replayed slots held, lowest slot first.
     pub fn replay_slots(&self) -> Vec<ReplaySlotTimes> {
         self.replay_slots
             .lock()
-            .map(|slots| slots.iter().copied().collect())
+            .map(|slots| slots.values().copied().collect())
             .unwrap_or_default()
     }
 
@@ -2233,13 +2234,16 @@ mod tests {
     #[test]
     fn test_only_the_newest_replayed_slots_are_kept() {
         let tap = MetricsTap::default();
-        for micros in 0..REPLAY_SLOTS.saturating_add(10) {
-            tap.observe(&replay_point(&[("execute_us", &format!("{micros}i"))]));
+        for slot in 0..REPLAY_SLOTS.saturating_add(10) {
+            tap.observe(&replay_point(&[
+                ("slot", &format!("{slot}i")),
+                ("execute_us", &format!("{slot}i")),
+            ]));
         }
 
         let held = tap.replay_slots();
         assert_eq!(held.len(), REPLAY_SLOTS);
-        assert_eq!(held[0].execute, 10, "oldest first, the first ten dropped");
+        assert_eq!(held[0].execute, 10, "lowest first, the first ten dropped");
     }
 
     #[test]
