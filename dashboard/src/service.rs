@@ -9,7 +9,7 @@
 
 use {
     crate::{
-        collect::{Collector, EpochInfo, system_time_nanos},
+        collect::{Collector, CollectorShared, EpochInfo, system_time_nanos},
         config::DashboardConfig,
         context::{DashboardContext, StartProgress},
         history::{PACKED_SLOTS, SlotHistory},
@@ -244,8 +244,7 @@ impl DashboardService {
             thread::Builder::new()
                 .name("solDashColl".to_string())
                 .spawn(move || {
-                    let mut collector = Collector::new(
-                        context,
+                    let shared = CollectorShared {
                         publisher,
                         info_cache,
                         history,
@@ -253,9 +252,8 @@ impl DashboardService {
                         startup_progress,
                         startup,
                         metrics_tap,
-                        tips,
-                        commission_bps,
-                    );
+                    };
+                    let mut collector = Collector::new(context, shared, tips, commission_bps);
                     collector.publish_static();
                     while !exit.load(Ordering::Relaxed) {
                         collector.tick();

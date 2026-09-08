@@ -336,22 +336,34 @@ pub struct Collector {
     tips_residual: Option<u64>,
 }
 
+/// The handles the service holds and the collector reads or writes through.
+/// The server reads most of them too, which is why they live on the service.
+pub struct CollectorShared {
+    pub publisher: Arc<Publisher>,
+    pub info_cache: Arc<RwLock<ValidatorInfoCache>>,
+    pub history: Arc<RwLock<SlotHistory>>,
+    pub epochs: Arc<RwLock<Vec<EpochInfo>>>,
+    pub startup_progress: StartProgress,
+    pub startup: Arc<Mutex<StartupPublisher>>,
+    pub metrics_tap: Arc<MetricsTap>,
+}
+
 impl Collector {
-    /// Every argument is a handle the service already holds, passed once at
-    /// attach; a struct to carry them would exist for this call alone.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: DashboardContext,
-        publisher: Arc<Publisher>,
-        info_cache: Arc<RwLock<ValidatorInfoCache>>,
-        history: Arc<RwLock<SlotHistory>>,
-        epochs: Arc<RwLock<Vec<EpochInfo>>>,
-        startup_progress: StartProgress,
-        startup: Arc<Mutex<StartupPublisher>>,
-        metrics_tap: Arc<MetricsTap>,
+        shared: CollectorShared,
         tips: Option<TipMeter>,
         commission_bps: Option<u16>,
     ) -> Self {
+        let CollectorShared {
+            publisher,
+            info_cache,
+            history,
+            epochs,
+            startup_progress,
+            startup,
+            metrics_tap,
+        } = shared;
         let now = Instant::now();
         Self {
             slots: SlotRing::new(SLOT_HISTORY),
