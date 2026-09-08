@@ -52,11 +52,13 @@ export function StartupPhases({ startup }: { startup: StartupProgress }) {
   // Replay measures itself in slots; the supermajority wait measures itself in
   // stake. They are different things and the bar means something different
   // under each, so which one is showing is said rather than left to be assumed.
+  // The stake share arrives as a whole percent, the validator having truncated
+  // it, so it is drawn without a decimal the figure does not have.
   const measured =
     startup.phase === "waiting_for_supermajority" && startup.stake_percent !== null
-      ? { fraction: startup.stake_percent, label: "of stake visible in gossip" }
+      ? { fraction: startup.stake_percent, label: "of stake visible in gossip", decimals: 0 }
       : startup.fraction !== null && startup.fraction !== undefined
-        ? { fraction: startup.fraction, label: "of the ledger replayed" }
+        ? { fraction: startup.fraction, label: "of the ledger replayed", decimals: 1 }
         : null;
 
   return (
@@ -90,7 +92,7 @@ export function StartupPhases({ startup }: { startup: StartupProgress }) {
         <div className="startup-measure">
           <Meter fraction={measured.fraction} />
           <div className="startup-measure-label">
-            <span className="startup-measure-value">{percent(measured.fraction, 1)}</span>{" "}
+            <span className="startup-measure-value">{percent(measured.fraction, measured.decimals)}</span>{" "}
             {measured.label}
           </div>
         </div>
