@@ -25,7 +25,7 @@ use {
             Semaphore,
             broadcast::error::{RecvError, TryRecvError},
         },
-        time::{Duration, timeout},
+        time::{Duration, sleep, timeout},
     },
     tokio_util::compat::TokioAsyncReadCompatExt,
 };
@@ -145,16 +145,19 @@ async fn handle(
     limits: Limits,
     allowed_hosts: &[String],
 ) -> Result<(), ConnectionError> {
+    // Taken before the head is read. A connection over the cap is closed
+    // without reading it, so a flood cannot hold a task and a buffer each for
+    // the ten seconds a head is waited for. Only a connection under the cap
+    // is answered with a reason.
+    let Ok(_connection) = limits.connections.try_acquire_owned() else {
+        log::info!("dashboard: refusing a connection, {MAX_CONNECTIONS} already being served");
+        socket.shutdown().await?;
+        return Ok(());
+    };
+
     let (head, head_len) = timeout(REQUEST_TIMEOUT, peek_request_head(&socket))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request head"))??;
-
-    // Taken after the head is read, so a refusal can drain and answer rather than
-    // closing on unread bytes and sending a reset.
-    let Ok(_connection) = limits.connections.try_acquire_owned() else {
-        log::info!("dashboard: refusing a connection, {MAX_CONNECTIONS} already being served");
-        return refuse(socket, head_len, 503, b"too many dashboard connections").await;
-    };
 
     // Checked before anything is served: a page served to a rebound name would be
     // same-origin with the dashboard.
@@ -215,11 +218,18 @@ async fn refuse(
     Ok(())
 }
 
+/// How long to wait for more of a head that has stopped arriving. `peek`
+/// leaves the bytes in the socket, so its readiness never clears and
+/// `readable` returns at once; without a pause the loop would spin until the
+/// timeout.
+const HEAD_POLL: Duration = Duration::from_millis(20);
+
 /// Reads the request head without consuming it, so a websocket connection can
 /// still be handed to soketto. Returns the head and its exact length, which the
 /// HTTP path drains.
 async fn peek_request_head(socket: &TcpStream) -> io::Result<(String, usize)> {
     let mut buffer = vec![0u8; MAX_REQUEST_HEAD];
+    let mut last_peeked = 0;
     loop {
         socket.readable().await?;
         let peeked = match socket.peek(&mut buffer).await {
@@ -228,6 +238,11 @@ async fn peek_request_head(socket: &TcpStream) -> io::Result<(String, usize)> {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
             Err(err) => return Err(err),
         };
+        if peeked == last_peeked {
+            sleep(HEAD_POLL).await;
+            continue;
+        }
+        last_peeked = peeked;
         // `from_utf8_lossy` can change the byte count, so the length comes from
         // what was actually peeked rather than from the string.
         let head = String::from_utf8_lossy(&buffer[..peeked]);
@@ -1107,22 +1122,19 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(request).await.unwrap();
         let mut reply = String::new();
-        client.read_to_string(&mut reply).await.unwrap();
+        // Closed unread, the connection can end in a reset, which counts as
+        // nothing read.
+        let _ = client.read_to_string(&mut reply).await;
         server.await.unwrap().unwrap();
         reply
     }
 
     #[tokio::test]
-    async fn test_full_connection_cap_refuses_rather_than_serving() {
-        // A refusal has to arrive as a complete response, not a reset, or the caller
-        // cannot tell an overloaded dashboard from a broken one.
+    async fn test_full_connection_cap_closes_without_reading() {
+        // Over the cap the request is never read: reading it is the cost the
+        // cap exists to bound.
         let reply = request_with_no_connections_left(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        assert!(
-            reply.starts_with("HTTP/1.1 503 Service Unavailable"),
-            "expected a refusal, got {:?}",
-            &reply[..reply.len().min(80)]
-        );
-        assert!(reply.contains("too many dashboard connections"));
+        assert!(reply.is_empty(), "expected a closed socket, got {reply:?}");
     }
 
     #[tokio::test]
@@ -1133,9 +1145,23 @@ mod tests {
             b"GET /websocket HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n",
         )
         .await;
+        assert!(reply.is_empty(), "expected a closed socket, got {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_head_arriving_in_two_pieces_is_still_served() {
+        // The peek loop waits for the rest rather than spinning on what it has.
+        let (addr, server) = serve_one(Arc::new(Publisher::new())).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHo").await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        client.write_all(b"st: x\r\n\r\n").await.unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        server.await.unwrap().unwrap();
         assert!(
-            reply.starts_with("HTTP/1.1 503"),
-            "expected a refusal, got {:?}",
+            reply.starts_with("HTTP/1.1 200 OK"),
+            "expected the page, got {:?}",
             &reply[..reply.len().min(80)]
         );
     }

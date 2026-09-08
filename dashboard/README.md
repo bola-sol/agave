@@ -50,7 +50,8 @@ the domain in the site block is the name to allow, and nothing else is needed.
   same-origin policy, so without this any page open in a viewer's browser could
   connect to a dashboard that viewer can reach.
 - **Caps connections** at 256 being served at once, and websockets at 64 of
-  those. A refused request gets a 503 rather than a dropped socket.
+  those. A connection over the cap is closed without being read; a websocket
+  over its own cap gets a 503.
 - **Sends a content security policy** that permits no external code, styles,
   fonts or connections. Images are the one exception, because validator icons
   come from URLs operators publish on chain, and those are limited to `https`.
