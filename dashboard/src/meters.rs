@@ -2306,7 +2306,7 @@ mod tests {
         let harness = fixture();
         let mut meters = harness.meters();
         let bank = harness.advance_to(64);
-        meters.note_epoch(&bank);
+        meters.tpu.note_epoch(&bank);
 
         let position = meters.tpu.epoch_now.unwrap();
         assert_eq!(position.slot, 64);
@@ -2320,7 +2320,9 @@ mod tests {
         // reported no config apart from one whose config has not arrived yet.
         let harness = fixture();
         let mut meters = harness.meters();
-        meters.collect_xdp();
+        meters
+            .tpu
+            .collect_xdp(&meters.metrics_tap, &meters.publisher);
 
         let published = harness.published_key("summary", "xdp").unwrap();
         assert!(published.contains(r#""value":null"#), "{published}");
@@ -2337,7 +2339,9 @@ mod tests {
         point.add_tag("zero_copy", "true");
         point.add_field_str("model", "Ethernet Controller E810-C for QSFP");
         meters.metrics_tap.observe_point(&point);
-        meters.collect_xdp();
+        meters
+            .tpu
+            .collect_xdp(&meters.metrics_tap, &meters.publisher);
 
         let published = harness.published_key("summary", "xdp").unwrap();
         assert!(published.contains(r#""zero_copy":true"#), "{published}");
