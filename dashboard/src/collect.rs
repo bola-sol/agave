@@ -20,6 +20,7 @@ use {
     },
     serde::Serialize,
     solana_clock::{Clock, Epoch, Slot},
+    solana_gossip::contact_info::ContactInfo,
     solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
@@ -496,13 +497,16 @@ impl Collector {
         if subscribers > 0 && now.duration_since(self.last_slow_tick) >= SLOW_TICK {
             self.last_slow_tick = now;
             self.collect_validator_info(&frozen);
-            self.collect_peers(&working_bank);
+            // One snapshot for both walks below: it clones the whole table under
+            // the gossip lock.
+            let peers = self.ctx.cluster_info.all_peers();
+            self.collect_peers(&working_bank, &peers);
             self.collect_health();
             self.collect_skip_rate(&root_bank);
             // Ahead of the peer table, which covers the leaders of both the
             // slots already sent and the ones about to be.
             let ahead = self.collect_upcoming(&root_bank, highest_slot);
-            self.collect_peer_table(&working_bank, ahead);
+            self.collect_peer_table(&working_bank, ahead, &peers);
             self.report_tip_residual();
         }
     }
@@ -786,7 +790,12 @@ impl Collector {
     /// Publishes stake, client version and address for the leaders on screen, and
     /// no more: a table of every node would be the largest message the dashboard
     /// sends. Sorted by identity so the debounce has a stable value.
-    fn collect_peer_table(&mut self, bank: &Bank, mut leaders: HashSet<String>) {
+    fn collect_peer_table(
+        &mut self,
+        bank: &Bank,
+        mut leaders: HashSet<String>,
+        peers: &[(ContactInfo, u64)],
+    ) {
         // The leaders of the window a client holds, from the schedule: a leader takes
         // four slots at a time, so a quarter as many lookups as slots.
         let highest = self.last_completed_slot;
@@ -817,7 +826,7 @@ impl Collector {
         }
 
         let mut gossip: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-        for (contact_info, _) in self.ctx.cluster_info.all_peers() {
+        for (contact_info, _) in peers {
             let identity = contact_info.pubkey().to_string();
             if !leaders.contains(&identity) {
                 continue;
@@ -1367,17 +1376,14 @@ impl Collector {
     /// Counts the cluster: who holds stake, who is behind, and what they run.
     /// Accumulated straight into the counters rather than building a record per
     /// validator first.
-    fn collect_peers(&mut self, bank: &Bank) {
+    fn collect_peers(&mut self, bank: &Bank, peers: &[(ContactInfo, u64)]) {
         let vote_accounts = bank.vote_accounts();
         let tip = bank.slot();
 
         // Gossip reports a client version; vote accounts report stake. A
         // validator can appear in one and not the other, so both are walked.
-        let versions: HashMap<Pubkey, String> = self
-            .ctx
-            .cluster_info
-            .all_peers()
-            .into_iter()
+        let versions: HashMap<Pubkey, String> = peers
+            .iter()
             .map(|(contact_info, _)| (*contact_info.pubkey(), contact_info.version().to_string()))
             .collect();
 
