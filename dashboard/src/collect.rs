@@ -466,12 +466,15 @@ impl Collector {
             .unwrap_or_default();
 
         self.collect_slot_positions(&root_bank, highest_slot, completed);
-        self.mark_caught_cluster();
+        // Read once: before Alpenglow it opens a blockstore iterator, and two
+        // readers want it every tick.
+        let cluster_tip = self.ctx.cluster_tip();
+        self.mark_caught_cluster(cluster_tip);
         self.collect_leaders(&root_bank, highest_slot);
         self.collect_slot_levels(&root_bank, &frozen);
         // From the working bank: the root trails the tip by the thirty-two slots it
         // takes to root.
-        self.collect_identity_and_vote(&working_bank);
+        self.collect_identity_and_vote(&working_bank, cluster_tip);
         self.collect_epoch(&working_bank);
         self.collect_startup_progress();
 
@@ -1028,7 +1031,7 @@ impl Collector {
 
     // ---- identity, vote account, stake ----------------------------------
 
-    fn collect_identity_and_vote(&mut self, bank: &Bank) {
+    fn collect_identity_and_vote(&mut self, bank: &Bank, cluster_tip: Option<Slot>) {
         let identity = self.ctx.identity();
         self.debounces.identity_key.publish(
             &self.publisher,
@@ -1125,10 +1128,7 @@ impl Collector {
         // hundreds of slots back votes promptly on a stale tip and passes every other
         // check. `collect_slot_positions` ran earlier this tick, so the completed slot
         // is current.
-        let behind_cluster = self
-            .ctx
-            .cluster_tip()
-            .map(|tip| tip.saturating_sub(self.last_completed_slot));
+        let behind_cluster = cluster_tip.map(|tip| tip.saturating_sub(self.last_completed_slot));
         self.debounces.behind_cluster.publish(
             &self.publisher,
             TOPIC_SUMMARY,
@@ -1467,11 +1467,11 @@ impl Collector {
     /// Stamps, once, the moment replay draws level with a cluster tip it was
     /// seen trailing: caught up as an operator means it. On the fast path, since
     /// the health figures only run while someone is watching.
-    fn mark_caught_cluster(&mut self) {
+    fn mark_caught_cluster(&mut self, cluster_tip: Option<Slot>) {
         if self.caught_cluster {
             return;
         }
-        let Some(tip) = self.ctx.cluster_tip() else {
+        let Some(tip) = cluster_tip else {
             return;
         };
         if tip > self.last_completed_slot {
