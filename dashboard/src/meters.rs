@@ -2387,6 +2387,8 @@ mod tests {
         // finds no port here and the listener reports next to nothing.
         let harness = fixture();
         let mut meters = harness.meters();
+        // The table has been read and holds no TPU port.
+        meters.sockets.sampled = true;
         let used = quic_tap(1);
         meters.collect_waterfall(&used, &used);
         let published = harness.published_key("summary", "quic_paths").unwrap();
@@ -2406,6 +2408,19 @@ mod tests {
         let harness = fixture();
         let mut meters = harness.meters();
         meters.sockets.unavailable = true;
+        let used = quic_tap(1);
+        meters.collect_waterfall(&used, &used);
+
+        let published = harness.published_key("summary", "quic_paths").unwrap();
+        assert!(published.contains(r#""tpu_offhost":false"#), "{published}");
+    }
+
+    #[test]
+    fn test_an_unread_socket_table_does_not_say_tpu_moved() {
+        // The socket meter waits for a viewer, so the table can be empty because
+        // it has never been read, which says nothing about where the port is.
+        let harness = fixture();
+        let mut meters = harness.meters();
         let used = quic_tap(1);
         meters.collect_waterfall(&used, &used);
 
