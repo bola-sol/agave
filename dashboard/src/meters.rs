@@ -729,9 +729,15 @@ impl Meters {
 
         self.network.tick(&self.publisher);
         self.collect_xdp();
-        self.host.tick(&self.ctx, &self.publisher);
-        self.threads.tick(&self.publisher);
-        self.collect_ingest_paths();
+        // The three readings that walk `/proc` run only while somebody is
+        // watching: the thread walk alone is two files per thread every second.
+        // The rest is a small file or a set of atomics, and keeps running so the
+        // charts are whole when a viewer connects.
+        if self.publisher.subscriber_count() > 0 {
+            self.host.tick(&self.ctx, &self.publisher);
+            self.threads.tick(&self.publisher);
+            self.collect_ingest_paths();
+        }
         self.collect_from_metrics();
     }
 
@@ -786,10 +792,11 @@ impl Meters {
 
     fn collect_waterfall(&mut self, previous: &TapCounters, current: &TapCounters) {
         // Whether the advertised TPU port is bound here: a port missing from the
-        // kernel's table is one this host is not listening on. Only answerable while
-        // that table can be read.
-        let tpu_offhost =
-            !self.sockets.unavailable && !self.sockets.kernel_drops.contains_key("tpu");
+        // kernel's table is one this host is not listening on. Only answerable once
+        // that table has been read, and while it can be.
+        let tpu_offhost = self.sockets.sampled
+            && !self.sockets.unavailable
+            && !self.sockets.kernel_drops.contains_key("tpu");
         self.tpu.tick(
             &self.metrics_tap,
             previous,
@@ -1129,6 +1136,10 @@ struct SocketMeter {
     /// Set once `/proc/net/udp` proves unreadable. It fails independently of
     /// the other `/proc` files: a container can expose one and not another.
     unavailable: bool,
+    /// Set once the table has been read at all. This meter only runs while
+    /// somebody is watching, and an empty table before the first read must
+    /// not say the TPU port is bound elsewhere.
+    sampled: bool,
     published: Debounced<IngestSummary>,
 }
 
@@ -1143,6 +1154,7 @@ impl SocketMeter {
             received_baseline: None,
             known_sockets: HashMap::new(),
             unavailable: false,
+            sampled: false,
             published: Debounced::default(),
         }
     }
@@ -1168,6 +1180,7 @@ impl SocketMeter {
                 return;
             }
         };
+        self.sampled = true;
         let now = Instant::now();
         let ports = ingest_ports(ctx, tap);
 
@@ -2433,6 +2446,7 @@ mod tests {
     fn test_the_threads_are_published_from_the_second_tick() {
         // The first reading is the baseline; the panel wants a difference.
         let harness = fixture();
+        let _viewer = harness.publisher.subscribe();
         let mut meters = harness.meters();
         meters.tick();
         assert!(
@@ -2557,6 +2571,35 @@ mod tests {
         assert!(
             harness.published_key("summary", "estimated_tps").is_none(),
             "replay throughput was reported as cluster throughput"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_the_proc_walks_wait_for_a_viewer() {
+        // Two files per thread every second, with nobody to show them to.
+        let harness = fixture();
+        let mut meters = harness.meters();
+        meters.tick();
+        sleep(Duration::from_millis(20));
+        meters.tick();
+        assert!(
+            harness
+                .published_key("summary", "threads_history")
+                .is_none(),
+            "the thread walk ran with nobody watching"
+        );
+
+        // Holding a receiver is what counts as a viewer.
+        let _viewer = harness.publisher.subscribe();
+        meters.tick();
+        sleep(Duration::from_millis(20));
+        meters.tick();
+        assert!(
+            harness
+                .published_key("summary", "threads_history")
+                .is_some(),
+            "a viewer attached and the thread walk still did not run"
         );
     }
 }
