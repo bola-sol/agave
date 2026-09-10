@@ -47,11 +47,9 @@ export function leaderAt(epoch: EpochInfo | undefined, slot: number): string | n
 }
 
 /**
- * Which epoch a slot fell in, from the current epoch's position and length.
- *
- * Arithmetic rather than a request: every epoch has had the same length since
- * warmup ended, so a slot below the current start is a whole number of epochs
- * back. Null with no epoch to count from, or for a slot before the chain.
+ * Which epoch a slot fell in, counted from the current epoch's start at its
+ * length, which has been constant since warmup. Null without an epoch to
+ * count from.
  */
 export function epochOf(epoch: EpochInfo | undefined, slot: number): number | null {
   if (!epoch || epoch.slots_in_epoch <= 0) return null;

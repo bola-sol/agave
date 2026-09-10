@@ -69,11 +69,8 @@ export function SlotDetailsPage() {
   const toggle = (key: SortKey) =>
     setSort(sort?.key === key ? { key, dir: sort.dir === "desc" ? "asc" : "desc" } : { key, dir: "desc" });
 
-  // Which epoch each block fell in. A divider is drawn where the list steps
-  // from one epoch into the next, and only in the newest-first order, where
-  // that step is one place: sorted by a column the epochs interleave. Nothing
-  // is drawn while every block held is from the same epoch, which is most of
-  // the time.
+  // Dividers only in the newest-first order, where an epoch boundary is one
+  // place, and only when the blocks held span more than one epoch.
   const epoch = store.get<EpochInfo>("epoch", "new");
   const numbered = listed.map((block) => ({ block, epoch: epochOf(epoch, block.slot) }));
   const divided = !sort && new Set(numbered.map((entry) => entry.epoch)).size > 1;
