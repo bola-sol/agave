@@ -46,6 +46,19 @@ export function leaderAt(epoch: EpochInfo | undefined, slot: number): string | n
   return epoch.leaders[index] ?? null;
 }
 
+/**
+ * Which epoch a slot fell in, from the current epoch's position and length.
+ *
+ * Arithmetic rather than a request: every epoch has had the same length since
+ * warmup ended, so a slot below the current start is a whole number of epochs
+ * back. Null with no epoch to count from, or for a slot before the chain.
+ */
+export function epochOf(epoch: EpochInfo | undefined, slot: number): number | null {
+  if (!epoch || epoch.slots_in_epoch <= 0) return null;
+  const at = epoch.epoch + Math.floor((slot - epoch.start_slot) / epoch.slots_in_epoch);
+  return at < 0 ? null : at;
+}
+
 /** One slot of a turn: what replay found, or nothing yet. */
 export interface TurnSlot {
   slot: number;

@@ -1,9 +1,10 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { Fragment, useMemo, useState, type ReactNode } from "react";
 import { blockStamp, blockTime, bytes, count, percent, sol, units } from "../format";
 import { recurrence } from "../cost";
 import { blockAverages, sortBlocks, type SortDir, type SortKey } from "../produced";
+import { epochOf } from "../schedule";
 import { jitoShare, ourShare } from "../tips";
-import type { ProducedBlock, SlotCost, SlotWaterfall, TipRates } from "../types";
+import type { EpochInfo, ProducedBlock, SlotCost, SlotWaterfall, TipRates } from "../types";
 import { useStore } from "../useStore";
 import {
   bundlesValue,
@@ -68,21 +69,35 @@ export function SlotDetailsPage() {
   const toggle = (key: SortKey) =>
     setSort(sort?.key === key ? { key, dir: sort.dir === "desc" ? "asc" : "desc" } : { key, dir: "desc" });
 
+  // Which epoch each block fell in. A divider is drawn where the list steps
+  // from one epoch into the next, and only in the newest-first order, where
+  // that step is one place: sorted by a column the epochs interleave. Nothing
+  // is drawn while every block held is from the same epoch, which is most of
+  // the time.
+  const epoch = store.get<EpochInfo>("epoch", "new");
+  const numbered = listed.map((block) => ({ block, epoch: epochOf(epoch, block.slot) }));
+  const divided = !sort && new Set(numbered.map((entry) => entry.epoch)).size > 1;
+
   return (
     <section className="slot-details">
       <div className="produced">
         <AveragesRow blocks={blocks} sort={sort} onSort={toggle} onClear={() => setSort(null)} />
-        {listed.map((block) => (
-          <BlockRow
-            key={block.slot}
-            block={block}
-            waterfall={bySlot.get(block.slot)}
-            cost={costBySlot.get(block.slot)}
-            costs={costs ?? []}
-            rates={rates}
-            open={open === block.slot}
-            onToggle={() => setOpen(open === block.slot ? null : block.slot)}
-          />
+        {numbered.map(({ block, epoch: at }, index) => (
+          <Fragment key={block.slot}>
+            {divided && at !== null && at !== numbered[index - 1]?.epoch && (
+              <div className="produced-epoch">epoch {count(at)}</div>
+            )}
+            <BlockRow
+              block={block}
+              epoch={at}
+              waterfall={bySlot.get(block.slot)}
+              cost={costBySlot.get(block.slot)}
+              costs={costs ?? []}
+              rates={rates}
+              open={open === block.slot}
+              onToggle={() => setOpen(open === block.slot ? null : block.slot)}
+            />
+          </Fragment>
         ))}
       </div>
       <div className="card-footnote">
@@ -206,6 +221,7 @@ function AveragesRow({
  */
 function BlockRow({
   block,
+  epoch,
   waterfall,
   cost,
   costs,
@@ -214,6 +230,8 @@ function BlockRow({
   onToggle,
 }: {
   block: ProducedBlock;
+  /** The epoch the slot fell in, or null before the epoch message has arrived. */
+  epoch: number | null;
   waterfall: SlotWaterfall | undefined;
   cost: SlotCost | undefined;
   /** Every produced block's cost, for reading this one against the rest. */
@@ -272,6 +290,7 @@ function BlockRow({
               className="produced-foot-slot"
             />
             <span className="produced-time">{blockTime(block.slot_time_millis)}</span>
+            {epoch !== null && <span className="produced-time">epoch {count(epoch)}</span>}
             {/* The blockhash, which is the hash of the block's last entry and
                 not a transaction signature. Copyable because reading forty-four
                 base58 characters off a screen is nobody's idea of a good time. */}
