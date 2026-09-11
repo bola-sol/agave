@@ -35,6 +35,10 @@ const MAX_DELINQUENT_SLOT_DISTANCE: u64 = 128;
 /// are taken, regardless of the poll interval.
 const SLOW_TICK: Duration = Duration::from_secs(5);
 
+/// How often the retained slot overview is re-encoded while slots change. Only
+/// a connecting client reads it, and it is a few hundred kilobytes.
+const OVERVIEW_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Slots to include in the strip and sidebar snapshot sent on connect.
 const SLOT_OVERVIEW_LEN: usize = 512;
 
@@ -321,6 +325,10 @@ pub struct Collector {
     /// The meter's last reported residual, so a change is logged once rather
     /// than every slow tick.
     tips_residual: Option<u64>,
+    /// Whether a slot has changed since the overview was last encoded, and when
+    /// that was.
+    overview_dirty: bool,
+    overview_retained_at: Instant,
 }
 
 /// The handles the service holds and the collector reads or writes through.
@@ -392,6 +400,8 @@ impl Collector {
             tips,
             commission_bps,
             tips_residual: None,
+            overview_dirty: false,
+            overview_retained_at: now.checked_sub(OVERVIEW_INTERVAL).unwrap_or(now),
         }
     }
 
@@ -508,6 +518,15 @@ impl Collector {
             let ahead = self.collect_upcoming(&root_bank, highest_slot);
             self.collect_peer_table(&working_bank, ahead, &peers);
             self.report_tip_residual();
+        }
+
+        // Encoded on a timer rather than per change: live clients follow the
+        // updates above, and only a connecting one reads this.
+        if self.overview_dirty && now.duration_since(self.overview_retained_at) >= OVERVIEW_INTERVAL
+        {
+            self.retain_slot_overview();
+            self.overview_dirty = false;
+            self.overview_retained_at = now;
         }
     }
 
@@ -967,9 +986,6 @@ impl Collector {
         for entry in &changed {
             self.publish_slot(entry);
         }
-        if !changed.is_empty() {
-            self.retain_slot_overview();
-        }
         // The bundle stage reports a slot a moment after its bank freezes, so a
         // block captured without its bundles is filled in on a later tick.
         let tap = &self.metrics_tap;
@@ -1012,6 +1028,7 @@ impl Collector {
         self.history.write().unwrap().record(entry);
         self.publisher
             .publish_ephemeral(TOPIC_SLOT, "update", entry);
+        self.overview_dirty = true;
     }
 
     /// Refreshes the snapshot a newly connected client receives, without
@@ -2816,5 +2833,28 @@ mod tests {
         assert_eq!(release_of(""), "");
         assert_eq!(release_of("unknown"), "unknown");
         assert_eq!(release_of("-leading"), "");
+    }
+
+    #[test]
+    fn test_the_overview_is_encoded_once_a_second() {
+        // The first tick encodes at once; a change inside the interval waits.
+        let harness = fixture();
+        let mut collector = harness.collector();
+        harness.advance_to(8);
+        collector.tick();
+        let first = harness.published_key("slot", "overview").unwrap();
+        assert!(first.contains(r#""slot":8"#), "{first}");
+
+        harness.advance_to(9);
+        collector.tick();
+        let held = harness.published_key("slot", "overview").unwrap();
+        assert!(!held.contains(r#""slot":9"#), "encoded inside the interval");
+        assert!(collector.overview_dirty);
+
+        collector.overview_retained_at = Instant::now().checked_sub(OVERVIEW_INTERVAL).unwrap();
+        collector.tick();
+        let refreshed = harness.published_key("slot", "overview").unwrap();
+        assert!(refreshed.contains(r#""slot":9"#), "{refreshed}");
+        assert!(!collector.overview_dirty);
     }
 }
