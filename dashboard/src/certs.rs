@@ -109,12 +109,9 @@ fn read_block(blockstore: &Blockstore, slot: Slot, root: Slot) -> Block {
         .into_iter()
         .rev()
         .find_map(|component| match component {
-            BlockComponent::BlockMarker(VersionedBlockMarker::V1(marker)) => {
-                match marker.as_block_footer() {
-                    Some(VersionedBlockFooter::V1(footer)) => Some(footer.clone()),
-                    None => None,
-                }
-            }
+            BlockComponent::BlockMarker(VersionedBlockMarker::V1(marker)) => marker
+                .as_block_footer()
+                .map(|VersionedBlockFooter::V1(footer)| footer.clone()),
             BlockComponent::EntryBatch(_) => None,
         })
         .map_or(Block::Opaque, |footer| Block::Footer(Box::new(footer)))
