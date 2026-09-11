@@ -2,7 +2,9 @@
 //! certificates alpenglow leaders write into their block footers.
 
 use {
-    agave_votor_messages::reward_certificate::NUM_SLOTS_FOR_REWARD,
+    agave_votor_messages::reward_certificate::{
+        NUM_SLOTS_FOR_REWARD, NotarRewardCertificate, SkipRewardCertificate,
+    },
     serde::Serialize,
     solana_clock::Slot,
     solana_entry::block_component::{
@@ -70,7 +72,11 @@ pub fn walk(
         };
         match read_block(blockstore, slot, root) {
             Block::Footer(footer) => {
-                if let Some(reward) = reward_of(&footer, rank, len) {
+                let (notar, skip) = (
+                    footer.notar_reward_cert.as_ref(),
+                    footer.skip_reward_cert.as_ref(),
+                );
+                if let Some(reward) = reward_of(notar, skip, rank, len) {
                     marks.push(Mark {
                         slot: reward_slot,
                         reward,
@@ -124,26 +130,22 @@ fn read_block(blockstore: &Blockstore, slot: Slot, root: Slot) -> Block {
         .map_or(Block::Opaque, |footer| Block::Footer(Box::new(footer)))
 }
 
-/// What the footer's reward certificates say about `rank`. A footer with
-/// neither certificate paid nobody. `None` where a bitmap could not be read.
-fn reward_of(footer: &BlockFooterV1, rank: usize, len: usize) -> Option<Reward> {
-    let in_notar = footer
-        .notar_reward_cert
-        .as_ref()
-        .map_or(Some(false), |cert| includes(cert.bitmap(), rank, len));
-    let in_skip = footer
-        .skip_reward_cert
-        .as_ref()
-        .map_or(Some(false), |cert| includes(cert.to_bitmap(), rank, len));
+/// What a footer's reward certificates say about `rank`. Neither certificate
+/// means nobody was paid. `None` where a bitmap could not be read.
+fn reward_of(
+    notar: Option<&NotarRewardCertificate>,
+    skip: Option<&SkipRewardCertificate>,
+    rank: usize,
+    len: usize,
+) -> Option<Reward> {
+    let in_notar = notar.map_or(Some(false), |cert| includes(cert.bitmap(), rank, len));
+    let in_skip = skip.map_or(Some(false), |cert| includes(cert.to_bitmap(), rank, len));
     match (in_notar, in_skip) {
         (Some(true), _) | (_, Some(true)) => Some(Reward::Paid),
-        (Some(false), Some(false)) => {
-            if footer.notar_reward_cert.is_none() && footer.skip_reward_cert.is_none() {
-                Some(Reward::NoCertificate)
-            } else {
-                Some(Reward::Unpaid)
-            }
+        (Some(false), Some(false)) if notar.is_none() && skip.is_none() => {
+            Some(Reward::NoCertificate)
         }
+        (Some(false), Some(false)) => Some(Reward::Unpaid),
         _ => None,
     }
 }
@@ -196,14 +198,6 @@ mod tests {
 
     #[test]
     fn test_a_footer_with_no_reward_certificate_paid_nobody() {
-        let footer = BlockFooterV1 {
-            bank_hash: Default::default(),
-            block_producer_time_nanos: 0,
-            block_user_agent: Vec::new(),
-            block_final_cert: None,
-            skip_reward_cert: None,
-            notar_reward_cert: None,
-        };
-        assert_eq!(reward_of(&footer, 0, 10), Some(Reward::NoCertificate));
+        assert_eq!(reward_of(None, None, 0, 10), Some(Reward::NoCertificate));
     }
 }
