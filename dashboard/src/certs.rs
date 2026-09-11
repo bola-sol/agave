@@ -45,10 +45,6 @@ enum Block {
     Opaque,
 }
 
-/// This node's rank in the epoch stakes that cover `slot`, and how many ranks
-/// there are. `None` where it holds no stake there.
-type RankOf<'a> = dyn Fn(Slot) -> Option<(usize, usize)> + 'a;
-
 /// Reads the footers of `from..=to` for the reward certificates they carry,
 /// returning a mark per certificate and the last slot read. Stops at the
 /// first slot still filling.
@@ -93,6 +89,8 @@ pub fn walk(
     (read_to, marks)
 }
 
+/// This node's rank in the epoch stakes that cover `slot`, and how many ranks
+/// there are. `None` where it holds no stake there.
 fn rank_of(bank: &Bank, vote_account: &Pubkey, slot: Slot) -> Option<(usize, usize)> {
     let map = bank.get_rank_map(slot)?;
     let rank = map.get_rank_for_vote_pubkey(vote_account)?;
