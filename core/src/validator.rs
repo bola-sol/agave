@@ -111,7 +111,8 @@ use {
     solana_rpc::{
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::{
-            BankNotificationSender, BankNotificationSenderConfig, OptimisticallyConfirmedBank,
+            BankNotificationSender, BankNotificationSenderConfig,
+            BankNotificationWithDependencyWork, OptimisticallyConfirmedBank,
             OptimisticallyConfirmedBankTracker,
         },
         rpc::JsonRpcConfig,
@@ -1421,7 +1422,7 @@ impl Validator {
                 };
                 let mut subscribers = config.extra_bank_notification_senders.clone();
                 subscribers.extend(bank_notification_sender.map(|rpc| rpc.sender));
-                let (sender, receiver) = unbounded();
+                let (sender, receiver) = unbounded::<BankNotificationWithDependencyWork>();
                 let relay = Builder::new()
                     .name("solBankNotifRly".to_string())
                     .spawn(move || {
