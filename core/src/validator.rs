@@ -111,7 +111,7 @@ use {
     solana_rpc::{
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::{
-            BankNotificationSenderConfig, OptimisticallyConfirmedBank,
+            BankNotificationSender, BankNotificationSenderConfig, OptimisticallyConfirmedBank,
             OptimisticallyConfirmedBankTracker,
         },
         rpc::JsonRpcConfig,
@@ -409,6 +409,8 @@ pub struct ValidatorConfig {
     pub repair_handler_type: RepairHandlerType,
     // Thread niceness adjustment for snapshot packager service
     pub snapshot_packager_niceness_adj: i8,
+    /// Receive every bank notification replay sends, beside the RPC tracker.
+    pub extra_bank_notification_senders: Vec<BankNotificationSender>,
 }
 
 impl ValidatorConfig {
@@ -494,6 +496,7 @@ impl ValidatorConfig {
             delay_leader_block_for_pending_fork: true,
             repair_handler_type: RepairHandlerType::default(),
             snapshot_packager_niceness_adj: 0,
+            extra_bank_notification_senders: Vec::new(),
         }
     }
 
@@ -720,6 +723,7 @@ pub struct Validator {
     blockstore_metric_report_service: BlockstoreMetricReportService,
     accounts_background_service: AccountsBackgroundService,
     xdp_transmitter: Option<Transmitter>,
+    bank_notification_relay: Option<JoinHandle<()>>,
     // This runtime is used to run the client owned by SendTransactionService.
     // We don't wait for its JoinHandle here because ownership and shutdown
     // are managed elsewhere. This variable is intentionally unused.
@@ -1405,6 +1409,39 @@ impl Validator {
             (None, None, None, None, None, None, None)
         };
 
+        // Replay reports on one channel. Where the config names other receivers,
+        // a relay copies each notification to them and to the RPC tracker.
+        let (bank_notification_sender, bank_notification_relay) =
+            if config.extra_bank_notification_senders.is_empty() {
+                (bank_notification_sender, None)
+            } else {
+                let (should_send_parents, dependency_tracker) = match &bank_notification_sender {
+                    Some(rpc) => (rpc.should_send_parents, rpc.dependency_tracker.clone()),
+                    None => (geyser_plugin_service.is_some(), None),
+                };
+                let mut subscribers = config.extra_bank_notification_senders.clone();
+                subscribers.extend(bank_notification_sender.map(|rpc| rpc.sender));
+                let (sender, receiver) = unbounded();
+                let relay = Builder::new()
+                    .name("solBankNotifRly".to_string())
+                    .spawn(move || {
+                        for notification in receiver {
+                            for subscriber in &subscribers {
+                                let _ = subscriber.send(notification.clone());
+                            }
+                        }
+                    })
+                    .unwrap();
+                (
+                    Some(BankNotificationSenderConfig {
+                        sender,
+                        should_send_parents,
+                        dependency_tracker,
+                    }),
+                    Some(relay),
+                )
+            };
+
         // CompletedDataSetsService feeds two independent sinks: RPC signatureSubscribe
         // notifications (which need rpc_subscriptions) and the geyser deshred-transaction notifier
         // (which does not). Spawn it whenever either sink wants it, kept out of the rpc_addrs block
@@ -1889,6 +1926,7 @@ impl Validator {
             blockstore_metric_report_service,
             accounts_background_service,
             xdp_transmitter,
+            bank_notification_relay,
             _tpu_client_next_runtime: tpu_client_next_runtime,
         })
     }
@@ -2057,6 +2095,9 @@ impl Validator {
         }
         self.tpu.join().expect("tpu");
         self.tvu.join().expect("tvu");
+        if let Some(relay) = self.bank_notification_relay {
+            relay.join().expect("bank_notification_relay");
+        }
         if let Some(completed_data_sets_service) = self.completed_data_sets_service {
             completed_data_sets_service
                 .join()
