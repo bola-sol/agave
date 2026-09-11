@@ -25,7 +25,7 @@ use {
     },
     solana_runtime::bank::Bank,
     std::{
-        collections::{HashMap, HashSet, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         sync::{Arc, Mutex, RwLock},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
