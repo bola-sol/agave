@@ -215,6 +215,15 @@ pub enum VoteHealth {
     Delinquent,
 }
 
+/// Which consensus the cluster runs. Alpenglow carries votes outside blocks,
+/// so several figures have no meaning under it and the page drops them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Consensus {
+    Tower,
+    Alpenglow,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SkipRate {
     pub epoch: Epoch,
@@ -250,6 +259,7 @@ struct Debounces {
     skip_rate: Debounced<SkipRate>,
     health: Debounced<Health>,
     epoch: Debounced<EpochInfo>,
+    consensus: Debounced<Consensus>,
     epoch_remaining_nanos: Debounced<u64>,
     upcoming: Debounced<Vec<UpcomingSlot>>,
     peers: Debounced<Vec<Peer>>,
@@ -503,6 +513,16 @@ impl Collector {
         // takes to root.
         self.collect_identity_and_vote(&working_bank, cluster_tip);
         self.collect_epoch(&working_bank);
+        self.debounces.consensus.publish(
+            &self.publisher,
+            TOPIC_SUMMARY,
+            "consensus",
+            if working_bank.is_alpenglow() {
+                Consensus::Alpenglow
+            } else {
+                Consensus::Tower
+            },
+        );
         self.collect_startup_progress();
 
         // The slow tier walks every vote account, so it waits for a viewer. The
@@ -2846,6 +2866,15 @@ mod tests {
         assert_eq!(release_of(""), "");
         assert_eq!(release_of("unknown"), "unknown");
         assert_eq!(release_of("-leading"), "");
+    }
+
+    #[test]
+    fn test_the_consensus_is_published() {
+        let harness = fixture();
+        harness.advance_to(8);
+        harness.collector().tick();
+        let message = harness.published_key("summary", "consensus").unwrap();
+        assert!(message.contains(r#""value":"tower""#), "{message}");
     }
 
     #[test]

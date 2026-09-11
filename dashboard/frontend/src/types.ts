@@ -609,6 +609,9 @@ export interface Health {
   vote: "not_voting" | "not_started" | "voting" | "delinquent";
 }
 
+/** Which consensus the cluster runs. Under alpenglow votes are not transactions. */
+export type Consensus = "tower" | "alpenglow";
+
 export interface SkipRate {
   epoch: number;
   rate: number | null;
