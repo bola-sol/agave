@@ -784,12 +784,13 @@ impl Collector {
 
     /// Publishes who leads the slots past the highest held. Returns the leaders
     /// published, for the peer table.
-    fn collect_upcoming(&mut self, root_bank: &Bank, highest_slot: Slot) -> HashSet<String> {
+    fn collect_upcoming(&mut self, root_bank: &Bank, highest_slot: Slot) -> HashSet<Pubkey> {
         let me = self.ctx.identity();
         let first = highest_slot.saturating_add(1);
         let last = highest_slot.saturating_add(UPCOMING_SLOTS);
 
         let mut upcoming = Vec::new();
+        let mut leaders = HashSet::new();
         for slot in first..=last {
             let Some(leader) = self
                 .ctx
@@ -799,6 +800,7 @@ impl Collector {
                 break;
             };
             let (leader_name, leader_icon) = self.peer_display(&leader.id);
+            leaders.insert(leader.id);
             upcoming.push(UpcomingSlot {
                 slot,
                 leader: leader.id.to_string(),
@@ -808,10 +810,6 @@ impl Collector {
             });
         }
 
-        let leaders = upcoming
-            .iter()
-            .map(|slot| slot.leader.clone())
-            .collect::<HashSet<_>>();
         self.debounces
             .upcoming
             .publish(&self.publisher, TOPIC_SLOT, "upcoming", upcoming);
@@ -824,7 +822,7 @@ impl Collector {
     fn collect_peer_table(
         &mut self,
         bank: &Bank,
-        mut leaders: HashSet<String>,
+        mut leaders: HashSet<Pubkey>,
         peers: &[(ContactInfo, u64)],
     ) {
         // The leaders of the window a client holds, from the schedule: a leader takes
@@ -839,31 +837,31 @@ impl Collector {
                 .leader_schedule_cache
                 .slot_leader_at(slot, Some(bank))
             {
-                leaders.insert(leader.id.to_string());
+                leaders.insert(leader.id);
             }
             slot = slot.saturating_add(stride);
         }
 
-        let mut stakes: HashMap<String, u64> = HashMap::new();
+        let mut stakes: HashMap<Pubkey, u64> = HashMap::new();
         for (stake, account) in bank.vote_accounts().values() {
             if *stake == 0 {
                 continue;
             }
-            let identity = account.node_pubkey().to_string();
-            if leaders.contains(&identity) {
-                let total = stakes.entry(identity).or_insert(0);
+            let identity = account.node_pubkey();
+            if leaders.contains(identity) {
+                let total = stakes.entry(*identity).or_insert(0);
                 *total = total.saturating_add(*stake);
             }
         }
 
-        let mut gossip: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        let mut gossip: HashMap<Pubkey, (Option<String>, Option<String>)> = HashMap::new();
         for (contact_info, _) in peers {
-            let identity = contact_info.pubkey().to_string();
-            if !leaders.contains(&identity) {
+            let identity = contact_info.pubkey();
+            if !leaders.contains(identity) {
                 continue;
             }
             gossip.insert(
-                identity,
+                *identity,
                 (
                     Some(contact_info.version().to_string()),
                     contact_info.gossip().map(|addr| addr.ip().to_string()),
@@ -875,17 +873,14 @@ impl Collector {
             .into_iter()
             .map(|identity| {
                 let (version, ip) = gossip.get(&identity).cloned().unwrap_or_default();
-                let (name, icon) = identity
-                    .parse()
-                    .map(|key| self.peer_display(&key))
-                    .unwrap_or_default();
+                let (name, icon) = self.peer_display(&identity);
                 Peer {
                     stake: stakes.get(&identity).copied().unwrap_or(0),
                     version,
                     ip,
                     name,
                     icon,
-                    identity,
+                    identity: identity.to_string(),
                 }
             })
             .collect();
