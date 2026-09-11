@@ -193,8 +193,26 @@ pub struct EpochInfo {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Health {
-    pub replay: &'static str,
-    pub vote: &'static str,
+    pub replay: ReplayHealth,
+    pub vote: VoteHealth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayHealth {
+    NotStarted,
+    Running,
+    Stalled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoteHealth {
+    /// This node is not the voting identity, so it has no votes of its own.
+    NotVoting,
+    NotStarted,
+    Voting,
+    Delinquent,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1650,25 +1668,25 @@ fn health_of(
     since_vote_advance: Duration,
 ) -> Health {
     let replay = if since_completed > REPLAY_STALL_AFTER {
-        "stalled"
+        ReplayHealth::Stalled
     } else if completed_slot == 0 {
-        "not_started"
+        ReplayHealth::NotStarted
     } else {
-        "running"
+        ReplayHealth::Running
     };
 
     // Checked first: a node that is not the voter has no votes of its own, and
     // every rule below would read the other machine's health. Not a fault; an
     // operator who has just failed over wants to see that it took.
     let vote = if !voting {
-        "not_voting"
+        VoteHealth::NotVoting
     } else {
         // A vote can be delinquent two ways: far behind, or not moving at all.
         match (vote_slot, behind) {
-            (None, _) => "not_started",
-            (Some(_), Some(behind)) if behind > VOTE_BEHIND_LIMIT => "delinquent",
-            _ if since_vote_advance > VOTE_STALL_AFTER => "delinquent",
-            _ => "voting",
+            (None, _) => VoteHealth::NotStarted,
+            (Some(_), Some(behind)) if behind > VOTE_BEHIND_LIMIT => VoteHealth::Delinquent,
+            _ if since_vote_advance > VOTE_STALL_AFTER => VoteHealth::Delinquent,
+            _ => VoteHealth::Voting,
         }
     };
 
@@ -2295,11 +2313,11 @@ mod tests {
     fn test_replay_is_stalled_when_no_slot_completes() {
         assert_eq!(
             health_of(Duration::from_secs(13), 100, true, Some(99), Some(1), FRESH).replay,
-            "stalled"
+            ReplayHealth::Stalled
         );
         assert_eq!(
             health_of(FRESH, 100, true, Some(99), Some(1), FRESH).replay,
-            "running"
+            ReplayHealth::Running
         );
     }
 
@@ -2308,7 +2326,7 @@ mod tests {
         // Slot zero means nothing has completed yet, which is not a stall.
         assert_eq!(
             health_of(FRESH, 0, true, None, None, FRESH).replay,
-            "not_started"
+            ReplayHealth::NotStarted
         );
     }
 
@@ -2367,7 +2385,7 @@ mod tests {
         // last vote looks healthy.
         assert_eq!(
             health_of(FRESH, 100, false, Some(99), Some(1), FRESH).vote,
-            "not_voting"
+            VoteHealth::NotVoting
         );
     }
 
@@ -2385,11 +2403,11 @@ mod tests {
                 FRESH
             )
             .vote,
-            "not_voting"
+            VoteHealth::NotVoting
         );
         assert_eq!(
             health_of(FRESH, 100, false, None, None, Duration::from_secs(3_600)).vote,
-            "not_voting"
+            VoteHealth::NotVoting
         );
     }
 
@@ -2399,7 +2417,7 @@ mod tests {
         // know it is keeping up before handing the identity back.
         assert_eq!(
             health_of(FRESH, 100, false, None, None, FRESH).replay,
-            "running"
+            ReplayHealth::Running
         );
     }
 
@@ -2415,11 +2433,11 @@ mod tests {
                 FRESH
             )
             .vote,
-            "delinquent"
+            VoteHealth::Delinquent
         );
         assert_eq!(
             health_of(FRESH, 100, true, Some(50), Some(VOTE_BEHIND_LIMIT), FRESH).vote,
-            "voting"
+            VoteHealth::Voting
         );
     }
 
@@ -2428,7 +2446,7 @@ mod tests {
         // The case the distance alone misses: near the tip and not moving.
         assert_eq!(
             health_of(FRESH, 100, true, Some(99), Some(1), Duration::from_secs(61)).vote,
-            "delinquent"
+            VoteHealth::Delinquent
         );
     }
 
@@ -2437,7 +2455,7 @@ mod tests {
         // An unstaked node is not a failing one, however long it sits there.
         assert_eq!(
             health_of(FRESH, 100, true, None, None, Duration::from_secs(3_600)).vote,
-            "not_started"
+            VoteHealth::NotStarted
         );
     }
 
