@@ -4,6 +4,7 @@
 
 use {
     crate::{
+        certs::{self, Cert},
         context::{DashboardContext, StartProgress},
         history::SlotHistory,
         metrics_tap::{BundleLanding, MetricsTap, ShredFill},
@@ -38,6 +39,10 @@ const SLOW_TICK: Duration = Duration::from_secs(5);
 /// How often the retained slot overview is re-encoded while slots change. Only
 /// a connecting client reads it, and it is a few hundred kilobytes.
 const OVERVIEW_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Block footers read for certificates on one tick, so a restart catches up
+/// over a few ticks rather than stalling one.
+const CERT_SLOTS_PER_TICK: u64 = 64;
 
 /// Slots to include in the strip and sidebar snapshot sent on connect.
 const SLOT_OVERVIEW_LEN: usize = 512;
@@ -312,6 +317,10 @@ pub struct Collector {
     skip_elapsed: usize,
     last_completed_slot: Slot,
     last_completed_at: Instant,
+    /// The slot the certificate walk started at and the last it has read. Marks
+    /// for slots before the start are dropped: a slot the walk never covered
+    /// cannot be told apart from one alpenglow was not yet running for.
+    certs_walk: Option<(Slot, Slot)>,
     /// Highest slot examined for a shred timestamp, whether or not it had one.
     /// Skipped slots never do, so this advances past them independently.
     slot_timed_to: Option<Slot>,
@@ -412,6 +421,7 @@ impl Collector {
             last_completed_slot: 0,
             last_completed_at: now,
             slot_timed_to: None,
+            certs_walk: None,
             last_shred_time: None,
             slot_time_window: VecDeque::new(),
             caught_up_at: None,
@@ -509,6 +519,7 @@ impl Collector {
         self.mark_caught_cluster(cluster_tip);
         self.collect_leaders(&root_bank, highest_slot);
         self.collect_slot_levels(&root_bank, &frozen);
+        self.collect_vote_certs(&root_bank);
         // From the working bank: the root trails the tip by the thirty-two slots it
         // takes to root.
         self.collect_identity_and_vote(&working_bank, cluster_tip);
@@ -1051,6 +1062,47 @@ impl Collector {
             priority_fees: detail.priority_fees,
             tips: detail.tips,
             bundles: self.metrics_tap.bundles_landed(slot).map(landed),
+        }
+    }
+
+    /// Reads the block footers since the last tick for what they say about this
+    /// node's vote, and marks the slots they speak of. Alpenglow only: nothing
+    /// else writes footers.
+    fn collect_vote_certs(&mut self, root_bank: &Bank) {
+        if !root_bank.is_alpenglow() || self.last_completed_slot == 0 {
+            return;
+        }
+        let (floor, from) = match self.certs_walk {
+            Some((floor, read_to)) => (floor, read_to.saturating_add(1)),
+            None => (self.last_completed_slot, self.last_completed_slot),
+        };
+        let to = self
+            .last_completed_slot
+            .min(from.saturating_add(CERT_SLOTS_PER_TICK).saturating_sub(1));
+        if to < from {
+            return;
+        }
+        let (read_to, marks) = certs::walk(
+            &self.ctx.blockstore,
+            root_bank,
+            &self.ctx.vote_account,
+            from,
+            to,
+        );
+        if let Some(read_to) = read_to {
+            self.certs_walk = Some((floor, read_to));
+        }
+        for mark in marks {
+            if mark.slot < floor {
+                continue;
+            }
+            let updated = self.slots.update(mark.slot, |entry| match mark.cert {
+                Cert::Finalization => entry.certs.finalized = Some(mark.with_vote),
+                Cert::Reward => entry.certs.rewarded = Some(mark.with_vote),
+            });
+            if let Some(entry) = updated {
+                self.publish_slot(&entry);
+            }
         }
     }
 
