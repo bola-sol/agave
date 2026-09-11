@@ -111,7 +111,8 @@ use {
     solana_rpc::{
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::{
-            BankNotificationSenderConfig, OptimisticallyConfirmedBank,
+            BankNotificationSender, BankNotificationSenderConfig,
+            BankNotificationWithDependencyWork, OptimisticallyConfirmedBank,
             OptimisticallyConfirmedBankTracker,
         },
         rpc::JsonRpcConfig,
@@ -138,6 +139,7 @@ use {
         snapshot_controller::SnapshotController,
         snapshot_utils,
         transaction_execution::TransactionStatusSender,
+        validated_block_finalization::ValidatedBlockFinalizationCert,
     },
     solana_send_transaction_service::send_transaction_service::Config as SendTransactionServiceConfig,
     solana_shred_version::compute_shred_version,
@@ -408,6 +410,8 @@ pub struct ValidatorConfig {
     pub repair_handler_type: RepairHandlerType,
     // Thread niceness adjustment for snapshot packager service
     pub snapshot_packager_niceness_adj: i8,
+    /// Receive every bank notification replay sends, beside the RPC tracker.
+    pub extra_bank_notification_senders: Vec<BankNotificationSender>,
 }
 
 impl ValidatorConfig {
@@ -493,6 +497,7 @@ impl ValidatorConfig {
             delay_leader_block_for_pending_fork: true,
             repair_handler_type: RepairHandlerType::default(),
             snapshot_packager_niceness_adj: 0,
+            extra_bank_notification_senders: Vec::new(),
         }
     }
 
@@ -708,6 +713,9 @@ pub struct Validator {
     pub cluster_info: Arc<ClusterInfo>,
     pub bank_forks: Arc<RwLock<BankForks>>,
     pub blockstore: Arc<Blockstore>,
+    pub block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+    pub leader_schedule_cache: Arc<LeaderScheduleCache>,
+    pub highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
     geyser_plugin_service: Option<GeyserPluginService>,
     /// Held for the lifetime of the validator so the dispatch thread keeps
     /// running. `None` when no loaded plugin opted into contact info
@@ -716,6 +724,7 @@ pub struct Validator {
     blockstore_metric_report_service: BlockstoreMetricReportService,
     accounts_background_service: AccountsBackgroundService,
     xdp_transmitter: Option<Transmitter>,
+    bank_notification_relay: Option<JoinHandle<()>>,
     // This runtime is used to run the client owned by SendTransactionService.
     // We don't wait for its JoinHandle here because ownership and shutdown
     // are managed elsewhere. This variable is intentionally unused.
@@ -1401,6 +1410,39 @@ impl Validator {
             (None, None, None, None, None, None, None)
         };
 
+        // Replay reports on one channel. Where the config names other receivers,
+        // a relay copies each notification to them and to the RPC tracker.
+        let (bank_notification_sender, bank_notification_relay) =
+            if config.extra_bank_notification_senders.is_empty() {
+                (bank_notification_sender, None)
+            } else {
+                let (should_send_parents, dependency_tracker) = match &bank_notification_sender {
+                    Some(rpc) => (rpc.should_send_parents, rpc.dependency_tracker.clone()),
+                    None => (geyser_plugin_service.is_some(), None),
+                };
+                let mut subscribers = config.extra_bank_notification_senders.clone();
+                subscribers.extend(bank_notification_sender.map(|rpc| rpc.sender));
+                let (sender, receiver) = unbounded::<BankNotificationWithDependencyWork>();
+                let relay = Builder::new()
+                    .name("solBankNotifRly".to_string())
+                    .spawn(move || {
+                        for notification in receiver {
+                            for subscriber in &subscribers {
+                                let _ = subscriber.send(notification.clone());
+                            }
+                        }
+                    })
+                    .unwrap();
+                (
+                    Some(BankNotificationSenderConfig {
+                        sender,
+                        should_send_parents,
+                        dependency_tracker,
+                    }),
+                    Some(relay),
+                )
+            };
+
         // CompletedDataSetsService feeds two independent sinks: RPC signatureSubscribe
         // notifications (which need rpc_subscriptions) and the geyser deshred-transaction notifier
         // (which does not). Spawn it whenever either sink wants it, kept out of the rpc_addrs block
@@ -1682,7 +1724,7 @@ impl Validator {
             config.vote_history_storage.clone(),
             &leader_schedule_cache,
             exit.clone(),
-            block_commitment_cache,
+            block_commitment_cache.clone(),
             config.turbine_mode.clone(),
             transaction_status_sender.clone(),
             entry_notification_sender.clone(),
@@ -1734,7 +1776,7 @@ impl Validator {
                 votor_server_sockets: node.sockets.votor_server,
                 votor_client_socket: node.sockets.quic_votor_client,
                 votor_peer_overrides: config.votor_peer_overrides.clone(),
-                highest_finalized,
+                highest_finalized: highest_finalized.clone(),
             },
             reward_aggregates_sender,
         )
@@ -1877,11 +1919,15 @@ impl Validator {
             cluster_info,
             bank_forks,
             blockstore,
+            block_commitment_cache,
+            leader_schedule_cache,
+            highest_finalized,
             geyser_plugin_service,
             _contact_info_notifier: contact_info_notifier,
             blockstore_metric_report_service,
             accounts_background_service,
             xdp_transmitter,
+            bank_notification_relay,
             _tpu_client_next_runtime: tpu_client_next_runtime,
         })
     }
@@ -2050,6 +2096,9 @@ impl Validator {
         }
         self.tpu.join().expect("tpu");
         self.tvu.join().expect("tvu");
+        if let Some(relay) = self.bank_notification_relay {
+            relay.join().expect("bank_notification_relay");
+        }
         if let Some(completed_data_sets_service) = self.completed_data_sets_service {
             completed_data_sets_service
                 .join()

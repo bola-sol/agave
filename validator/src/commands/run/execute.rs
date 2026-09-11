@@ -6,6 +6,7 @@ use {
         commands::{FromClapArgMatches, run::args::RunArgs},
         ledger_lockfile, lock_ledger,
     },
+    agave_dashboard::{DashboardConfig, DashboardContext, DashboardService},
     agave_snapshots::{
         ArchiveFormat, SnapshotInterval, SnapshotVersion,
         paths::BANK_SNAPSHOTS_DIR,
@@ -543,6 +544,27 @@ pub fn execute(
         bind_addresses.active()
     };
 
+    // The dashboard is unauthenticated and exposes validator internals, so it
+    // stays on loopback unless the operator names an address explicitly.
+    let dashboard_config = value_t!(matches, "dashboard_port", u16).ok().map(|port| {
+        let bind_address = matches
+            .value_of("dashboard_bind_address")
+            .map(|address| {
+                solana_net_utils::parse_host(address).expect("invalid dashboard_bind_address")
+            })
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut config = DashboardConfig::new(SocketAddr::new(bind_address, port));
+        // Added to the loopback defaults rather than replacing them, so a
+        // proxied dashboard stays reachable on the box it runs on.
+        config
+            .allowed_hosts
+            .extend(values_t!(matches, "dashboard_allowed_host", String).unwrap_or_default());
+        config
+    });
+    // Frozen banks reach the collector from replay rather than by polling bank
+    // forks, which under alpenglow prunes a bank within a slot of freezing.
+    let dashboard_banks = dashboard_config.is_some().then(unbounded);
+
     let contact_debug_interval = value_t_or_exit!(matches, "contact_debug_interval", u64);
 
     let account_indexes = AccountSecondaryIndexes::from_clap_arg_match(matches)?;
@@ -782,6 +804,10 @@ pub fn execute(
 
     let mut validator_config = ValidatorConfig {
         log_config,
+        extra_bank_notification_senders: dashboard_banks
+            .iter()
+            .map(|(sender, _)| sender.clone())
+            .collect(),
         require_tower: matches.is_present("require_tower"),
         require_vote_history: !matches.is_present("do_not_require_vote_history"),
         tower_storage,
@@ -1045,6 +1071,22 @@ pub fn execute(
             .incremental_snapshot_archives_dir,
     );
 
+    // Started before the bootstrap below, which is where the RPC search and the
+    // snapshot download happen, so the page is up through the slowest part of
+    // a cold start. The collector attaches once the validator exists.
+    let mut dashboard_service = match dashboard_config {
+        None => None,
+        Some(dashboard_config) => {
+            let listen_addr = dashboard_config.listen_addr;
+            Some(
+                DashboardService::start(dashboard_config, start_progress.clone(), exit.clone())
+                    .map_err(|err| {
+                        format!("failed to start the dashboard on {listen_addr}: {err}")
+                    })?,
+            )
+        }
+    };
+
     if !cluster_entrypoints.is_empty() {
         bootstrap::rpc_bootstrap(
             &node,
@@ -1156,12 +1198,33 @@ pub fn execute(
     )
     .map_err(|err| format!("{err:?}"))?;
 
+    if let Some(dashboard_service) = &mut dashboard_service {
+        dashboard_service
+            .attach(
+                DashboardContext {
+                    cluster_info: validator.cluster_info.clone(),
+                    bank_forks: validator.bank_forks.clone(),
+                    block_commitment_cache: validator.block_commitment_cache.clone(),
+                    blockstore: validator.blockstore.clone(),
+                    leader_schedule_cache: validator.leader_schedule_cache.clone(),
+                    vote_account,
+                    highest_finalized: validator.highest_finalized.clone(),
+                    account_paths: validator_config.account_paths.clone(),
+                },
+                dashboard_banks.map(|(_, receiver)| receiver),
+            )
+            .map_err(|err| format!("failed to start the dashboard collector: {err}"))?;
+    }
+
     if let Some(filename) = init_complete_file {
         File::create(filename).map_err(|err| format!("unable to create {filename}: {err}"))?;
     }
     info!("Validator initialized");
     validator.listen_for_signals()?;
     validator.close();
+    if let Some(dashboard_service) = dashboard_service {
+        dashboard_service.join().expect("dashboard_service");
+    }
     info!("Validator exiting...");
 
     Ok(())
