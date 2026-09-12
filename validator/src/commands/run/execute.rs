@@ -564,6 +564,9 @@ pub fn execute(
     // Frozen banks reach the collector from replay rather than by polling bank
     // forks, which under alpenglow prunes a bank within a slot of freezing.
     let dashboard_banks = dashboard_config.is_some().then(unbounded);
+    // The handles the supermajority wait reads, sent before it starts, so the
+    // page can show the wait per validator.
+    let dashboard_gossip = dashboard_config.is_some().then(unbounded);
 
     let contact_debug_interval = value_t_or_exit!(matches, "contact_debug_interval", u64);
 
@@ -808,6 +811,7 @@ pub fn execute(
             .iter()
             .map(|(sender, _)| sender.clone())
             .collect(),
+        gossip_ready_sender: dashboard_gossip.as_ref().map(|(sender, _)| sender.clone()),
         require_tower: matches.is_present("require_tower"),
         require_vote_history: !matches.is_present("do_not_require_vote_history"),
         tower_storage,
@@ -1079,10 +1083,13 @@ pub fn execute(
         Some(dashboard_config) => {
             let listen_addr = dashboard_config.listen_addr;
             Some(
-                DashboardService::start(dashboard_config, start_progress.clone(), exit.clone())
-                    .map_err(|err| {
-                        format!("failed to start the dashboard on {listen_addr}: {err}")
-                    })?,
+                DashboardService::start(
+                    dashboard_config,
+                    start_progress.clone(),
+                    exit.clone(),
+                    dashboard_gossip.map(|(_, receiver)| receiver),
+                )
+                .map_err(|err| format!("failed to start the dashboard on {listen_addr}: {err}"))?,
             )
         }
     };

@@ -43,7 +43,7 @@ use {
     agave_xdp::transmitter::{Transmitter, TransmitterBuilder, XdpSender},
     anyhow::{Result, anyhow},
     arc_swap::ArcSwap,
-    crossbeam_channel::{Receiver, bounded, unbounded},
+    crossbeam_channel::{Receiver, Sender, bounded, unbounded},
     serde::{Deserialize, Serialize},
     solana_account::{ReadableAccount, state_traits::StateMutWincode as _},
     solana_accounts_db::{
@@ -412,6 +412,9 @@ pub struct ValidatorConfig {
     pub snapshot_packager_niceness_adj: i8,
     /// Receive every bank notification replay sends, beside the RPC tracker.
     pub extra_bank_notification_senders: Vec<BankNotificationSender>,
+    /// Handed gossip and bank forks before the supermajority wait, for a
+    /// reader that wants the wait's view of the cluster.
+    pub gossip_ready_sender: Option<Sender<(Arc<ClusterInfo>, Arc<RwLock<BankForks>>)>>,
 }
 
 impl ValidatorConfig {
@@ -498,6 +501,7 @@ impl ValidatorConfig {
             repair_handler_type: RepairHandlerType::default(),
             snapshot_packager_niceness_adj: 0,
             extra_bank_notification_senders: Vec::new(),
+            gossip_ready_sender: None,
         }
     }
 
@@ -1582,6 +1586,10 @@ impl Validator {
                 bank_forks_r.migration_status(),
             )
         };
+
+        if let Some(sender) = &config.gossip_ready_sender {
+            let _ = sender.send((cluster_info.clone(), bank_forks.clone()));
+        }
 
         let waited_for_supermajority = wait_for_supermajority(
             config,
