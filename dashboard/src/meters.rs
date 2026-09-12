@@ -2398,7 +2398,13 @@ mod tests {
         meters.collect_waterfall(&vote(0), &vote(3));
         assert!(listed(), "the first connection lists it");
 
+        // Three arrived during epoch one, so its boundary keeps the port.
         meters.tpu.epoch_now = Some(at(2, 100));
+        meters.collect_waterfall(&vote(3), &vote(3));
+        assert!(listed(), "the epoch had connections");
+
+        // None during epoch two.
+        meters.tpu.epoch_now = Some(at(3, 100));
         meters.collect_waterfall(&vote(3), &vote(3));
         assert!(!listed(), "an epoch passed with none");
         meters.collect_waterfall(&vote(3), &vote(4));
