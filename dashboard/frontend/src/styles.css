@@ -4599,25 +4599,25 @@ body {
   line-height: 1.5;
 }
 
+/* One scrolling box for heading, group and rows, so every line shares one
+   width and the columns line up beside the scrollbar. */
 .gs-table {
-  display: flex;
-  flex-direction: column;
   min-width: 0;
+  max-height: 380px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .gs-head,
 .gs-row,
 .gs-group {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 62px 64px 64px;
+  grid-template-columns: minmax(0, 1fr) 132px 64px 64px;
   gap: 8px;
   align-items: baseline;
   padding: 5px 6px;
 }
 
-.gs-card.is-narrow .gs-head,
-.gs-card.is-narrow .gs-row,
-.gs-card.is-narrow .gs-group,
 .gs-head:has(> :nth-child(3):last-child),
 .gs-row:has(> :nth-child(3):last-child) {
   grid-template-columns: minmax(0, 1fr) 64px 64px;
@@ -4631,6 +4631,10 @@ body {
 }
 
 .gs-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -4658,23 +4662,18 @@ body {
   color: var(--bad);
 }
 
-.gs-rows {
-  max-height: 340px;
-  overflow-y: auto;
-}
-
 .gs-row {
   border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
   font-size: 12px;
 }
 
-.gs-row > :first-child {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.gs-name {
+  font: inherit;
+  color: var(--text);
+  text-align: left;
 }
 
-.gs-key {
+.gs-name.gs-key {
   font-family: ui-monospace, monospace;
   color: var(--text-faint);
 }
