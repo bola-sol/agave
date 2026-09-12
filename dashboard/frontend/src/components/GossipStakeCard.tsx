@@ -128,20 +128,23 @@ function Table({
   const majority = majorityVersion(stake);
   return (
     <div className="gs-table">
-      <div className="gs-head">
-        <span>{seen ? "Seen" : "Not seen"}</span>
-        {versions && <span>Version</span>}
-        <span>Stake</span>
-        <span>Share</span>
-      </div>
-      <div className={`gs-group ${seen ? "is-seen" : "is-unseen"}`}>
-        <span>
-          {seen ? "Online" : "Offline"}
-          <span className="gs-n">{count(rows.length)} nodes</span>
-        </span>
-        {versions && <span />}
-        <span>{solCompact(share)}</span>
-        <span>{percent(stake.total > 0 ? share / stake.total : 0)}</span>
+      {/* Heading and group line stay put; the rows scroll under them. */}
+      <div className="gs-fixed">
+        <div className="gs-head">
+          <span>{seen ? "Seen" : "Not seen"}</span>
+          {versions && <span>Version</span>}
+          <span>Stake</span>
+          <span>Share</span>
+        </div>
+        <div className={`gs-group ${seen ? "is-seen" : "is-unseen"}`}>
+          <span>
+            {seen ? "Online" : "Offline"}
+            <span className="gs-n">{count(rows.length)} nodes</span>
+          </span>
+          {versions && <span />}
+          <span>{solCompact(share)}</span>
+          <span>{percent(stake.total > 0 ? share / stake.total : 0)}</span>
+        </div>
       </div>
       {rows.map((row) => (
         <div className="gs-row" key={row.identity}>
