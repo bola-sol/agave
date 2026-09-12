@@ -135,10 +135,13 @@ function Table({
         <span>Share</span>
       </div>
       <div className={`gs-group ${seen ? "is-seen" : "is-unseen"}`}>
-        {seen ? "Online" : "Offline"}
         <span>
-          {count(rows.length)} nodes · {percent(stake.total > 0 ? share / stake.total : 0)}
+          {seen ? "Online" : "Offline"}
+          <span className="gs-n">{count(rows.length)} nodes</span>
         </span>
+        {versions && <span />}
+        <span>{solCompact(share)}</span>
+        <span>{percent(stake.total > 0 ? share / stake.total : 0)}</span>
       </div>
       {rows.map((row) => (
         <div className="gs-row" key={row.identity}>

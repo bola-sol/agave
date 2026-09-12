@@ -173,7 +173,11 @@ impl DashboardService {
                             if let Some((cluster_info, bank_forks)) = &handles {
                                 let bank = bank_forks.read().unwrap().root_bank();
                                 let entries = crate::validator_info::scan_all(&bank);
-                                info_cache.write().unwrap().merge(entries);
+                                let found = entries.len();
+                                let loaded = info_cache.write().unwrap().merge(entries);
+                                log::info!(
+                                    "dashboard: read validator info before the wait, {found} accounts, {loaded} cached"
+                                );
                                 // The header's own name, which otherwise waits for
                                 // the collector.
                                 let identity = cluster_info.id();

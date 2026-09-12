@@ -4619,11 +4619,13 @@ body {
 }
 
 .gs-head:has(> :nth-child(3):last-child),
+.gs-group:has(> :nth-child(3):last-child),
 .gs-row:has(> :nth-child(3):last-child) {
   grid-template-columns: minmax(0, 1fr) 64px 64px;
 }
 
 .gs-head > :not(:first-child),
+.gs-group > :not(:first-child),
 .gs-row > :not(:first-child) {
   text-align: right;
   font-family: ui-monospace, monospace;
@@ -4643,12 +4645,11 @@ body {
 }
 
 .gs-group {
-  display: flex;
   font-weight: 600;
   border-bottom: 1px solid var(--border);
 }
 
-.gs-group span {
+.gs-group .gs-n {
   margin-left: 8px;
   font-weight: 400;
   color: var(--text-faint);
