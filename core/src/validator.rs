@@ -323,6 +323,9 @@ pub struct ValidatorLogConfig {
     pub logrotate_flag: Arc<AtomicBool>,
 }
 
+/// Gossip and bank forks, as sent before the supermajority wait.
+pub type GossipReady = (Arc<ClusterInfo>, Arc<RwLock<BankForks>>);
+
 pub struct ValidatorConfig {
     /// Log messages go to `stderr` if `None`
     pub log_config: Option<ValidatorLogConfig>,
@@ -414,7 +417,7 @@ pub struct ValidatorConfig {
     pub extra_bank_notification_senders: Vec<BankNotificationSender>,
     /// Handed gossip and bank forks before the supermajority wait, for a
     /// reader that wants the wait's view of the cluster.
-    pub gossip_ready_sender: Option<Sender<(Arc<ClusterInfo>, Arc<RwLock<BankForks>>)>>,
+    pub gossip_ready_sender: Option<Sender<GossipReady>>,
 }
 
 impl ValidatorConfig {

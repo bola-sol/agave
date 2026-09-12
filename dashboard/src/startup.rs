@@ -10,13 +10,12 @@ use {
     crossbeam_channel::Receiver,
     serde::Serialize,
     solana_clock::Slot,
-    solana_core::validator::ValidatorStartProgress,
+    solana_core::validator::{GossipReady, ValidatorStartProgress},
     solana_gossip::cluster_info::ClusterInfo,
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime::bank::Bank,
     std::{
         collections::HashMap,
-        sync::{Arc, RwLock},
         time::{Duration, Instant},
     },
 };
@@ -25,7 +24,6 @@ pub const KEY_STARTUP_PROGRESS: &str = "startup_progress";
 pub const KEY_GOSSIP_STAKE: &str = "gossip_stake";
 
 /// The handles the validator sends before its supermajority wait.
-pub type GossipReady = (Arc<ClusterInfo>, Arc<RwLock<BankForks>>);
 pub type GossipReadyReceiver = Receiver<GossipReady>;
 
 /// The wait as this node sees it: every staked validator, and whether gossip
