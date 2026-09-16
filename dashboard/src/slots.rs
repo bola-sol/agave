@@ -1,6 +1,7 @@
 //! Rolling history of recent slots, backing the slot strip and the sidebar.
 
 use {
+    crate::certs::Reward,
     serde::Serialize,
     solana_clock::Slot,
     std::collections::{BTreeMap, btree_map::Entry},
@@ -48,6 +49,9 @@ pub struct SlotEntry {
     /// Milliseconds from the slot's first shred to replay finishing it. `None`
     /// for a bank this validator built, which replay never timed.
     pub replayed_millis: Option<u64>,
+    /// Whether this node's vote was paid for the slot. `None` until the reward
+    /// certificate has been seen, and always under TowerBFT.
+    pub reward: Option<Reward>,
 }
 
 /// How a block's shreds arrived. Outside [`BlockDetail`] because a slot fills
@@ -63,10 +67,8 @@ pub struct ShredArrival {
     pub full_millis: u64,
 }
 
-/// What one block contained, read off its bank as it froze. Every field is per
-/// block: the caller differences the bank counters that accumulate along the
-/// fork before they reach here. Grouped so an absent block is one null rather
-/// than eight.
+/// What one block contained, read off its bank as it froze. Every field is
+/// per block; the caller differences the cumulative counters first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BlockDetail {
     /// Transactions in this block. Differenced against the parent.
@@ -110,15 +112,13 @@ impl SlotEntry {
             time_millis: None,
             shreds: None,
             replayed_millis: None,
+            reward: None,
         }
     }
 }
 
-/// This validator's own leader slots held back from pruning, so a reconnecting
-/// client still receives them: a window sized for the live strip holds none.
-/// Sixty-four is what the sidebar rail needs; the schedule page searches the
-/// packed history instead. They occupy the ring's capacity rather than
-/// extending it.
+/// This validator's own leader slots held back from pruning, within the
+/// ring's capacity. Sixty-four is what the sidebar rail needs.
 const OWN_SLOTS_KEPT: usize = 64;
 
 /// A bounded, slot-keyed history. Slots more than `capacity` behind the highest
@@ -302,6 +302,7 @@ mod tests {
                         full_millis: u64::MAX,
                     }),
                     replayed_millis: Some(u64::MAX),
+                    reward: Some(Reward::NoCertificate),
                     block: Some(BlockDetail {
                         transactions: u64::MAX,
                         non_vote_transactions: u64::MAX,
@@ -408,7 +409,8 @@ mod tests {
     }
 
     #[test]
-    fn test_the_overview_carries_our_own_slots_from_before_the_window() {
+    fn test_overview_carries_own_slots_before_the_window() {
+        // The overview carries our own slots from before the window.
         let mut ring = SlotRing::new(512);
         for slot in [1, 2] {
             ring.update(slot, |entry| entry.mine = true);

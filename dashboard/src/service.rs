@@ -1,15 +1,10 @@
-//! Owns the dashboard's threads and ties the collector to the server.
-//!
-//! The server and a boot-progress thread come up near the top of validator
-//! startup, so a snapshot download or ledger replay is visible rather than
-//! blank; the collector attaches once bank forks and the blockstore exist.
-//! Sampling runs on two threads, the collector for slots and the meters for the
-//! once-a-second readings, so a slow blockstore read does not stall every
-//! panel.
+//! Owns the dashboard's threads. The server and a boot-progress thread start
+//! early in validator startup; the collector and meters attach once bank forks
+//! and the blockstore exist.
 
 use {
     crate::{
-        collect::{Collector, EpochInfo, system_time_nanos},
+        collect::{Collector, CollectorShared, EpochInfo, system_time_nanos},
         config::DashboardConfig,
         context::{DashboardContext, StartProgress},
         history::{PACKED_SLOTS, SlotHistory},
@@ -17,11 +12,13 @@ use {
         metrics_tap::MetricsTap,
         proto::{Publisher, TOPIC_SUMMARY},
         server,
-        startup::StartupPublisher,
+        startup::{GossipReadyReceiver, StartupPublisher, gossip_stake},
         tips::TipMeter,
         validator_info::ValidatorInfoCache,
     },
+    solana_core::validator::ValidatorStartProgress,
     solana_pubkey::Pubkey,
+    solana_rpc::optimistically_confirmed_bank_tracker::BankNotificationReceiver,
     std::{
         io,
         sync::{
@@ -34,10 +31,8 @@ use {
     tokio::{net::TcpListener, runtime::Builder},
 };
 
-/// Worker threads the dashboard's runtime is allowed. `Runtime::new()` takes
-/// one per core, in the same process as replay, banking and PoH. The
-/// dashboard's work is almost all socket writes, so two is generous; what this
-/// bounds is the hostile case.
+/// Worker threads the dashboard's runtime is allowed, in the same process as
+/// replay and banking. Two is generous for socket writes.
 const RUNTIME_THREADS: usize = 2;
 
 /// How often the boot thread samples the startup phase. Phases last seconds at
@@ -88,10 +83,14 @@ impl DashboardService {
     /// Binds the listener and begins serving startup progress. The only error is a
     /// failure to bind, so a misconfigured dashboard fails loudly at boot. Call
     /// [`DashboardService::attach`] once the validator is assembled.
+    /// `gossip_ready` carries gossip and bank forks once the validator has
+    /// them, before its supermajority wait; the wait is drawn per validator
+    /// from then on.
     pub fn start(
         config: DashboardConfig,
         startup_progress: StartProgress,
         exit: Arc<AtomicBool>,
+        gossip_ready: Option<GossipReadyReceiver>,
     ) -> io::Result<Self> {
         let publisher = Arc::new(Publisher::new());
         let started = SystemTime::now();
@@ -151,14 +150,67 @@ impl DashboardService {
             let attached = attached.clone();
             let startup_progress = startup_progress.clone();
             let startup = startup.clone();
+            let metrics_tap = metrics_tap.clone();
+            let info_cache = info_cache.clone();
             thread::Builder::new()
                 .name("solDashBoot".to_string())
                 .spawn(move || {
+                    let mut handles = None;
                     while !attached.load(Ordering::Relaxed) && !exit.load(Ordering::Relaxed) {
                         let progress = *startup_progress.read().unwrap();
-                        startup.lock().unwrap().publish(&publisher, progress);
+                        startup.lock().unwrap().publish(
+                            &publisher,
+                            progress,
+                            metrics_tap.stake_in_gossip(),
+                        );
+
+                        // Names are read once the snapshot bank exists, which is
+                        // before the wait and long before the collector's own pass.
+                        if handles.is_none() {
+                            handles = gossip_ready
+                                .as_ref()
+                                .and_then(|receiver| receiver.try_recv().ok());
+                            if let Some((cluster_info, bank_forks)) = &handles {
+                                let bank = bank_forks.read().unwrap().root_bank();
+                                let entries = crate::validator_info::scan_all(&bank);
+                                let found = entries.len();
+                                let loaded = info_cache.write().unwrap().merge(entries);
+                                log::info!(
+                                    "dashboard: read validator info before the wait, {found} accounts, {loaded} cached"
+                                );
+                                // The header's own name, which otherwise waits for
+                                // the collector.
+                                let identity = cluster_info.id();
+                                let (name, icon) = info_cache
+                                    .read()
+                                    .unwrap()
+                                    .get(&identity)
+                                    .map_or((None, None), |info| {
+                                        (info.name.clone(), info.icon_url.clone())
+                                    });
+                                publisher.publish(
+                                    TOPIC_SUMMARY,
+                                    "identity_key",
+                                    &identity.to_string(),
+                                );
+                                publisher.publish(TOPIC_SUMMARY, "identity_name", &name);
+                                publisher.publish(TOPIC_SUMMARY, "identity_icon", &icon);
+                            }
+                        }
+                        let waiting = matches!(
+                            progress,
+                            ValidatorStartProgress::WaitingForSupermajority { .. }
+                        );
+                        let stake = handles.as_ref().filter(|_| waiting).map(
+                            |(cluster_info, bank_forks)| {
+                                let bank = bank_forks.read().unwrap().root_bank();
+                                gossip_stake(cluster_info, &bank, &info_cache.read().unwrap())
+                            },
+                        );
+                        startup.lock().unwrap().publish_gossip(&publisher, stake);
                         thread::sleep(BOOT_POLL);
                     }
+                    startup.lock().unwrap().publish_gossip(&publisher, None);
                 })?
         };
 
@@ -186,7 +238,11 @@ impl DashboardService {
     /// Starts the collector against a fully assembled validator. Both threads
     /// publish startup progress through the same [`StartupPublisher`], so the
     /// handover is invisible to a client.
-    pub fn attach(&mut self, context: DashboardContext) -> io::Result<()> {
+    pub fn attach(
+        &mut self,
+        context: DashboardContext,
+        frozen_banks: Option<BankNotificationReceiver>,
+    ) -> io::Result<()> {
         let info_cache = self.info_cache.clone();
 
         // Validator names are read once here, off the collector's thread, and the
@@ -244,8 +300,7 @@ impl DashboardService {
             thread::Builder::new()
                 .name("solDashColl".to_string())
                 .spawn(move || {
-                    let mut collector = Collector::new(
-                        context,
+                    let shared = CollectorShared {
                         publisher,
                         info_cache,
                         history,
@@ -253,9 +308,9 @@ impl DashboardService {
                         startup_progress,
                         startup,
                         metrics_tap,
-                        tips,
-                        commission_bps,
-                    );
+                    };
+                    let mut collector =
+                        Collector::new(context, shared, tips, commission_bps, frozen_banks);
                     collector.publish_static();
                     while !exit.load(Ordering::Relaxed) {
                         collector.tick();
@@ -314,9 +369,10 @@ mod tests {
             config,
             Arc::new(RwLock::new(ValidatorStartProgress::Running)),
             exit.clone(),
+            None,
         )
         .unwrap();
-        service.attach(harness.ctx.clone()).unwrap();
+        service.attach(harness.ctx.clone(), None).unwrap();
 
         exit.store(true, Ordering::Relaxed);
         // Joined on a helper thread so a regression fails instead of hanging.

@@ -25,7 +25,7 @@ use {
             Semaphore,
             broadcast::error::{RecvError, TryRecvError},
         },
-        time::{Duration, timeout},
+        time::{Duration, sleep, timeout},
     },
     tokio_util::compat::TokioAsyncReadCompatExt,
 };
@@ -51,10 +51,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// generous enough that several tabs never notice it.
 const MAX_WEBSOCKET_CLIENTS: usize = 64;
 
-/// Connections served at once, websockets included. Every request in flight
-/// holds a copy of what it answers with, so unbounded a request flood is a
-/// memory amplifier in a process whose death takes the validator too. A
-/// ceiling, not a throttle.
+/// Connections served at once, websockets included. A ceiling, not a
+/// throttle: every request in flight holds a copy of its answer.
 const MAX_CONNECTIONS: usize = 256;
 
 /// The caps a connection has to pass. Named so the two semaphores cannot be
@@ -145,16 +143,17 @@ async fn handle(
     limits: Limits,
     allowed_hosts: &[String],
 ) -> Result<(), ConnectionError> {
+    // Taken before the head is read, so a flood over the cap holds no task or
+    // buffer for the ten seconds a head is waited for.
+    let Ok(_connection) = limits.connections.try_acquire_owned() else {
+        log::info!("dashboard: refusing a connection, {MAX_CONNECTIONS} already being served");
+        socket.shutdown().await?;
+        return Ok(());
+    };
+
     let (head, head_len) = timeout(REQUEST_TIMEOUT, peek_request_head(&socket))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request head"))??;
-
-    // Taken after the head is read, so a refusal can drain and answer rather than
-    // closing on unread bytes and sending a reset.
-    let Ok(_connection) = limits.connections.try_acquire_owned() else {
-        log::info!("dashboard: refusing a connection, {MAX_CONNECTIONS} already being served");
-        return refuse(socket, head_len, 503, b"too many dashboard connections").await;
-    };
 
     // Checked before anything is served: a page served to a rebound name would be
     // same-origin with the dashboard.
@@ -215,11 +214,16 @@ async fn refuse(
     Ok(())
 }
 
+/// Pause between peeks of a head that has stopped arriving: `peek` never
+/// clears readiness, so `readable` returns at once.
+const HEAD_POLL: Duration = Duration::from_millis(20);
+
 /// Reads the request head without consuming it, so a websocket connection can
 /// still be handed to soketto. Returns the head and its exact length, which the
 /// HTTP path drains.
 async fn peek_request_head(socket: &TcpStream) -> io::Result<(String, usize)> {
     let mut buffer = vec![0u8; MAX_REQUEST_HEAD];
+    let mut last_peeked = 0;
     loop {
         socket.readable().await?;
         let peeked = match socket.peek(&mut buffer).await {
@@ -228,6 +232,11 @@ async fn peek_request_head(socket: &TcpStream) -> io::Result<(String, usize)> {
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
             Err(err) => return Err(err),
         };
+        if peeked == last_peeked {
+            sleep(HEAD_POLL).await;
+            continue;
+        }
+        last_peeked = peeked;
         // `from_utf8_lossy` can change the byte count, so the length comes from
         // what was actually peeked rather than from the string.
         let head = String::from_utf8_lossy(&buffer[..peeked]);
@@ -280,11 +289,9 @@ fn host_is_allowed(head: &str, allowed: &[String]) -> bool {
         .any(|candidate| host_of(candidate).eq_ignore_ascii_case(host))
 }
 
-/// Whether a websocket upgrade comes from a page served by this dashboard.
-/// Websockets are exempt from the same-origin policy, so without this any page
-/// a browser visits could read the feed, loopback included. A missing `Origin`
-/// means the caller is not a browser and is allowed; a literal `null`, which a
-/// sandboxed frame sends, is refused.
+/// Whether a websocket upgrade comes from a page this dashboard served.
+/// No `Origin` is not a browser and is allowed; `null` is a sandboxed frame
+/// and is refused.
 fn origin_is_allowed(head: &str) -> bool {
     let Some(origin) = header(head, "origin") else {
         return true;
@@ -367,12 +374,9 @@ fn lookup(path: &str) -> Option<(&'static str, &'static [u8])> {
         .map(|(_, content_type, body)| (*content_type, *body))
 }
 
-/// Sent with every response. `img-src` is open to any https host because
-/// validator icons are URLs operators publish on chain; plaintext is refused.
-/// Scripts and styles permit inline because index.html carries the theme stamp
-/// and splash styling, and every value the client renders goes through React.
-/// `connect-src 'self'` covers the websocket. One directive per line so it
-/// formats the same everywhere.
+/// Sent with every response. `img-src` allows any https host for validator
+/// icons; inline scripts and styles are for index.html's theme stamp and
+/// splash.
 const SECURITY_HEADERS: &str = concat!(
     "content-security-policy:",
     " default-src 'none';",
@@ -542,10 +546,8 @@ async fn serve_websocket(
     }
 }
 
-/// Bounds and flattens a caller-supplied string before it reaches the log. A
-/// newline forges an entry, an escape sequence drives a terminal, a
-/// right-to-left override reverses text, and an 8 KB header must not write an
-/// 8 KB line.
+/// Bounds and flattens a caller-supplied string before it reaches the log:
+/// no forged lines, terminal escapes or 8 KB entries.
 fn for_logging(value: &str) -> String {
     const LIMIT: usize = 48;
     let mut out: String = value
@@ -709,7 +711,8 @@ mod tests {
     }
 
     #[test]
-    fn test_an_epoch_the_validator_still_holds_is_answered_with_its_arrays() {
+    fn test_held_epoch_is_answered_with_its_arrays() {
+        // An epoch the validator still holds is answered with its arrays.
         let epochs = RwLock::new(vec![epoch_record(841), epoch_record(842)]);
         let reply = respond(
             br#"{"topic":"epoch","key":"query","id":11,"params":{"epoch":841}}"#,
@@ -724,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn test_an_epoch_older_than_the_validator_kept_is_answered_with_nothing() {
+    fn test_dropped_epoch_is_answered_with_nothing() {
         // Not an error. A validator that has not been up that long has no schedule
         // for it, and the page draws those turns without a leader.
         let epochs = RwLock::new(vec![epoch_record(842)]);
@@ -764,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_validator_that_published_nothing_takes_no_room_in_the_table() {
+    fn test_unnamed_validator_takes_no_room() {
         // Most of a cluster publishes neither a name nor an icon. Carrying them
         // as a key and two nulls each would be most of the table saying nothing.
         use crate::validator_info::ValidatorInfo;
@@ -800,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_range_with_unusable_parameters_is_answered_rather_than_dropped() {
+    fn test_bad_range_parameters_are_answered() {
         // Silence and a slow answer look the same to a client waiting on an id,
         // so every request that parses as one gets something back.
         let reply = respond(
@@ -915,7 +918,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rebinding_defeats_the_origin_check_and_is_caught_by_the_host_check() {
+    fn test_rebinding_is_caught_by_the_host_check() {
+        // Rebinding defeats the origin check and is caught by the host check.
         let rebound = req("Host: rebind.evil:10999\r\nOrigin: http://rebind.evil");
         assert!(
             origin_is_allowed(&rebound),
@@ -933,7 +937,8 @@ mod tests {
     }
 
     #[test]
-    fn test_headers_are_read_case_insensitively_and_stop_at_the_body() {
+    fn test_headers_are_case_insensitive_and_end_at_body() {
+        // Headers are read case insensitively and stop at the body.
         let head = "GET / HTTP/1.1\r\nHOST: x\r\n\r\nHost: injected\r\n";
         assert_eq!(header(head, "host"), Some("x"));
         assert_eq!(header(head, "missing"), None);
@@ -1021,7 +1026,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unrecognised_host_is_turned_away_before_anything_is_served() {
+    async fn test_unrecognised_host_is_turned_away() {
+        // Unrecognised host is turned away before anything is served.
         let reply = request_with_hosts(
             b"GET / HTTP/1.1\r\nHost: rebind.evil\r\n\r\n",
             vec!["dash.example.com".to_string()],
@@ -1107,22 +1113,19 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(request).await.unwrap();
         let mut reply = String::new();
-        client.read_to_string(&mut reply).await.unwrap();
+        // Closed unread, the connection can end in a reset, which counts as
+        // nothing read.
+        let _ = client.read_to_string(&mut reply).await;
         server.await.unwrap().unwrap();
         reply
     }
 
     #[tokio::test]
-    async fn test_full_connection_cap_refuses_rather_than_serving() {
-        // A refusal has to arrive as a complete response, not a reset, or the caller
-        // cannot tell an overloaded dashboard from a broken one.
+    async fn test_full_connection_cap_closes_without_reading() {
+        // Over the cap the request is never read: reading it is the cost the
+        // cap exists to bound.
         let reply = request_with_no_connections_left(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        assert!(
-            reply.starts_with("HTTP/1.1 503 Service Unavailable"),
-            "expected a refusal, got {:?}",
-            &reply[..reply.len().min(80)]
-        );
-        assert!(reply.contains("too many dashboard connections"));
+        assert!(reply.is_empty(), "expected a closed socket, got {reply:?}");
     }
 
     #[tokio::test]
@@ -1133,9 +1136,23 @@ mod tests {
             b"GET /websocket HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n",
         )
         .await;
+        assert!(reply.is_empty(), "expected a closed socket, got {reply:?}");
+    }
+
+    #[tokio::test]
+    async fn test_a_head_arriving_in_two_pieces_is_still_served() {
+        // The peek loop waits for the rest rather than spinning on what it has.
+        let (addr, server) = serve_one(Arc::new(Publisher::new())).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHo").await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        client.write_all(b"st: x\r\n\r\n").await.unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        server.await.unwrap().unwrap();
         assert!(
-            reply.starts_with("HTTP/1.1 503"),
-            "expected a refusal, got {:?}",
+            reply.starts_with("HTTP/1.1 200 OK"),
+            "expected the page, got {:?}",
             &reply[..reply.len().min(80)]
         );
     }
@@ -1165,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hashed_assets_are_cached_forever_and_the_document_never_is() {
+    fn test_only_hashed_assets_are_cached() {
         // Asset filenames carry a content hash; index.html does not, and caching it
         // would hide a redeploy.
         assert!(

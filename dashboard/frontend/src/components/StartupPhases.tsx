@@ -1,23 +1,11 @@
-import { duration, percent } from "../format";
+import { duration, percent, solCompact } from "../format";
+import { stakeSeen, SUPERMAJORITY_PERCENT } from "../startup";
 import type { StartupProgress } from "../types";
 import { Meter } from "./primitives";
 
-/**
- * The boot sequence in the order the validator moves through it, mirroring
- * `ValidatorStartProgress`.
- *
- * Several phases are conditional: a validator starting from a local ledger
- * downloads no snapshot, and one that is not waiting on a supermajority skips
- * that step. Rather than guess which will run, anything above the current
- * phase is shown as done or skipped, which is true either way.
- *
- * Two phases can say how far through they are and the rest cannot. Replay
- * counts slots and the supermajority wait counts stake; unpacking an archive
- * and building an accounts index report nothing at all while they run, and
- * there is no bank forks yet to read them from either. What every phase can
- * offer is how long it has taken, which on a boot that has stopped somewhere is
- * the figure being looked for anyway.
- */
+/** The boot sequence in the validator's order, mirroring
+ *  `ValidatorStartProgress`. Anything above the current phase is shown as
+ *  done or skipped. */
 const PHASES: Array<[string, string]> = [
   ["initializing", "Initializing"],
   ["searching_for_rpc_service", "Searching for an RPC service"],
@@ -31,7 +19,14 @@ const PHASES: Array<[string, string]> = [
   ["running", "Running"],
 ];
 
-export function StartupPhases({ startup }: { startup: StartupProgress }) {
+export function StartupPhases({
+  startup,
+  withStake,
+}: {
+  startup: StartupProgress;
+  /** Whether the supermajority wait's meter is drawn here rather than on its own card. */
+  withStake: boolean;
+}) {
   const current = PHASES.findIndex(([phase]) => phase === startup.phase);
   const taken = new Map(startup.phases_taken.map((t) => [t.phase, t.elapsed_nanos]));
 
@@ -52,12 +47,12 @@ export function StartupPhases({ startup }: { startup: StartupProgress }) {
   // Replay measures itself in slots; the supermajority wait measures itself in
   // stake. They are different things and the bar means something different
   // under each, so which one is showing is said rather than left to be assumed.
-  const measured =
-    startup.phase === "waiting_for_supermajority" && startup.stake_percent !== null
-      ? { fraction: startup.stake_percent, label: "of stake visible in gossip" }
-      : startup.fraction !== null && startup.fraction !== undefined
-        ? { fraction: startup.fraction, label: "of the ledger replayed" }
-        : null;
+  const stake = withStake ? stakeSeen(startup) : null;
+  const measured = stake
+    ? { fraction: stake.fraction, label: "of stake visible in gossip", decimals: stake.decimals }
+    : startup.fraction !== null && startup.fraction !== undefined
+      ? { fraction: startup.fraction, label: "of the ledger replayed", decimals: 1 }
+      : null;
 
   return (
     <div className="startup">
@@ -88,11 +83,33 @@ export function StartupPhases({ startup }: { startup: StartupProgress }) {
       </ol>
       {measured && (
         <div className="startup-measure">
-          <Meter fraction={measured.fraction} />
+          {/* The wait ends at a fixed share, so the bar carries a tick there. */}
+          <div className="startup-meter">
+            <Meter fraction={measured.fraction} />
+            {stake && (
+              <span
+                className="startup-target"
+                style={{ left: `${SUPERMAJORITY_PERCENT}%` }}
+                title={`The wait ends at ${SUPERMAJORITY_PERCENT}%`}
+              />
+            )}
+          </div>
           <div className="startup-measure-label">
-            <span className="startup-measure-value">{percent(measured.fraction, 1)}</span>{" "}
+            <span className="startup-measure-value">{percent(measured.fraction, measured.decimals)}</span>{" "}
             {measured.label}
           </div>
+          {/* Only once the validator's own count has arrived: the whole percent
+              has no lamports behind it. */}
+          {stake && stake.online !== null && stake.total !== null && (
+            <div className="startup-measure-sub">
+              <span>
+                <b>{solCompact(stake.online)}</b> of <b>{solCompact(stake.total)}</b> SOL online
+              </span>
+              <span>
+                needs <b>{SUPERMAJORITY_PERCENT}%</b>
+              </span>
+            </div>
+          )}
         </div>
       )}
     </div>

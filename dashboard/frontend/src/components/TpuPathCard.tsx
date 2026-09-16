@@ -38,37 +38,10 @@ import { Card, Explain } from "./primitives";
 
 /**
  * Everything that happens to a transaction before the scheduler sees it.
- *
- * The card is here whenever a QUIC port has taken a connection at any point in
- * this process's life, rather than whenever one took a connection lately. That
- * is the point of it: the two sections at the foot go quiet between leader
- * slots, and the card this replaces left the grid entirely whenever they did,
- * so an operator with few slots could rarely open the dashboard at a moment it
- * was there to read.
- *
- * Two shapes, chosen by whether the address this validator advertises for its
- * TPU is a socket on this host. It is not behind a relayer or a proxy, and the
- * layout for that is on `Elsewhere` below.
- *
- * Five sections, each drawn against its own total. They do not reconcile and
- * are not meant to: the door counts connections, the streams count streams, and
- * the three below count transactions, measured by three subsystems on three
- * cadences. A single chain across them would look authoritative and be quietly
- * wrong, so each restarts at its own hundred percent under its own heading.
- *
- * The last two are counted over a different span as well as against a different
- * total. Both only run while this validator is leader, and five minutes of a
- * stage that fires for a handful of slots every few hours reports whether a
- * leader slot happened to fall inside the window rather than anything about the
- * stage. They are summed over the epoch instead, which is the span the leader
- * schedule is drawn over and the stake behind it is fixed for. The two are
- * bracketed together under one caption that says so, rather than each carrying
- * a label of its own: they are summed on the same tick over the same slots, and
- * two copies of that fact are two chances to disagree about it.
- *
- * What the scheduler did with what arrived is not here. It is per leader slot
- * and it is on the slot page, joined to the block it produced, which is where a
- * figure that only exists during leader slots belongs.
+ * Present once any QUIC port has ever taken a connection. Two shapes, by
+ * whether the advertised TPU is on this host (`Elsewhere` otherwise). Five
+ * sections, each against its own total; the last two are summed over the
+ * epoch, since they run only while leader.
  */
 export function TpuPathCard() {
   const store = useStore();
@@ -82,10 +55,8 @@ export function TpuPathCard() {
 
   if (!paths) return null;
 
-  // The two stages below the listener, which are the node's own work on
-  // whatever it was given and do not depend on how it arrived. Both are absent
-  // rather than nought where nothing happened, so a stage that has been quiet
-  // costs no height.
+  // The two stages below the listener, absent rather than nought where
+  // nothing happened.
   const stages = (
     <EpochStages
       span={span ?? null}
@@ -131,7 +102,7 @@ export function TpuPathCard() {
             {admitted === null ? "—" : percent(admitted, 1)}
           </span>
           <span className="path-figure-label">
-            <Explain text="Of every connection offered to the TPU port, the share this validator let in. The offer says more about the cluster than about this node, since an open port is offered far more than it could ever carry. What the node decides is how much of it to take, and this is that decision as one figure.">
+            <Explain text="Share of connections offered to the TPU port that this validator admitted.">
               Admitted of offered
             </Explain>
           </span>
@@ -141,7 +112,7 @@ export function TpuPathCard() {
             {staked === null ? "—" : percent(staked, 0)}
           </span>
           <span className="path-figure-label">
-            <Explain text="Of the connections that were admitted, the share from peers holding stake. This is the figure that says whether stake weighting is doing anything for you: under pressure the limits are meant to keep letting staked peers in while the rest are shed, and a leader watching this fall during a busy slot is watching that fail.">
+            <Explain text="Share of admitted connections from staked peers.">
               Staked
             </Explain>
           </span>
@@ -167,22 +138,8 @@ export function TpuPathCard() {
   );
 }
 
-/**
- * The two stages counted over the epoch, bracketed under one caption.
- *
- * Bracketed rather than run in with the rest because the sections above are
- * counted over five minutes and the port list below comes back to them. A rule
- * with the span written on it would read as governing everything under it,
- * which here would be wrong twice over.
- *
- * The caption is set as a caption and not as a heading. It sits directly above
- * a section title, and given the titles' own size, case and colour the two read
- * as one heading of two lines rather than as a label and the thing labelled.
- *
- * Nothing at all where neither stage reported, which before the first leader
- * slot of an epoch is the honest state: a span named over no figures says the
- * stages threw everything away.
- */
+/** The two stages counted over the epoch, bracketed under one caption.
+ *  Nothing where neither has reported. */
 function EpochStages({
   span,
   sections,
@@ -195,7 +152,7 @@ function EpochStages({
   return (
     <div className="path-epoch">
       <div className="path-span">
-        <Explain text="What the sections in this box are counted over, which is not what the sections outside it are counted over. Both of these stages only run while this validator is leader, and a five-minute window measures neither: on all but the largest validators it reports whether a leader slot happened to fall inside the last five minutes, and almost always one did not. An epoch is the span the leader schedule is drawn over and the stake behind it is fixed for, so it is the span these are kept over. Where the heading says counted from part way in, this validator was restarted during the epoch and the totals begin there rather than at its first slot.">
+        <Explain text="Counted over the epoch rather than the window, since these stages run only while this validator is leader. Counted from part way in means a restart during the epoch.">
           {/* Published alongside the two stages, so it is only missing if one
               of them arrived without it. Named rather than left blank in that
               case: an epoch total under no heading reads as a windowed one. */}
@@ -215,28 +172,9 @@ function others(paths: QuicPaths): QuicPort[] {
   return paths.ports.filter((port) => port.name !== "tpu");
 }
 
-/**
- * The card on a validator whose advertised TPU address is answered off-host.
- *
- * Which is what a relayer or a block-assembly proxy does: it overwrites the
- * address in gossip, so the cluster connects to it and this host's own TPU
- * listener is offered almost nothing. Every figure the three port sections
- * would draw is then a true nought, and three empty bars under "connections
- * offered" say a port nobody uses is a port nobody could get through.
- *
- * So the ports fold to a line each and the stages keep the card. Those two
- * count what the scheduler was handed however it arrived, which on this
- * validator is the only part of the path that has anything to say. Verify is
- * kept rather than assumed away: a relayer forwards into the fetch stage and
- * sigverify counts what it sends, while a proxy that verifies its own
- * signatures never reaches that stage at all, and the card cannot tell which it
- * is sitting behind — so it draws the stage when the stage reports and leaves
- * it out when it does not.
- *
- * The headline is dropped with them. It is a rate over the TPU port's offer,
- * and a rate over one or two stray connections is noise wearing the clothes of
- * a measurement.
- */
+/** The card where the advertised TPU address is answered off-host, behind a
+ *  relayer or proxy: the ports fold to a line each, the stages keep the
+ *  card, the headline is dropped. */
 function Elsewhere({
   paths,
   stages,
@@ -316,14 +254,7 @@ function PortList({
   );
 }
 
-/**
- * One stage: a bar, what came out of it, and the losses beside it.
- *
- * The heading matters more here than it would in a single list. Every section
- * restarts at a hundred percent against its own total, and without a rule and a
- * name between them the card would read as one cascade that repeatedly climbs
- * back to full.
- */
+/** One stage: a bar, what came out of it, and the losses beside it. */
 function Section({ section }: { section: PathSection }) {
   const narrow = useNarrow();
   const [expanded, setExpanded] = useState(false);
@@ -333,10 +264,8 @@ function Section({ section }: { section: PathSection }) {
   // reasons behind one of the rows above rather than siblings of it, so showing
   // them alongside would read as another share of the same total.
   const more = section.losses.length - shown.length + (expanded ? 0 : section.detail.length);
-  // Whether there is anything to expand at all, which is not the same as
-  // whether anything is hidden right now: counted from what is hidden, the
-  // control disappears the moment it is used and the section cannot be folded
-  // back up again.
+  // Whether there is anything to expand at all, not whether anything is
+  // hidden now, or the control would vanish once used.
   const foldable = section.losses.length > cap || section.detail.length > 0;
 
   return (
@@ -402,7 +331,7 @@ function Section({ section }: { section: PathSection }) {
             </button>
           )}
           {section.zeros > 0 && (
-            <Explain text="Counters this section watches that stayed at nought over the window. Kept as a figure rather than as rows: a counter at nought is worth knowing, since it is the difference between nothing having gone wrong and nothing being measured, but a column of noughts is most of what made this card too tall to read.">
+            <Explain text="Counters this section watches that stayed at nought over the window.">
               <span>
                 {count(section.zeros)} counter{section.zeros === 1 ? "" : "s"} at zero
               </span>
@@ -430,18 +359,9 @@ function Loss({ loss, rank }: { loss: PathLoss; rank: number | null }) {
   );
 }
 
-/**
- * One QUIC port folded to a line.
- *
- * The quieter two always, and all three where the advertised TPU address is
- * answered off this host: there none of them carries the transaction path, and
- * a line each saying so is the whole of what they have to report. Unfolded,
- * each is the two sections the TPU port gets when it is the subject.
- *
- * The head is a row with a button in it rather than a row that is a button,
- * because the share needs an explanation and an explanation is itself a button,
- * which cannot be nested inside another one.
- */
+/** One QUIC port folded to a line; unfolded, the two sections the TPU port
+ *  gets. The row holds a button rather than being one, since the share's
+ *  explanation is a button. */
 function OtherPort({
   port,
   open,
@@ -459,7 +379,7 @@ function OtherPort({
         <span className="path-port-name">{port.name}</span>
         <span className="path-port-note">
           <Explain
-            text={`Connections offered to the ${port.name} port over the last five minutes, and the share of them admitted. Every port has its own listener with its own limits, so each is counted on its own rather than added to the others.`}
+            text={`Connections offered to the ${port.name} port over the last five minutes, and the share admitted.`}
           >
             {count(port.offered)} offered
             {admitted === null ? "" : ` · ${percent(admitted, 1)} admitted`}

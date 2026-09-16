@@ -1,10 +1,6 @@
 //! The once-a-second readings: throughput, host, network, sockets, caches and
-//! the TPU path.
-//!
-//! On their own thread, apart from the slot sampling in [`crate::collect`], so
-//! a slow blockstore read does not stall every panel. Bank forks is taken with
-//! `try_read`: if replay holds it the sample is skipped. A gap in a chart is
-//! honest; a stalled heartbeat is not.
+//! the TPU path. On their own thread; bank forks is taken with `try_read` and
+//! a sample skipped when replay holds it.
 
 use {
     crate::{
@@ -31,12 +27,16 @@ use {
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
         path::PathBuf,
         sync::Arc,
+        thread,
         time::{Duration, Instant, SystemTime},
     },
 };
 
-/// How often these readings are taken.
 pub const METER_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Tries at bank forks before a tick goes without a throughput sample.
+const LOCK_ATTEMPTS: u32 = 5;
+const LOCK_RETRY: Duration = Duration::from_millis(5);
 
 /// Samples retained for the transaction and network charts: five minutes at
 /// one a second, which is what the client keeps.
@@ -294,12 +294,9 @@ pub struct IngestPath {
     /// Bytes waiting unread at the instant of the sample.
     pub queued_bytes: u64,
 
-    /// Packets the port handed over across the same window, so the panel can show
-    /// a share lost. Missing for a port with no receiver reporting one, which is
-    /// four of the seven; nought received alongside drops would read as total
-    /// loss. `Some(0)` is possible where the validator logs below info and the
-    /// counting points never fire, so the panel shows a share only where something
-    /// was counted.
+    /// Packets the port handed over across the same window. `None` for a port
+    /// with no receiver reporting one; `Some(0)` where the validator logs below
+    /// info and the points never fire.
     pub received_recent: Option<u64>,
     pub received_total: Option<u64>,
 
@@ -328,10 +325,8 @@ pub struct QuicPort {
 pub struct QuicPaths {
     pub window_seconds: f64,
     pub ports: Vec<QuicPort>,
-    /// Whether the TPU address advertised in gossip is a socket on this host. It is
-    /// not behind a relayer or block-assembly proxy, and the listener then reports
-    /// almost nothing, which reads as a fault without this. Says only that the
-    /// address is answered elsewhere, never by what.
+    /// Whether the TPU address advertised in gossip is a socket on this host.
+    /// False behind a relayer or block-assembly proxy.
     pub tpu_offhost: bool,
 }
 
@@ -524,9 +519,7 @@ struct IngestPort {
 }
 
 /// Cumulative transaction counters, differenced between samples for a rate.
-/// Total and non-vote are inherited from the parent bank; the error count
-/// resets per bank, so `errors` is a running sum the caller adds to as banks
-/// freeze.
+/// `errors` resets per bank, so it is a running sum the caller keeps.
 #[derive(Clone, Copy)]
 struct TxnCounters {
     slot: Slot,
@@ -713,25 +706,42 @@ impl Meters {
     pub fn tick(&mut self) {
         self.collect_clock();
 
-        // Taken without waiting: replay holds bank forks to advance, and this thread
-        // exists so the readings survive a busy validator.
-        let working_bank = match self.ctx.bank_forks.try_read() {
-            Ok(bank_forks) => {
-                self.throughput.count_frozen(&bank_forks);
-                Some(bank_forks.working_bank())
+        // Taken without waiting long: replay holds bank forks to advance, and
+        // this thread exists so the readings survive a busy validator.
+        let mut working_bank = None;
+        for attempt in 0..LOCK_ATTEMPTS {
+            if attempt > 0 {
+                thread::sleep(LOCK_RETRY);
             }
-            Err(_) => None,
-        };
+            if let Ok(bank_forks) = self.ctx.bank_forks.try_read() {
+                self.throughput.count_frozen(&bank_forks);
+                working_bank = Some(bank_forks.working_bank());
+                break;
+            }
+        }
         if let Some(working_bank) = working_bank {
             self.throughput.tick(&working_bank, &self.publisher);
-            self.note_epoch(&working_bank);
+            self.tpu.note_epoch(&working_bank);
         }
 
         self.network.tick(&self.publisher);
-        self.collect_xdp();
-        self.host.tick(&self.ctx, &self.publisher);
-        self.threads.tick(&self.publisher);
-        self.collect_ingest_paths();
+        self.tpu.collect_xdp(&self.metrics_tap, &self.publisher);
+        // The `/proc` walks run only while somebody is watching. The rest is
+        // cheap and keeps the charts whole for a viewer connecting.
+        if self.publisher.subscriber_count() > 0 {
+            self.host.tick(&self.ctx, &self.publisher);
+            self.threads.tick(&self.publisher);
+            let running = matches!(
+                *self.startup_progress.read().unwrap(),
+                ValidatorStartProgress::Running
+            );
+            self.sockets.tick(
+                &self.ctx,
+                &self.metrics_tap.counters(),
+                running,
+                &self.publisher,
+            );
+        }
         self.collect_from_metrics();
     }
 
@@ -745,27 +755,6 @@ impl Meters {
             .as_nanos() as u64;
         self.publisher
             .publish(TOPIC_SUMMARY, "uptime_nanos", &uptime);
-    }
-
-    fn note_epoch(&mut self, working_bank: &Bank) {
-        self.tpu.note_epoch(working_bank);
-    }
-
-    fn collect_xdp(&mut self) {
-        self.tpu.collect_xdp(&self.metrics_tap, &self.publisher);
-    }
-
-    fn collect_ingest_paths(&mut self) {
-        let running = matches!(
-            *self.startup_progress.read().unwrap(),
-            ValidatorStartProgress::Running
-        );
-        self.sockets.tick(
-            &self.ctx,
-            &self.metrics_tap.counters(),
-            running,
-            &self.publisher,
-        );
     }
 
     /// The readings from the metrics tap, each the difference against the last.
@@ -786,10 +775,11 @@ impl Meters {
 
     fn collect_waterfall(&mut self, previous: &TapCounters, current: &TapCounters) {
         // Whether the advertised TPU port is bound here: a port missing from the
-        // kernel's table is one this host is not listening on. Only answerable while
-        // that table can be read.
-        let tpu_offhost =
-            !self.sockets.unavailable && !self.sockets.kernel_drops.contains_key("tpu");
+        // kernel's table is one this host is not listening on. Only answerable once
+        // that table has been read, and while it can be.
+        let tpu_offhost = self.sockets.sampled
+            && !self.sockets.unavailable
+            && !self.sockets.kernel_drops.contains_key("tpu");
         self.tpu.tick(
             &self.metrics_tap,
             previous,
@@ -872,7 +862,13 @@ impl Throughput {
         };
         publisher.publish_ephemeral(TOPIC_SUMMARY, "tps_sample", &sample);
 
-        push_history(&mut self.history, sample, publisher, "tps_history");
+        push_history(
+            &mut self.history,
+            sample,
+            CHART_HISTORY,
+            publisher,
+            "tps_history",
+        );
     }
 }
 
@@ -931,7 +927,13 @@ impl NetworkMeter {
         };
         publisher.publish_ephemeral(TOPIC_SUMMARY, "network_sample", &sample);
 
-        push_history(&mut self.history, sample, publisher, "network_history");
+        push_history(
+            &mut self.history,
+            sample,
+            CHART_HISTORY,
+            publisher,
+            "network_history",
+        );
     }
 }
 
@@ -1091,7 +1093,7 @@ impl ThreadMeter {
             groups: thread_stats::select_rows(groups, &means, THREAD_ROWS),
         };
         publisher.publish_ephemeral(TOPIC_SUMMARY, "threads_sample", &sample);
-        push_history_of(
+        push_history(
             &mut self.history,
             sample,
             THREADS_HISTORY,
@@ -1129,6 +1131,10 @@ struct SocketMeter {
     /// Set once `/proc/net/udp` proves unreadable. It fails independently of
     /// the other `/proc` files: a container can expose one and not another.
     unavailable: bool,
+    /// Set once the table has been read at all. This meter only runs while
+    /// somebody is watching, and an empty table before the first read must
+    /// not say the TPU port is bound elsewhere.
+    sampled: bool,
     published: Debounced<IngestSummary>,
 }
 
@@ -1143,6 +1149,7 @@ impl SocketMeter {
             received_baseline: None,
             known_sockets: HashMap::new(),
             unavailable: false,
+            sampled: false,
             published: Debounced::default(),
         }
     }
@@ -1168,6 +1175,7 @@ impl SocketMeter {
                 return;
             }
         };
+        self.sampled = true;
         let now = Instant::now();
         let ports = ingest_ports(ctx, tap);
 
@@ -1191,10 +1199,7 @@ impl SocketMeter {
             .filter_map(|port| Some((port.port, port.received?)))
             .collect();
 
-        // Taken the first tick the validator reports itself running, which is where
-        // the startup burst ends; before that the raw counters stand so the burst is
-        // visible. Both baselines at the same instant, so the two totals can be
-        // divided.
+        // Both baselines at the first running tick, where the startup burst ends.
         if self.drops_baseline.is_none() && running {
             self.drops_baseline = Some(drops.clone());
             self.received_baseline = Some(received.clone());
@@ -1258,11 +1263,8 @@ impl SocketMeter {
     }
 }
 
-/// This validator's own UDP ports, in the order the panel lists them, from what
-/// the node advertises in gossip: behind a port forward the match finds
-/// nothing. Each is paired with the validator's own count of what it delivered,
-/// where anything counts it, because this is the one place that knows which
-/// socket is which.
+/// This validator's UDP ports as advertised in gossip, in the panel's order,
+/// each with its receiver's packet count where one reports.
 fn ingest_ports(ctx: &DashboardContext, tap: &TapCounters) -> Vec<IngestPort> {
     let info = ctx.cluster_info.my_contact_info();
     [
@@ -1557,13 +1559,16 @@ struct TpuMeter {
     quic_forwards_window: VecDeque<QuicTotals>,
     quic_vote_window: VecDeque<QuicTotals>,
     quic_paths: Debounced<Option<QuicPaths>>,
+    /// The vote port is listed from its first connection until an epoch
+    /// passes without another: under alpenglow votes leave it for good.
+    vote_quiet: bool,
+    /// The port's cumulative offer as of the last epoch boundary seen.
+    vote_offered_at_epoch: Option<(Epoch, u64)>,
     /// How the XDP transmit path is configured, or nothing where the
     /// validator is not running one.
     xdp: Debounced<Option<XdpConfig>>,
-    /// Where the chain had got to in its epoch as of the last tick that could take
-    /// bank forks. Held because the totals are summed in the metrics pass, which
-    /// has no bank; kept across a missed read, which is a missing sample and not a
-    /// new epoch.
+    /// Epoch position as of the last tick that could take bank forks. Kept across
+    /// a missed read.
     epoch_now: Option<EpochPosition>,
     /// The two stages that only run while this validator is leader, gathered
     /// over the epoch rather than over the window the sections above use.
@@ -1587,6 +1592,8 @@ impl TpuMeter {
             quic_forwards_window: VecDeque::with_capacity(WATERFALL_WINDOW),
             quic_vote_window: VecDeque::with_capacity(WATERFALL_WINDOW),
             quic_paths: Debounced::default(),
+            vote_quiet: true,
+            vote_offered_at_epoch: None,
             xdp: Debounced::default(),
             epoch_now: None,
             leader_totals: LeaderTotals::default(),
@@ -1656,12 +1663,25 @@ impl TpuMeter {
             }),
         );
 
-        // One row per QUIC port, sent as a list so the panel draws the ports it was
-        // given. Present once any port has ever taken a connection, rather than within
-        // the window: behind a proxy the only inbound QUIC is vote traffic during
-        // leader slots, and a windowed test left the card off the grid for the half
-        // hour between. A lifetime at nought is a port nothing has used, which below
-        // `solana=info` is every port.
+        if current.quic_vote.offered > previous.quic_vote.offered {
+            self.vote_quiet = false;
+        }
+        if let Some(at) = self.epoch_now {
+            let offered = current.quic_vote.offered;
+            match self.vote_offered_at_epoch {
+                Some((epoch, before)) if epoch != at.epoch => {
+                    self.vote_quiet = offered == before;
+                    self.vote_offered_at_epoch = Some((at.epoch, offered));
+                }
+                Some(_) => {}
+                None => self.vote_offered_at_epoch = Some((at.epoch, offered)),
+            }
+        }
+        let vote_quiet = self.vote_quiet;
+
+        // Present once any port has ever taken a connection, not within the
+        // window: behind a proxy the only inbound QUIC is vote traffic during
+        // leader slots.
         let ports: Vec<QuicPort> = [
             (
                 "tpu",
@@ -1691,6 +1711,7 @@ impl TpuMeter {
             // dropped nothing.
             kernel_drops: kernel_drops.get(name).copied(),
         })
+        .filter(|port| port.name != "tpu vote quic" || !vote_quiet)
         .collect();
         // The cumulative figures: `offered` is stored as the listener reports it, so
         // this is the count since the port opened.
@@ -1711,12 +1732,8 @@ impl TpuMeter {
             }),
         );
 
-        // The last two stages are counted over the epoch rather than the window. Both
-        // only run while this validator is leader, and a five-minute window of a stage
-        // that fires for a few slots every few hours is not a rate. Safe over an epoch
-        // because every field is a difference the reporter itself resets. Nothing
-        // published until a bank has said which epoch, since an unlabelled total is
-        // worse than none.
+        // Summed over the epoch, not the window: these stages run only while
+        // leader. Nothing is published until a bank has said which epoch.
         if let Some(at) = self.epoch_now {
             self.leader_totals.add(
                 at,
@@ -1812,19 +1829,14 @@ fn at_baseline(baseline: Option<&HashMap<u16, u64>>, port: u16) -> u64 {
         .unwrap_or(0)
 }
 
-/// Appends a chart sample and republishes the retained series, which a
-/// connecting client needs whole.
-fn push_history<T: Serialize>(history: &mut Vec<T>, sample: T, publisher: &Publisher, key: &str) {
-    push_history_of(history, sample, CHART_HISTORY, publisher, key);
-}
-
-/// The same, keeping `keep` samples.
-fn push_history_of<T: Serialize>(
+/// Appends a chart sample, keeping `keep` of them, and republishes the retained
+/// series, which a connecting client needs whole.
+fn push_history<T: Serialize>(
     history: &mut Vec<T>,
     sample: T,
     keep: usize,
     publisher: &Publisher,
-    key: &str,
+    key: &'static str,
 ) {
     history.push(sample);
     if history.len() > keep {
@@ -1957,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn test_only_the_ports_counted_in_datagrams_carry_a_received_figure() {
+    fn test_received_figure_only_on_datagram_ports() {
         // The kernel keys drops by port and the validator keys packets by thread
         // name, and only this join knows `shred_fetch_receiver` is the socket gossip
         // advertises as `tvu`.
@@ -2022,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_waterfall_reports_the_window_and_not_the_running_total() {
+    fn test_waterfall_reports_the_window() {
         // The tap's counters only climb; published as they stand they would present
         // every transaction since startup as the last five minutes.
         let harness = fixture();
@@ -2055,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_scheduler_with_no_traffic_reports_nothing_rather_than_noughts() {
+    fn test_idle_scheduler_reports_nothing() {
         // An empty window is a validator nothing was sent, not one throwing
         // everything away.
         let harness = fixture();
@@ -2134,7 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_bundles_are_summed_over_the_epoch_beside_the_stage_they_annotate() {
+    fn test_bundles_are_summed_over_the_epoch() {
         // Printed on Executed's heading, so they have to cover what Executed covers.
         let mut totals = LeaderTotals::default();
         totals.add(at(842, 10), verified(100), attempted(40), bundled(6, 21));
@@ -2146,7 +2158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_bundles_start_over_with_the_stage_they_are_printed_against() {
+    fn test_bundles_start_over_with_the_stage() {
         // Reset on the same tick as the stages they annotate.
         let mut totals = LeaderTotals::default();
         totals.add(
@@ -2162,7 +2174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_leader_totals_add_every_sample_of_the_epoch_rather_than_a_window() {
+    fn test_leader_totals_add_the_whole_epoch() {
         // A stage that fires for a few slots every few hours has nothing to say about
         // the last five minutes.
         let mut totals = LeaderTotals::default();
@@ -2219,7 +2231,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_span_says_how_much_of_the_epoch_was_actually_counted() {
+    fn test_span_reports_the_counted_slots() {
         // A validator restarted part way through an epoch has totals honest about a
         // shorter span than the heading.
         let mut totals = LeaderTotals::default();
@@ -2237,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_counted_span_never_runs_past_the_epoch_it_is_counted_against() {
+    fn test_counted_span_stays_within_the_epoch() {
         // A bank read can land either side of the one that turned the epoch over.
         let totals = LeaderTotals {
             epoch: Some(842),
@@ -2251,7 +2263,8 @@ mod tests {
     }
 
     #[test]
-    fn test_the_two_leader_stages_are_published_against_the_epoch_they_ran_in() {
+    fn test_leader_stages_carry_their_epoch() {
+        // The two leader stages are published against the epoch they ran in.
         let harness = fixture();
         let mut meters = harness.meters();
         meters.tpu.epoch_now = Some(at(842, 216_000));
@@ -2274,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nothing_is_published_for_a_stage_until_a_bank_has_said_which_epoch() {
+    fn test_leader_stages_wait_for_an_epoch() {
         // A total with no epoch against it cannot be labelled, and one drawn
         // under a heading it was not counted for is worse than none at all.
         let harness = fixture();
@@ -2292,13 +2305,13 @@ mod tests {
     }
 
     #[test]
-    fn test_the_epoch_position_is_read_from_the_bank_the_validator_is_building_on() {
+    fn test_epoch_position_comes_from_the_working_bank() {
         // The working bank, not the root: the counters are reported as the work
         // happens.
         let harness = fixture();
         let mut meters = harness.meters();
         let bank = harness.advance_to(64);
-        meters.note_epoch(&bank);
+        meters.tpu.note_epoch(&bank);
 
         let position = meters.tpu.epoch_now.unwrap();
         assert_eq!(position.slot, 64);
@@ -2312,7 +2325,9 @@ mod tests {
         // reported no config apart from one whose config has not arrived yet.
         let harness = fixture();
         let mut meters = harness.meters();
-        meters.collect_xdp();
+        meters
+            .tpu
+            .collect_xdp(&meters.metrics_tap, &meters.publisher);
 
         let published = harness.published_key("summary", "xdp").unwrap();
         assert!(published.contains(r#""value":null"#), "{published}");
@@ -2329,7 +2344,9 @@ mod tests {
         point.add_tag("zero_copy", "true");
         point.add_field_str("model", "Ethernet Controller E810-C for QSFP");
         meters.metrics_tap.observe_point(&point);
-        meters.collect_xdp();
+        meters
+            .tpu
+            .collect_xdp(&meters.metrics_tap, &meters.publisher);
 
         let published = harness.published_key("summary", "xdp").unwrap();
         assert!(published.contains(r#""zero_copy":true"#), "{published}");
@@ -2358,7 +2375,44 @@ mod tests {
     }
 
     #[test]
-    fn test_no_path_card_where_no_port_has_ever_been_offered_anything() {
+    fn test_the_vote_port_is_listed_from_its_first_connection_to_a_quiet_epoch() {
+        let harness = fixture();
+        let mut meters = harness.meters();
+        let vote = |offered| TapCounters {
+            quic_vote: QuicTotals {
+                offered,
+                ..QuicTotals::default()
+            },
+            ..quic_tap(1)
+        };
+        let listed = || {
+            harness
+                .published_key("summary", "quic_paths")
+                .unwrap()
+                .contains(r#""name":"tpu vote quic""#)
+        };
+
+        meters.tpu.epoch_now = Some(at(1, 100));
+        meters.collect_waterfall(&vote(0), &vote(0));
+        assert!(!listed(), "nothing has arrived");
+        meters.collect_waterfall(&vote(0), &vote(3));
+        assert!(listed(), "the first connection lists it");
+
+        // Three arrived during epoch one, so its boundary keeps the port.
+        meters.tpu.epoch_now = Some(at(2, 100));
+        meters.collect_waterfall(&vote(3), &vote(3));
+        assert!(listed(), "the epoch had connections");
+
+        // None during epoch two.
+        meters.tpu.epoch_now = Some(at(3, 100));
+        meters.collect_waterfall(&vote(3), &vote(3));
+        assert!(!listed(), "an epoch passed with none");
+        meters.collect_waterfall(&vote(3), &vote(4));
+        assert!(listed(), "back at once when one arrives");
+    }
+
+    #[test]
+    fn test_no_path_card_before_any_offer() {
         // Also what a validator logging below `solana=info` looks like: the tap sees
         // nothing.
         let harness = fixture();
@@ -2375,6 +2429,8 @@ mod tests {
         // finds no port here and the listener reports next to nothing.
         let harness = fixture();
         let mut meters = harness.meters();
+        // The table has been read and holds no TPU port.
+        meters.sockets.sampled = true;
         let used = quic_tap(1);
         meters.collect_waterfall(&used, &used);
         let published = harness.published_key("summary", "quic_paths").unwrap();
@@ -2388,12 +2444,25 @@ mod tests {
     }
 
     #[test]
-    fn test_a_host_whose_sockets_cannot_be_read_is_not_told_its_tpu_moved() {
+    fn test_unreadable_sockets_do_not_say_tpu_moved() {
         // Once the socket table is unreadable every port looks absent, and the honest
         // answer is that we cannot tell.
         let harness = fixture();
         let mut meters = harness.meters();
         meters.sockets.unavailable = true;
+        let used = quic_tap(1);
+        meters.collect_waterfall(&used, &used);
+
+        let published = harness.published_key("summary", "quic_paths").unwrap();
+        assert!(published.contains(r#""tpu_offhost":false"#), "{published}");
+    }
+
+    #[test]
+    fn test_an_unread_socket_table_does_not_say_tpu_moved() {
+        // The socket meter waits for a viewer, so the table can be empty because
+        // it has never been read, which says nothing about where the port is.
+        let harness = fixture();
+        let mut meters = harness.meters();
         let used = quic_tap(1);
         meters.collect_waterfall(&used, &used);
 
@@ -2433,6 +2502,7 @@ mod tests {
     fn test_the_threads_are_published_from_the_second_tick() {
         // The first reading is the baseline; the panel wants a difference.
         let harness = fixture();
+        let _viewer = harness.publisher.subscribe();
         let mut meters = harness.meters();
         meters.tick();
         assert!(
@@ -2557,6 +2627,35 @@ mod tests {
         assert!(
             harness.published_key("summary", "estimated_tps").is_none(),
             "replay throughput was reported as cluster throughput"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_the_proc_walks_wait_for_a_viewer() {
+        // Two files per thread every second, with nobody to show them to.
+        let harness = fixture();
+        let mut meters = harness.meters();
+        meters.tick();
+        sleep(Duration::from_millis(20));
+        meters.tick();
+        assert!(
+            harness
+                .published_key("summary", "threads_history")
+                .is_none(),
+            "the thread walk ran with nobody watching"
+        );
+
+        // Holding a receiver is what counts as a viewer.
+        let _viewer = harness.publisher.subscribe();
+        meters.tick();
+        sleep(Duration::from_millis(20));
+        meters.tick();
+        assert!(
+            harness
+                .published_key("summary", "threads_history")
+                .is_some(),
+            "a viewer attached and the thread walk still did not run"
         );
     }
 }

@@ -543,6 +543,12 @@ pub fn execute(
             .extend(values_t!(matches, "dashboard_allowed_host", String).unwrap_or_default());
         config
     });
+    // Frozen banks reach the collector from replay rather than by polling bank
+    // forks, which under alpenglow prunes a bank within a slot of freezing.
+    let dashboard_banks = dashboard_config.is_some().then(unbounded);
+    // The handles the supermajority wait reads, sent before it starts, so the
+    // page can show the wait per validator.
+    let dashboard_gossip = dashboard_config.is_some().then(unbounded);
 
     let contact_debug_interval = value_t_or_exit!(matches, "contact_debug_interval", u64);
 
@@ -780,6 +786,11 @@ pub fn execute(
 
     let mut validator_config = ValidatorConfig {
         log_config,
+        extra_bank_notification_senders: dashboard_banks
+            .iter()
+            .map(|(sender, _)| sender.clone())
+            .collect(),
+        gossip_ready_sender: dashboard_gossip.as_ref().map(|(sender, _)| sender.clone()),
         require_tower: matches.is_present("require_tower"),
         require_vote_history: !matches.is_present("do_not_require_vote_history"),
         tower_storage,
@@ -1046,10 +1057,13 @@ pub fn execute(
         Some(dashboard_config) => {
             let listen_addr = dashboard_config.listen_addr;
             Some(
-                DashboardService::start(dashboard_config, start_progress.clone(), exit.clone())
-                    .map_err(|err| {
-                        format!("failed to start the dashboard on {listen_addr}: {err}")
-                    })?,
+                DashboardService::start(
+                    dashboard_config,
+                    start_progress.clone(),
+                    exit.clone(),
+                    dashboard_gossip.map(|(_, receiver)| receiver),
+                )
+                .map_err(|err| format!("failed to start the dashboard on {listen_addr}: {err}"))?,
             )
         }
     };
@@ -1168,16 +1182,19 @@ pub fn execute(
 
     if let Some(dashboard_service) = &mut dashboard_service {
         dashboard_service
-            .attach(DashboardContext {
-                cluster_info: validator.cluster_info.clone(),
-                bank_forks: validator.bank_forks.clone(),
-                block_commitment_cache: validator.block_commitment_cache.clone(),
-                blockstore: validator.blockstore.clone(),
-                leader_schedule_cache: validator.leader_schedule_cache.clone(),
-                vote_account,
-                highest_finalized: validator.highest_finalized.clone(),
-                account_paths: validator_config.account_paths.clone(),
-            })
+            .attach(
+                DashboardContext {
+                    cluster_info: validator.cluster_info.clone(),
+                    bank_forks: validator.bank_forks.clone(),
+                    block_commitment_cache: validator.block_commitment_cache.clone(),
+                    blockstore: validator.blockstore.clone(),
+                    leader_schedule_cache: validator.leader_schedule_cache.clone(),
+                    vote_account,
+                    highest_finalized: validator.highest_finalized.clone(),
+                    account_paths: validator_config.account_paths.clone(),
+                },
+                dashboard_banks.map(|(_, receiver)| receiver),
+            )
             .map_err(|err| format!("failed to start the dashboard collector: {err}"))?;
     }
 

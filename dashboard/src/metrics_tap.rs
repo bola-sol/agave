@@ -1,20 +1,15 @@
 //! Counters lifted from the metrics points the validator submits about itself.
-//!
-//! The counters behind most panels are private to the module keeping them and
-//! reset as they are reported, so this watches the points on their way out
-//! instead. The observer runs on the submitting thread: a name comparison, and
-//! for the few points wanted a scan of fields into atomics. Only the per-slot
-//! points take a lock, and those arrive once per leader slot.
-//!
-//! The points carry deltas, so accumulating them gives totals that only climb
-//! and can be differenced between readings like every other rate here.
+//! The observer runs on the submitting thread: a name match, then atomics;
+//! only the per-slot points take a lock. Points carry deltas, accumulated into
+//! totals. A few fields are levels, replaced by the latest reading and never
+//! summed.
 
 use {
     serde::Serialize,
     solana_clock::Slot,
     solana_metrics::datapoint::DataPoint,
     std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -49,10 +44,8 @@ const TPU_VOTE_RECEIVER: &str = "tpu_vote_receiver";
 /// Packets seen, which for the shred receivers is shreds.
 const PACKETS_COUNT: &str = "packets_count";
 
-/// The scheduler's account of everything handed to it, reported once a second
-/// with its counters reset as it reports. Submitted only when there is something
-/// to report, and through `solana_metrics::submit` directly, so it arrives at
-/// any log level.
+/// The scheduler's counters, reported once a second and reset as reported.
+/// Submitted directly, so it arrives at any log level.
 const SCHEDULER_COUNTS: &str = "banking_stage_scheduler_counts";
 /// Why a worker's transaction never reached the block. Same worker, tick and
 /// `id` as the counts point, so the two are read into one set of counters.
@@ -79,11 +72,14 @@ const QUIC_TPU_VOTE: &str = "quic_streamer_tpu_vote";
 /// is left alone: votes never reach the scheduler below.
 const TPU_VERIFIER: &str = "tpu-verifier";
 
-/// The bundle stage's loop, on builds that have one. Bundles arrive over gRPC
-/// and skip the QUIC ports and sigverify, so this annotates the executed stage
-/// rather than adding one. Silent where there is no bundle stage, where it is
-/// idle, and under BAM, which supersedes it.
+/// The bundle stage's loop, on builds that have one. Silent without a bundle
+/// stage and under BAM.
 const BUNDLE_STAGE: &str = "bundle_stage-loop_stats";
+
+/// The bundle stage's count for each leader slot: bundles it sanitised and
+/// bundles it executed into the block. One point per stage thread, summed.
+/// Silent under BAM, which drains the stage.
+const BUNDLE_SLOT_STATS: &str = "bundle_stage-stats";
 
 /// The worker threads, one point each under an `id` tag that is not read:
 /// summing them gives the stage's total. Submitted at trace level, which does
@@ -112,10 +108,14 @@ const SHRED_FULL: &str = "shred_insert_is_full";
 /// with whether it was ours; only ours are kept.
 const COST_TRACKER: &str = "cost_tracker_stats";
 
+/// The stake the validator could see in gossip while it waited for a
+/// supermajority, in lamports. Submitted every tenth check, so about every
+/// ten seconds, and only during that wait.
+const WFSM_GOSSIP: &str = "wfsm_gossip";
+
 /// The tag saying whether the reporting node produced the block.
 const IS_LEADER: &str = "is_leader";
 
-/// The field naming the slot a point covers.
 const SLOT: &str = "slot";
 
 /// Replayed slots kept, about a minute and a half. Shorter samples missed the
@@ -151,8 +151,8 @@ pub struct AccountsCounters {
     pub stored_accounts: AtomicU64,
     pub stored_bytes: AtomicU64,
 
-    /// Levels, not counts: storage that exists and storage still live. The
-    /// difference is what shrink reclaims.
+    /// Levels: storage that exists and storage still live. The difference is
+    /// what shrink reclaims.
     pub storage_bytes: AtomicU64,
     pub storage_alive_bytes: AtomicU64,
     pub storage_count: AtomicU64,
@@ -195,12 +195,9 @@ pub struct ProgramCacheCounters {
     pub water_level: AtomicU64,
 }
 
-/// One QUIC port: who was let in, what they sent, and what got through.
-///
-/// Most fields are reported with `swap(0)` and accumulate here.
-/// `total_incoming_connection_attempts` is reported with `load`, already
-/// cumulative, and is stored instead; the last two are levels. Accumulating the
-/// cumulative one would square it within a minute.
+/// One QUIC port: who was let in, what they sent, and what got through. Most
+/// fields are deltas and accumulate; `offered` arrives cumulative and is
+/// stored; the last two are levels.
 #[derive(Debug, Default)]
 pub struct QuicCounters {
     /// Connections offered, cumulative on the wire. The denominator for
@@ -253,9 +250,9 @@ pub struct QuicCounters {
     /// Thrown away because that queue had gone.
     pub disconnected: AtomicU64,
 
-    /// Connections open at the moment of the last point. A level.
+    /// Connections open at the moment of the last point.
     pub open: AtomicU64,
-    /// Streams in flight at that same moment. A level.
+    /// Streams in flight at that same moment.
     pub active_streams: AtomicU64,
 }
 
@@ -370,17 +367,34 @@ pub struct MetricsTap {
     /// waterfalls.
     slot_costs: Mutex<VecDeque<SlotCost>>,
 
-    /// The last few hundred replayed slots, kept as arrivals rather than totals
+    /// The last few hundred replayed slots, keyed by slot. Kept one by one
     /// because the panel wants the worst slot as well as the mean.
-    replay_slots: Mutex<VecDeque<ReplaySlotTimes>>,
+    replay_slots: Mutex<BTreeMap<Slot, ReplaySlotTimes>>,
 
-    /// How each recent slot's shreds arrived, oldest first.
-    shred_fills: Mutex<VecDeque<ShredFill>>,
+    /// How each recent slot's shreds arrived, keyed by slot for the same reason.
+    shred_fills: Mutex<BTreeMap<Slot, ShredFill>>,
+
+    /// What the bundle stage landed in each of our recent leader slots.
+    bundle_slots: Mutex<BTreeMap<Slot, BundleLanding>>,
 
     /// How the XDP transmit path is configured. Latched: it cannot change while the
     /// process runs, and a config that stops being reported has not been turned
     /// off.
     xdp: Mutex<Option<XdpConfig>>,
+
+    /// The last count of stake seen in gossip during the supermajority wait.
+    /// The boot thread reads it; nothing after the wait does.
+    stake_in_gossip: Mutex<Option<StakeInGossip>>,
+}
+
+/// Stake the validator could see in gossip when it last counted, in lamports.
+/// The validator's own figure for the supermajority wait, exact where the
+/// progress report carries a whole percent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct StakeInGossip {
+    pub online: u64,
+    pub offline: u64,
+    pub total: u64,
 }
 
 /// How the XDP transmit path is configured, as the validator resolved it.
@@ -437,14 +451,19 @@ pub struct ShredFill {
     pub full_millis: u64,
 }
 
-/// One replayed slot's timings, in microseconds, of three kinds:
-///
-/// - `fetch`, `confirming` and `completing` are disjoint spans on replay's own
-///   thread and add up to a real duration;
-/// - `poh_verify`, `tx_verify` and `dispatch` are sums of overlapping
-///   asynchronous jobs, worth only relative to one another;
-/// - everything from `execute` down is thread time across the workers, which
-///   partitions cleanly into the CPU one slot costs.
+/// What the bundle stage did in one of our leader slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BundleLanding {
+    pub slot: Slot,
+    /// Bundles that passed sanitisation.
+    pub sanitized: u64,
+    /// Of those, the ones executed into the block.
+    pub executed: u64,
+}
+
+/// One replayed slot's timings, in microseconds. `fetch`, `confirming` and
+/// `completing` are disjoint spans on replay's thread; the verify fields are
+/// overlapping jobs; everything from `execute` down is worker thread time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReplaySlotTimes {
     /// The slot the point described, so a row can be asked for its own figure.
@@ -522,19 +541,15 @@ fn scheduler_source(point: &DataPoint) -> SchedulerSource {
     }
 }
 
-/// Whether a newly arrived report describes more of a slot's work than the one
-/// held. `scheduled` decides it, since only the enabled scheduler placed work;
-/// `finished` and `buffered` break ties on an empty slot. `received` is not
-/// consulted because the two schedulers count it in different units.
+/// Whether a new report describes more of a slot's work than the one held.
+/// `received` is left out: the two schedulers count it in different units.
 fn describes_more_work(new: &SchedulerTotals, held: &SchedulerTotals) -> bool {
     (new.scheduled, new.finished, new.buffered) > (held.scheduled, held.finished, held.buffered)
 }
 
-/// The scheduler's counters, in the order a transaction meets them: received,
-/// buffered, scheduled, finished, with the reasons the count falls between
-/// each. The first stretch is an identity the validator's own tests assert; the
-/// later ones are not, since the container holds a standing population across
-/// seconds.
+/// The scheduler's counters in the order a transaction meets them, with the
+/// reasons the count falls between each. Only the first stretch is an
+/// identity.
 #[derive(Debug, Default)]
 pub struct SchedulerCounters {
     /// Everything sigverify handed the scheduler.
@@ -614,17 +629,9 @@ pub struct ProgramCacheTotals {
     pub empty_entries: u64,
 }
 
-/// One window of a QUIC port's counters.
-///
-/// These do not partition the offer. The listener drops a connection without
-/// counting it in two places, either side of the handshake, and `handshook` is
-/// what tells the two silences apart:
-///
-/// ```text
-/// before = offered - (shed_all + shed_address + refused_full
-///                     + handshake_timeout + handshake_error + handshook)
-/// after  = handshook - (refused a table place + admitted)
-/// ```
+/// One window of a QUIC port's counters. They do not partition the offer:
+/// the listener drops uncounted on either side of the handshake, and
+/// `handshook` separates the two gaps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct QuicTotals {
     pub offered: u64,
@@ -652,8 +659,8 @@ pub struct QuicTotals {
     pub disconnected: u64,
 }
 
-/// How one QUIC port stands at this instant. Levels, kept apart from the
-/// counters because a window of them can be neither summed nor differenced.
+/// How one QUIC port stands at this instant, kept apart from the counters so
+/// a window cannot sum them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct QuicLevels {
     pub open: u64,
@@ -749,21 +756,19 @@ pub struct TapCounters {
     pub repair_sent_millis: u64,
     pub scheduler: SchedulerTotals,
     pub accounts: AccountsTotals,
-    /// Levels, read as they stand rather than differenced.
+    /// Levels.
     pub accounts_storage_bytes: u64,
     pub accounts_storage_alive_bytes: u64,
     pub accounts_storage_count: u64,
     pub accounts_cache_bytes: u64,
     pub accounts_cache_entries: u64,
     pub program_cache: ProgramCacheTotals,
-    /// Entries loaded when an eviction last ran. A level, so it is read as it
-    /// stands rather than differenced.
+    /// Entries loaded when an eviction last ran. A level.
     pub program_cache_water_level: u64,
     pub quic: QuicTotals,
     pub quic_forwards: QuicTotals,
     pub quic_vote: QuicTotals,
-    /// Levels rather than counts, one set per port, in the same order the
-    /// totals above are named.
+    /// One set of levels per port, in the same order the totals above are named.
     pub quic_levels: QuicLevels,
     pub quic_forwards_levels: QuicLevels,
     pub quic_vote_levels: QuicLevels,
@@ -799,10 +804,9 @@ impl MetricsTap {
     fn observe(&self, point: &DataPoint) {
         match point.name {
             ACCOUNTS_DB_TIMINGS => {
+                // The same point carries the cache's size and entry count, which are levels.
+                self.accounts.add_point(point);
                 for (name, value) in &point.fields {
-                    // The same point carries the cache's size and entry
-                    // count, which are levels rather than counts.
-                    self.accounts.add_point(point);
                     let counter = match *name {
                         "read_only_accounts_cache_hits" => &self.accounts_cache_hits,
                         "read_only_accounts_cache_misses" => &self.accounts_cache_misses,
@@ -832,7 +836,9 @@ impl MetricsTap {
             SCHEDULER_SLOT_COUNTS => self.remember_slot(point),
             REPLAY_SLOT_STATS => self.remember_replay(point),
             SHRED_FULL => self.remember_fill(point),
+            BUNDLE_SLOT_STATS => self.remember_bundles(point),
             XDP_NETWORK_CONFIG => self.remember_xdp(point),
+            WFSM_GOSSIP => self.remember_stake_in_gossip(point),
             COST_TRACKER => self.remember_cost(point),
             ACCOUNTS_LOADS | ACCOUNTS_STORES | ACCOUNTS_FLUSH => self.accounts.add_point(point),
             PROGRAM_CACHE => self.program_cache.add_point(point),
@@ -893,10 +899,8 @@ impl MetricsTap {
             // losing a panel is not worth taking the validator down over.
             return;
         };
-        // One row per slot, keeping whichever report describes the block. A build
-        // running two schedulers reports every leader slot twice, and only the enabled
-        // one did the work; keeping the last to arrive emptied the panel on half of
-        // all slots.
+        // A build running two schedulers reports every leader slot twice; keep
+        // the report that did the work.
         if let Some(held) = slots.iter_mut().find(|held| held.slot == slot) {
             if describes_more_work(&waterfall.counts, &held.counts) {
                 *held = waterfall;
@@ -1009,9 +1013,11 @@ impl MetricsTap {
         let Ok(mut slots) = self.replay_slots.lock() else {
             return;
         };
-        slots.push_back(slot);
+        // A slot replayed twice keeps the later report. Bounded from the lowest
+        // slot, which is the oldest during ordinary running.
+        slots.insert(slot.slot, slot);
         while slots.len() > REPLAY_SLOTS {
-            slots.pop_front();
+            slots.pop_first();
         }
     }
 
@@ -1042,9 +1048,44 @@ impl MetricsTap {
         let Ok(mut fills) = self.shred_fills.lock() else {
             return;
         };
-        fills.push_back(fill);
+        fills.insert(slot, fill);
         while fills.len() > SHRED_FILLS {
-            fills.pop_front();
+            fills.pop_first();
+        }
+    }
+
+    /// Records what the bundle stage landed in a leader slot, summed across the
+    /// stage's threads.
+    fn remember_bundles(&self, point: &DataPoint) {
+        let mut slot = None;
+        let mut sanitized = 0;
+        let mut executed = 0;
+        for (name, value) in &point.fields {
+            let Some(number) = field_u64(value) else {
+                continue;
+            };
+            match *name {
+                SLOT => slot = Some(number),
+                "num_sanitized_ok" => sanitized = number,
+                "execution_results_ok" => executed = number,
+                _ => (),
+            }
+        }
+        let Some(slot) = slot else {
+            return;
+        };
+
+        let Ok(mut slots) = self.bundle_slots.lock() else {
+            return;
+        };
+        let landing = slots.entry(slot).or_insert(BundleLanding {
+            slot,
+            ..BundleLanding::default()
+        });
+        landing.sanitized = landing.sanitized.saturating_add(sanitized);
+        landing.executed = landing.executed.saturating_add(executed);
+        while slots.len() > SLOT_WATERFALLS {
+            slots.pop_first();
         }
     }
 
@@ -1117,29 +1158,63 @@ impl MetricsTap {
             .unwrap_or_default()
     }
 
+    /// Keeps the latest count of stake seen in gossip. A point without a total
+    /// has nothing to divide by and is dropped.
+    fn remember_stake_in_gossip(&self, point: &DataPoint) {
+        let mut seen = StakeInGossip {
+            online: 0,
+            offline: 0,
+            total: 0,
+        };
+        for (name, value) in &point.fields {
+            let Some(number) = field_u64(value) else {
+                continue;
+            };
+            match *name {
+                "online_stake" => seen.online = number,
+                "offline_stake" => seen.offline = number,
+                "total_activated_stake" => seen.total = number,
+                _ => (),
+            }
+        }
+        if seen.total == 0 {
+            return;
+        }
+        if let Ok(mut held) = self.stake_in_gossip.lock() {
+            *held = Some(seen);
+        }
+    }
+
+    /// The last count of stake seen in gossip, or nothing before the first.
+    pub fn stake_in_gossip(&self) -> Option<StakeInGossip> {
+        self.stake_in_gossip.lock().ok().and_then(|held| *held)
+    }
+
     /// How the XDP transmit path is configured, or nothing where it is not.
     pub fn xdp(&self) -> Option<XdpConfig> {
         self.xdp.lock().ok().and_then(|held| held.clone())
     }
 
-    /// The replay record for `slot`, while it is still held. Newest first, in
-    /// case a slot was replayed twice.
+    /// The replay record for `slot`, while it is still held.
     pub fn replayed(&self, slot: Slot) -> Option<ReplaySlotTimes> {
-        let slots = self.replay_slots.lock().ok()?;
-        slots.iter().rev().find(|times| times.slot == slot).copied()
+        self.replay_slots.lock().ok()?.get(&slot).copied()
     }
 
     /// How `slot`'s shreds arrived, while the record is still held.
     pub fn shred_fill(&self, slot: Slot) -> Option<ShredFill> {
-        let fills = self.shred_fills.lock().ok()?;
-        fills.iter().rev().find(|fill| fill.slot == slot).copied()
+        self.shred_fills.lock().ok()?.get(&slot).copied()
     }
 
-    /// The replayed slots held, oldest first.
+    /// What the bundle stage landed in `slot`, while the record is still held.
+    pub fn bundles_landed(&self, slot: Slot) -> Option<BundleLanding> {
+        self.bundle_slots.lock().ok()?.get(&slot).copied()
+    }
+
+    /// The replayed slots held, lowest slot first.
     pub fn replay_slots(&self) -> Vec<ReplaySlotTimes> {
         self.replay_slots
             .lock()
-            .map(|slots| slots.iter().copied().collect())
+            .map(|slots| slots.values().copied().collect())
             .unwrap_or_default()
     }
 
@@ -1370,7 +1445,7 @@ impl QuicCounters {
         }
     }
 
-    /// The two levels, which are read as they stand and never windowed.
+    /// The two levels.
     fn levels(&self) -> QuicLevels {
         QuicLevels {
             open: self.open.load(Ordering::Relaxed),
@@ -1867,7 +1942,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_filled_slot_is_read_as_a_shred_count_and_a_repair_count() {
+    fn test_filled_slot_is_read_as_counts() {
         // Names from `ledger/src/slot_stats.rs`. The last index is the highest
         // shred, so the count is one more.
         let tap = MetricsTap::default();
@@ -1920,6 +1995,42 @@ mod tests {
             tap.shred_fill((SHRED_FILLS as u64).saturating_add(9))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn test_a_leader_slots_bundles_are_summed_across_the_stage_threads() {
+        // Names from jito's `bundle_stage_leader_metrics.rs`, one point per
+        // stage thread under its own `id`.
+        let tap = MetricsTap::default();
+        tap.observe(&named(
+            BUNDLE_SLOT_STATS,
+            &[
+                ("id", "0i"),
+                ("slot", "445527719i"),
+                ("num_sanitized_ok", "10i"),
+                ("execution_results_ok", "8i"),
+            ],
+        ));
+        tap.observe(&named(
+            BUNDLE_SLOT_STATS,
+            &[
+                ("id", "1i"),
+                ("slot", "445527719i"),
+                ("num_sanitized_ok", "7i"),
+                ("execution_results_ok", "6i"),
+            ],
+        ));
+
+        let landed = tap.bundles_landed(445_527_719).unwrap();
+        assert_eq!((landed.sanitized, landed.executed), (17, 14));
+        assert!(tap.bundles_landed(445_527_718).is_none());
+    }
+
+    #[test]
+    fn test_a_bundle_point_without_a_slot_is_dropped() {
+        let tap = MetricsTap::default();
+        tap.observe(&named(BUNDLE_SLOT_STATS, &[("num_sanitized_ok", "3i")]));
+        assert!(tap.bundle_slots.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2233,13 +2344,16 @@ mod tests {
     #[test]
     fn test_only_the_newest_replayed_slots_are_kept() {
         let tap = MetricsTap::default();
-        for micros in 0..REPLAY_SLOTS.saturating_add(10) {
-            tap.observe(&replay_point(&[("execute_us", &format!("{micros}i"))]));
+        for slot in 0..REPLAY_SLOTS.saturating_add(10) {
+            tap.observe(&replay_point(&[
+                ("slot", &format!("{slot}i")),
+                ("execute_us", &format!("{slot}i")),
+            ]));
         }
 
         let held = tap.replay_slots();
         assert_eq!(held.len(), REPLAY_SLOTS);
-        assert_eq!(held[0].execute, 10, "oldest first, the first ten dropped");
+        assert_eq!(held[0].execute, 10, "lowest first, the first ten dropped");
     }
 
     #[test]
@@ -2266,7 +2380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_slot_is_read_by_the_same_rule_as_every_other_integer() {
+    fn test_slot_is_read_as_an_integer_field() {
         // `add_field_i64` writes "430789128i", not "430789128". A change upstream
         // fails here rather than quietly emptying the panel.
         let tap = MetricsTap::default();
@@ -2304,7 +2418,7 @@ mod tests {
     }
 
     #[test]
-    fn test_an_idle_scheduler_does_not_empty_a_slot_it_did_not_build() {
+    fn test_idle_scheduler_does_not_empty_a_slot() {
         // Two schedulers report every leader slot, and only the enabled one did the
         // work. Keeping the last to arrive emptied the panel on half of all slots.
         for order in [["10000", "0"], ["0", "10000"]] {
@@ -2486,11 +2600,8 @@ mod tests {
 
     #[test]
     fn test_the_shed_connections_account_for_the_offer() {
-        // The listener sheds in order, so every attempt is shed at one gate, fails the
-        // handshake, or is admitted, and the section is drawn against its own total.
-        // Not quite a partition: a second rate-limit after the handshake and a failed
-        // `accept()` are counted nowhere. This sample is built so neither happens;
-        // `handshook` measures them when they do.
+        // Every attempt is shed at one gate, fails the handshake, or is admitted.
+        // This sample avoids the two uncounted drops.
         let tap = MetricsTap::default();
         tap.observe(&named(QUIC_TPU, QUIC_POINT));
 
@@ -2687,7 +2798,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_cache_counter_named_differently_from_its_field_still_lands() {
+    fn test_replace_entry_lands_on_replacements() {
         // The point calls it `replace_entry` where the counter is `replacements`.
         let tap = MetricsTap::default();
         tap.observe(&named(
@@ -2750,7 +2861,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_reasons_a_worker_dropped_a_transaction_join_its_counts() {
+    fn test_worker_error_reasons_join_its_counts() {
         // Two points from the same worker on the same tick: what became of the work
         // and why. Read into one set of counters.
         let tap = MetricsTap::default();
@@ -2849,7 +2960,7 @@ mod tests {
     }
 
     #[test]
-    fn test_the_xdp_config_is_read_from_the_tags_and_the_fields_alike() {
+    fn test_xdp_config_is_read_from_tags_and_fields() {
         // A tag keeps its value; a string field arrives wrapped in quotes for the line
         // protocol.
         let tap = MetricsTap::default();
@@ -2879,7 +2990,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_missing_zero_copy_tag_reads_as_copy_rather_than_dropping_the_report() {
+    fn test_missing_zero_copy_tag_reads_as_copy() {
         // Everything else on the point is still worth having, and copy is the
         // reading that claims least.
         let mut point = DataPoint::new(XDP_NETWORK_CONFIG);
@@ -2919,5 +3030,48 @@ mod tests {
         assert_eq!(field_str(r#""6.8.0""#), "6.8.0");
         assert_eq!(field_str(r#""a \"b\" c""#), r#"a "b" c"#);
         assert_eq!(field_str("unquoted"), "unquoted");
+    }
+
+    #[test]
+    fn test_the_stake_seen_in_gossip_is_read_in_lamports() {
+        // The exact figure behind the whole percent the progress report carries.
+        let tap = MetricsTap::default();
+        assert!(tap.stake_in_gossip().is_none());
+        tap.observe(&named(
+            WFSM_GOSSIP,
+            &[
+                ("online_stake", "2350000000000000i"),
+                ("offline_stake", "401650000000000000i"),
+                ("total_activated_stake", "404000000000000000i"),
+            ],
+        ));
+        assert_eq!(
+            tap.stake_in_gossip(),
+            Some(StakeInGossip {
+                online: 2_350_000_000_000_000,
+                offline: 401_650_000_000_000_000,
+                total: 404_000_000_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn test_a_stake_point_without_a_total_is_dropped() {
+        let tap = MetricsTap::default();
+        tap.observe(&named(WFSM_GOSSIP, &[("online_stake", "5i")]));
+        assert!(tap.stake_in_gossip().is_none());
+    }
+
+    #[test]
+    fn test_the_latest_stake_count_stands() {
+        // A level: the newest count replaces the last rather than adding to it.
+        let tap = MetricsTap::default();
+        for online in ["1i", "2i"] {
+            tap.observe(&named(
+                WFSM_GOSSIP,
+                &[("online_stake", online), ("total_activated_stake", "10i")],
+            ));
+        }
+        assert_eq!(tap.stake_in_gossip().unwrap().online, 2);
     }
 }

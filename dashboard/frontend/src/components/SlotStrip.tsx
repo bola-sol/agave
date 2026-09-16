@@ -4,24 +4,19 @@ import type { LeaderRef } from "../schedule";
 import { barHeight } from "../slotScale";
 import type { SlotEntry, SlotLevel } from "../types";
 import { useStore } from "../useStore";
+import { useAlpenglow } from "../consensus";
 import { Logo } from "./Logo";
 import { Explain, PeakLine } from "./primitives";
 
 /** Slots shown in the strip. Beyond this the bars are too thin to read. */
 const STRIP_LENGTH = 64;
 
-/**
- * What each bar colour means, in the order a slot passes through them.
- *
- * The names deliberately match the position readouts above the strip, so that
- * "Confirmed" in the header and a confirmed-coloured bar are recognisably the
- * same thing. Pending and Skipped have no position equivalent: a position is
- * one slot number, whereas these are states many slots can be in.
- */
+/** What each bar colour means, in the order a slot passes through them,
+ *  named to match the position readouts above. */
 const LEVELS: Array<[SlotLevel, string, string]> = [
   ["incomplete", "Pending", "Received but not yet replayed, or still arriving"],
   ["completed", "Processed", "Replayed and frozen by this validator"],
-  ["optimistically_confirmed", "Confirmed", "Two thirds of stake has voted for it"],
+  ["optimistically_confirmed", "Confirmed", "The cluster has voted to confirm it"],
   ["rooted", "Rooted", "This validator has rooted it"],
   ["finalized", "Finalized", "Rooted by a supermajority of stake"],
   ["skipped", "Skipped", "The leader produced no block, or it did not arrive in time"],
@@ -33,6 +28,7 @@ const LEVEL_NAMES = new Map<SlotLevel, string>(
 
 export function SlotStrip() {
   const store = useStore();
+  const alpenglow = useAlpenglow();
   const processed = store.get<number>("summary", "completed_slot");
   const observedSlotNanos = store.get<number | null>(
     "summary",
@@ -43,11 +39,8 @@ export function SlotStrip() {
   // one it is aimed at. Entering the strip pins what is on screen; leaving
   // releases it and the view jumps forward to live.
   const [pinned, setPinned] = useState<SlotEntry[] | null>(null);
-  // The slot being inspected, by number rather than by position in the window.
-  // Both the pointer and the arrow keys set it, so only one of them is ever in
-  // charge — and a slot number survives the strip scrolling underneath it,
-  // which a position does not: every bar's index changes when a slot arrives,
-  // which would rebuild all sixty four of them on every tick.
+  // The slot being inspected, by number rather than position, so it survives
+  // the strip scrolling and the bars stay memoised.
   const [cursor, setCursor] = useState<number | null>(null);
   const live = store.getSlots().slice(-STRIP_LENGTH);
   const slots = pinned ?? live;
@@ -68,26 +61,36 @@ export function SlotStrip() {
 
   // Ordered from most settled to least, so the deltas read monotonically from
   // left to right. Deltas are relative to Processed, this validator's own tip.
+  // Under alpenglow confirmed, root and finalized are one slot, and a vote
+  // shows by landing in a certificate.
   const positions: Array<[string, number | undefined, string]> = [
     [
       "Finalized",
       store.get<number>("summary", "finalized_slot"),
-      "Highest root a supermajority of stake has also rooted",
+      alpenglow
+        ? "Highest slot with a finalization certificate"
+        : "Highest slot a supermajority of stake has rooted",
     ],
     [
       "Root",
       store.get<number>("summary", "root_slot"),
-      "Highest slot this validator has rooted. Rooting needs 32 slots built on top, so this sits about 32 behind",
+      "Highest slot this validator has rooted",
     ],
-    [
-      "Confirmed",
-      store.get<number>("summary", "optimistically_confirmed_slot"),
-      "Highest slot two thirds of stake has voted for",
-    ],
+    ...(alpenglow
+      ? []
+      : [
+          [
+            "Confirmed",
+            store.get<number>("summary", "optimistically_confirmed_slot"),
+            "Highest slot the cluster has voted to confirm",
+          ] as [string, number | undefined, string],
+        ]),
     [
       "Voted",
       store.get<number | null>("summary", "vote_slot") ?? undefined,
-      "The slot this validator last voted on",
+      alpenglow
+        ? "Last slot a certificate carrying this node's vote landed"
+        : "The slot this validator last voted on",
     ],
     ["Processed", processed, "Highest slot this validator has replayed and frozen"],
     [
@@ -96,6 +99,11 @@ export function SlotStrip() {
       "Highest slot this validator holds a bank for, whether or not it has been replayed",
     ],
   ];
+
+  const levels = alpenglow
+    ? LEVELS.filter(([level]) => level !== "optimistically_confirmed")
+    : LEVELS;
+  const ours = slots.filter((entry) => entry.mine).length;
 
   const release = () => {
     setPinned(null);
@@ -155,7 +163,7 @@ export function SlotStrip() {
             to be their level and would not be. */}
         <div className="slot-position slot-head-stat">
           <div className="slot-position-label">
-            <Explain text="Mean time between slots arriving at this validator over the last minute. Slots come from every leader in turn, so this measures the cluster's rate as seen from here, not this validator's own block production. The minute covers more slots than the strip shows.">
+            <Explain text="Mean time between slots arriving here over the last minute: the cluster's rate as seen from this node.">
               Slot time (1 min avg)
             </Explain>
           </div>
@@ -213,7 +221,7 @@ export function SlotStrip() {
       </div>
 
       <div className="slot-key">
-        {LEVELS.map(([level, label, explanation]) => (
+        {levels.map(([level, label, explanation]) => (
           <Explain className="slot-key-item" text={explanation} key={level}>
             <i className={`slot-key-swatch level-${level}`} />
             {label}
@@ -221,7 +229,7 @@ export function SlotStrip() {
         ))}
         <Explain className="slot-key-item" text="A slot this validator was scheduled to lead">
           <i className="slot-key-swatch slot-key-mine" />
-          Ours
+          Ours{ours > 0 && ` · ${ours} in window`}
         </Explain>
         {pinned !== null && (
           <SlotDetail
@@ -234,16 +242,8 @@ export function SlotStrip() {
   );
 }
 
-/**
- * The hovered slot, shown in a fixed place rather than in a tooltip.
- *
- * A tooltip over a bar is clipped at the ends of the strip, waits on the
- * browser's hover delay, and covers the very bars it describes. This appears
- * at once and always in the same spot.
- *
- * `role="status"` so that arrowing along the strip is announced. The bars
- * themselves are not focusable, so their labels would otherwise never be read.
- */
+/** The hovered slot, in a fixed place rather than a tooltip. `role="status"`
+ *  so arrowing along the strip is announced. */
 function SlotDetail({ entry, leader }: { entry: SlotEntry | null; leader: LeaderRef }) {
   if (!entry) {
     return (
@@ -271,15 +271,8 @@ function SlotDetail({ entry, leader }: { entry: SlotEntry | null; leader: Leader
   );
 }
 
-/**
- * Memoised, and the reason the cursor is a slot number rather than a position.
- *
- * The strip re-renders on every published value, several times a second, and
- * the store keeps entry identity for slots that did not change — so all but the
- * one or two bars that actually moved are skipped. Passing a position instead
- * would change every bar's props each time a slot arrived and the memo would
- * never hold. `onPoint` is the raw setState, which React keeps stable.
- */
+/** Memoised on the entry, which the store keeps stable for slots that did
+ *  not change. `onPoint` is the raw setState. */
 const SlotBar = memo(function SlotBar({
   entry,
   leader,
@@ -293,10 +286,8 @@ const SlotBar = memo(function SlotBar({
   nominalMs: number;
   onPoint: (slot: number) => void;
 }) {
-  // Height carries how long the slot took and colour carries consensus level.
-  // The duration comes from when the blockstore first saw a shred for the
-  // slot, so a slot with none yet — or one that was skipped, which never gets
-  // any — shows as a stub.
+  // Height is duration, colour is consensus level. A slot with no shreds yet
+  // shows as a stub.
   const durationMs = entry.duration_nanos === null ? null : entry.duration_nanos / 1e6;
   const height = barHeight(durationMs, nominalMs);
   // Named the same way the sidebar names them, so the two agree on who a slot

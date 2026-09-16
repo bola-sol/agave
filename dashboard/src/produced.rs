@@ -4,6 +4,13 @@
 
 use {serde::Serialize, solana_clock::Slot};
 
+/// What the bundle stage landed in a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Bundles {
+    pub sanitized: u64,
+    pub executed: u64,
+}
+
 /// What one produced block looked like. `transactions` and
 /// `non_vote_transactions` are differences against the parent; the rest are
 /// the bank's own.
@@ -43,6 +50,9 @@ pub struct ProducedBlock {
     /// Lamports paid into the jito tip accounts during this slot, as measured.
     /// The page works our commission out from it; see [`crate::tips`].
     pub tips: Option<u64>,
+    /// Absent where no bundle stage reported the slot: a stock validator, or
+    /// one under BAM.
+    pub bundles: Option<Bundles>,
 }
 
 /// The most recent produced blocks, oldest first.
@@ -69,9 +79,7 @@ impl ProducedRing {
     }
 
     /// Records a block, keeping the newest `capacity`. Returns false for a slot
-    /// already held, since a bank stays frozen for many ticks and only the first
-    /// sighting has the block's figures. Sorted on insert because bank forks is
-    /// walked as a map.
+    /// already held: only the first sighting has the block's figures.
     pub fn insert(&mut self, block: ProducedBlock) -> bool {
         if self.contains(block.slot) {
             return false;
@@ -83,6 +91,22 @@ impl ProducedRing {
             self.blocks.drain(..excess);
         }
         true
+    }
+
+    /// Fills in the bundles of any block still without them. The stage reports
+    /// a slot a moment after its bank freezes, which is after the block was
+    /// captured. True if a block changed.
+    pub fn fill_bundles(&mut self, landed: impl Fn(Slot) -> Option<Bundles>) -> bool {
+        let mut changed = false;
+        for block in &mut self.blocks {
+            if block.bundles.is_none()
+                && let Some(bundles) = landed(block.slot)
+            {
+                block.bundles = Some(bundles);
+                changed = true;
+            }
+        }
+        changed
     }
 }
 
@@ -106,7 +130,31 @@ mod tests {
             total_fees: 0,
             priority_fees: 0,
             tips: None,
+            bundles: None,
         }
+    }
+
+    #[test]
+    fn test_bundles_are_filled_in_once_the_stage_reports() {
+        let mut ring = ProducedRing::new(4);
+        ring.insert(block(10));
+        ring.insert(block(11));
+        let landed = |slot: Slot| {
+            (slot == 11).then_some(Bundles {
+                sanitized: 17,
+                executed: 14,
+            })
+        };
+        assert!(ring.fill_bundles(landed));
+        assert_eq!(ring.blocks()[0].bundles, None);
+        assert_eq!(
+            ring.blocks()[1].bundles,
+            Some(Bundles {
+                sanitized: 17,
+                executed: 14,
+            })
+        );
+        assert!(!ring.fill_bundles(landed), "nothing left to fill");
     }
 
     #[test]

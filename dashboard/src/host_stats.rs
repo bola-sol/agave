@@ -1,7 +1,6 @@
 //! Host load, processor time, memory, filesystem capacity and disk saturation,
-//! read from `/proc` and `statvfs` rather than the metrics tap, so the panel
-//! works on a node logging below the default. Capacity and saturation are kept
-//! apart: a machine can be in trouble on one while the other reads healthy.
+//! read from `/proc` and `statvfs` so the panel works on a node logging below
+//! the default.
 
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
@@ -701,7 +700,8 @@ ctxt 6789
     }
 
     #[test]
-    fn test_clamps_busy_where_the_kernel_clock_runs_past_the_interval() {
+    fn test_busy_is_clamped_to_the_interval() {
+        // Clamps busy where the kernel clock runs past the interval.
         let delta = DiskCounters {
             busy_ms: 1004,
             ..DiskCounters::default()

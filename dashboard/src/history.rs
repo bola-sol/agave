@@ -1,11 +1,11 @@
-//! A flat history of what each recent slot contained.
-//!
-//! The slot ring in [`crate::slots`] holds whole [`SlotEntry`] records, the
-//! right shape for the few hundred slots a client is sent and the wrong one
-//! for a hundred thousand. This holds the same span as fixed-size rows carrying
-//! only the columns the schedule page draws.
+//! A flat history of what each recent slot contained: fixed-size rows with
+//! only the columns the schedule page draws, a hundred thousand deep.
 
-use {crate::slots::SlotEntry, serde::Serialize, solana_clock::Slot};
+use {
+    crate::{certs::Reward, slots::SlotEntry},
+    serde::Serialize,
+    solana_clock::Slot,
+};
 
 /// Slots kept in the packed history: a hundred thousand, about eleven hours,
 /// for about eight megabytes. Allocated by the service because the server
@@ -21,7 +21,7 @@ pub struct PackedSlot {
     pub level: u8,
     /// Bit 0: a block was recorded. Bit 1: the slot's clock is known. Both needed
     /// because nought is a real reading for every count here.
-    pub flags: u8,
+    pub flags: u16,
     pub votes: u32,
     pub non_votes: u32,
     /// Compute units the block used, saturating into `u32`, seventy times the
@@ -33,9 +33,7 @@ pub struct PackedSlot {
     /// The priority half of `fees`, so the split survives into history.
     pub priority_fees: u64,
     /// Lamports paid into the jito tip accounts during this slot, as measured.
-    /// What reached a distribution account and what it earned us are worked out
-    /// where drawn, from rates a correction can still reach. Nought unless
-    /// `HAS_TIPS` is set.
+    /// Nought unless `HAS_TIPS` is set.
     pub tips: u64,
     /// Wall time replay's own thread spent on the slot, in microseconds and
     /// saturating into `u32`, which is over an hour. Nought unless `HAS_REPLAY`.
@@ -60,15 +58,13 @@ pub struct PackedSlot {
 /// ceiling, which a test below holds it to. Twenty-five times a screenful.
 pub const MAX_RANGE_SLOTS: usize = 4096;
 
-/// One slot as it goes on the wire: a JSON array, because field names would
-/// outweigh the figures. Order: level, flags, votes, non-votes, compute, fees,
-/// priority fees, tips, time, replay, shreds, repaired, full, replayed. The
-/// frontend mirrors it. A struct rather than a tuple, which std stops
-/// deriving for at twelve.
+/// One slot as it goes on the wire, a JSON array in this order: level, flags,
+/// votes, non-votes, compute, fees, priority fees, tips, time, replay, shreds,
+/// repaired, full, replayed. The frontend mirrors it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct WireRow(
     pub u8,
-    pub u8,
+    pub u16,
     pub u32,
     pub u32,
     pub u32,
@@ -96,19 +92,35 @@ pub struct SlotRange {
 
 /// Set where the slot recorded a block, as against one that has not frozen or
 /// was skipped.
-pub const HAS_BLOCK: u8 = 1;
+pub const HAS_BLOCK: u16 = 1;
 /// Set where the slot's first shred was timed.
-pub const HAS_CLOCK: u8 = 1 << 1;
+pub const HAS_CLOCK: u16 = 1 << 1;
 /// Set where the slot's tips were measured. Nought is a real reading: the
 /// searchers passed that leader by.
-pub const HAS_TIPS: u8 = 1 << 2;
+pub const HAS_TIPS: u16 = 1 << 2;
 /// Set where replay's time on the slot was seen. Clear for a bank this validator
 /// built, which replay never timed.
-pub const HAS_REPLAY: u8 = 1 << 3;
+pub const HAS_REPLAY: u16 = 1 << 3;
 /// Set where the blockstore reported the slot filling.
-pub const HAS_SHREDS: u8 = 1 << 4;
+pub const HAS_SHREDS: u16 = 1 << 4;
 /// Set where replay's finish was seen, and so timed from the first shred.
-pub const HAS_REPLAYED: u8 = 1 << 5;
+pub const HAS_REPLAYED: u16 = 1 << 5;
+/// Two bits for the reward certificate's verdict on this node's vote: unseen,
+/// paid, unpaid, or no certificate written.
+pub const REWARD_SHIFT: u16 = 6;
+pub const REWARD_MASK: u16 = 0b11 << REWARD_SHIFT;
+pub const REWARD_PAID: u16 = 1 << REWARD_SHIFT;
+pub const REWARD_UNPAID: u16 = 2 << REWARD_SHIFT;
+pub const REWARD_NONE: u16 = 3 << REWARD_SHIFT;
+
+fn reward_bits(reward: Option<Reward>) -> u16 {
+    match reward {
+        None => 0,
+        Some(Reward::Paid) => REWARD_PAID,
+        Some(Reward::Unpaid) => REWARD_UNPAID,
+        Some(Reward::NoCertificate) => REWARD_NONE,
+    }
+}
 
 /// A fixed-size history of packed slots, direct-mapped at `slot % capacity`.
 /// The slot is stored beside its row so a row from a lap ago cannot answer for
@@ -199,6 +211,7 @@ impl SlotHistory {
             row.flags |= HAS_REPLAYED;
             row.replayed_millis = clamp(millis);
         }
+        row.flags = (row.flags & !REWARD_MASK) | reward_bits(entry.reward);
     }
 
     /// When the slot's first shred arrived, which the collector reads from the
@@ -251,6 +264,23 @@ mod tests {
             time_millis: None,
             shreds: None,
             replayed_millis: None,
+            reward: None,
+        }
+    }
+
+    #[test]
+    fn test_the_reward_verdict_packs_into_two_bits() {
+        let mut history = SlotHistory::new(64);
+        for (reward, bits) in [
+            (Some(Reward::Paid), REWARD_PAID),
+            (Some(Reward::Unpaid), REWARD_UNPAID),
+            (Some(Reward::NoCertificate), REWARD_NONE),
+            (None, 0),
+        ] {
+            let mut seen = entry(10);
+            seen.reward = reward;
+            history.record(&seen);
+            assert_eq!(history.get(10).expect("recorded").flags & REWARD_MASK, bits);
         }
     }
 
@@ -369,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_range_carries_the_columns_in_the_order_the_frontend_reads_them() {
+    fn test_range_column_order() {
         // The one place the wire order is pinned.
         let mut history = SlotHistory::new(64);
         history.record(&with_block(10, 9_500, 8_752));
@@ -445,11 +475,9 @@ mod tests {
     }
 
     #[test]
-    fn test_a_full_range_of_mainnet_sized_rows_fits_the_message_ceiling() {
-        // Every figure as large as a real slot's gets: fees in the thousands of
-        // SOL, a thirteen-digit clock, a compute figure at the row's clamp. The
-        // worst case the types allow does not fit and never did; this is the
-        // case the page will meet.
+    fn test_full_range_fits_the_message_ceiling() {
+        // Every figure as large as a real slot's gets; the worst case the types
+        // allow does not fit and never did.
         let mut history = SlotHistory::new(MAX_RANGE_SLOTS);
         for slot in 0..MAX_RANGE_SLOTS as Slot {
             let mut big = with_block(slot, 99_999, 99_999);
@@ -542,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_block_that_landed_empty_is_not_a_block_that_was_never_seen() {
+    fn test_empty_block_differs_from_no_block() {
         // Both are nought in every count, which is why the flag exists.
         let mut history = SlotHistory::new(64);
         history.record(&with_block(900, 0, 0));

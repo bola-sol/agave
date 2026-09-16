@@ -1,28 +1,32 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { Fragment, useMemo, useState, type ReactNode } from "react";
 import { blockStamp, blockTime, bytes, count, percent, sol, units } from "../format";
 import { recurrence } from "../cost";
-import { blockAverages, sortBlocks, type SortDir, type SortKey } from "../produced";
+import {
+  blockSummary,
+  sortBlocks,
+  type BlockFigures,
+  type SortDir,
+  type SortKey,
+} from "../produced";
+import { epochOf } from "../schedule";
 import { jitoShare, ourShare } from "../tips";
-import type { ProducedBlock, SlotCost, SlotWaterfall, TipRates } from "../types";
+import type { EpochInfo, ProducedBlock, SlotCost, SlotWaterfall, TipRates } from "../types";
 import { useStore } from "../useStore";
-import { capacity, schedulerView, shareOfGroup, type Capacity, type SchedulerView } from "../slotDetail";
+import { useAlpenglow } from "../consensus";
+import {
+  bundlesValue,
+  capacity,
+  schedulerView,
+  shareOfGroup,
+  type Capacity,
+  type SchedulerView,
+} from "../slotDetail";
 import type { WaterfallRow } from "../waterfall";
 import { Copyable } from "./Copyable";
 import { Explain } from "./primitives";
 
-/**
- * Every block this validator produced, and what went into each one.
- *
- * All of it is read while the block's bank is still in bank forks, since the
- * cost tracker and the collected fees go with the bank when it is dropped after
- * rooting. This is a record of what was captured as each block froze, not
- * something that can be recomputed for an arbitrary past slot, which is why the
- * list ends where the dashboard started rather than where the ledger does.
- *
- * A page rather than a card because a row opens into several hundred pixels of
- * detail. Squeezed into the overview it scrolled that through a six-row window,
- * and the waterfall inside it was most of what had to be scrolled past.
- */
+/** Every block this validator produced, captured as each froze; the list
+ *  ends where the dashboard started. */
 export function SlotDetailsPage() {
   const store = useStore();
   const blocks = store.get<ProducedBlock[]>("summary", "produced_blocks");
@@ -61,21 +65,32 @@ export function SlotDetailsPage() {
   const toggle = (key: SortKey) =>
     setSort(sort?.key === key ? { key, dir: sort.dir === "desc" ? "asc" : "desc" } : { key, dir: "desc" });
 
+  // Dividers only in the newest-first order, where an epoch boundary is one
+  // place, and only when the blocks held span more than one epoch.
+  const epoch = store.get<EpochInfo>("epoch", "new");
+  const numbered = listed.map((block) => ({ block, epoch: epochOf(epoch, block.slot) }));
+  const divided = !sort && new Set(numbered.map((entry) => entry.epoch)).size > 1;
+
   return (
     <section className="slot-details">
       <div className="produced">
-        <AveragesRow blocks={blocks} sort={sort} onSort={toggle} onClear={() => setSort(null)} />
-        {listed.map((block) => (
-          <BlockRow
-            key={block.slot}
-            block={block}
-            waterfall={bySlot.get(block.slot)}
-            cost={costBySlot.get(block.slot)}
-            costs={costs ?? []}
-            rates={rates}
-            open={open === block.slot}
-            onToggle={() => setOpen(open === block.slot ? null : block.slot)}
-          />
+        <SummaryRows blocks={blocks} sort={sort} onSort={toggle} onClear={() => setSort(null)} />
+        {numbered.map(({ block, epoch: at }, index) => (
+          <Fragment key={block.slot}>
+            {divided && at !== null && at !== numbered[index - 1]?.epoch && (
+              <div className="produced-epoch">epoch {count(at)}</div>
+            )}
+            <BlockRow
+              block={block}
+              epoch={at}
+              waterfall={bySlot.get(block.slot)}
+              cost={costBySlot.get(block.slot)}
+              costs={costs ?? []}
+              rates={rates}
+              open={open === block.slot}
+              onToggle={() => setOpen(open === block.slot ? null : block.slot)}
+            />
+          </Fragment>
         ))}
       </div>
       <div className="card-footnote">
@@ -87,18 +102,6 @@ export function SlotDetailsPage() {
   );
 }
 
-/**
- * The mean of each column, at the head of the column it averages.
- *
- * The rows below are a record rather than a series — a validator leads in
- * bursts of four and then not for an hour — so scanning them for whether a
- * block was ordinary means holding the last dozen in your head. This is that
- * comparison, on the same grid so the figures sit directly above the ones they
- * are the average of.
- *
- * Over the blocks held, which is what the page shows and what the footnote
- * counts. It is not an average over the epoch and does not claim to be.
- */
 /** An average that sorts its column. Module-level: a component made inside the
     row is a new type each render, so the buttons remounted under every click. */
 function SortButton({
@@ -137,7 +140,9 @@ const SORT_WORD: Record<SortKey, string> = {
   duration: "duration",
 };
 
-function AveragesRow({
+/** The mean, median and poor tail of each column over the blocks held, at the
+ *  head of the columns. The mean row's figures sort their column. */
+function SummaryRows({
   blocks,
   sort,
   onSort,
@@ -148,57 +153,94 @@ function AveragesRow({
   onSort: (key: SortKey) => void;
   onClear: () => void;
 }) {
-  const avg = blockAverages(blocks);
+  const summary = blockSummary(blocks);
+  const held = count(summary.blocks);
+  const { mean } = summary;
+  return (
+    <>
+      <div className="produced-averages">
+        <span className="produced-id">
+          <Explain
+            className="produced-avg-label"
+            text={`Mean of each column over the ${held} blocks held. A block missing a figure is left out of that column.`}
+          >
+            mean
+          </Explain>
+          {sort && (
+            <button type="button" className="produced-clear" onClick={onClear} aria-label="Clear sort">
+              ×<span className="produced-clear-word"> clear</span>
+            </button>
+          )}
+        </span>
+        <SortButton column="transactions" sort={sort} onSort={onSort} className="produced-txns">
+          {txns(mean.transactions)}
+        </SortButton>
+        <SortButton column="filled" sort={sort} onSort={onSort} className="produced-fill">
+          {full(mean.filled)}
+        </SortButton>
+        <SortButton column="fees" sort={sort} onSort={onSort} className="produced-fees">
+          {fees(mean.fees)}
+        </SortButton>
+        <SortButton column="duration" sort={sort} onSort={onSort} className="produced-ms">
+          {millis(mean.durationMillis)}
+        </SortButton>
+      </div>
+      <FiguresRow
+        label="median"
+        explain={`The middle block of each column over the ${held} held.`}
+        figures={summary.median}
+      />
+      <FiguresRow
+        label="worst 5%"
+        explain={`The fifth percentile of transactions, fill and fees, and the ninety fifth of duration, over the ${held} blocks held.`}
+        figures={summary.worst}
+      />
+    </>
+  );
+}
+
+function FiguresRow({
+  label,
+  explain,
+  figures,
+}: {
+  label: string;
+  explain: string;
+  figures: BlockFigures;
+}) {
   return (
     <div className="produced-averages">
       <span className="produced-id">
-        <Explain
-          className="produced-avg-label"
-          text={`The mean of each column over the ${count(avg.blocks)} blocks held on this page. Blocks missing a figure are left out of its average rather than counted as nought, so a column can be averaged over fewer blocks than the one beside it.`}
-        >
-          avg
+        <Explain className="produced-avg-label" text={explain}>
+          {label}
         </Explain>
-        {sort && (
-          <button type="button" className="produced-clear" onClick={onClear} aria-label="Clear sort">
-            ×<span className="produced-clear-word"> clear</span>
-          </button>
-        )}
       </span>
-      <SortButton column="transactions" sort={sort} onSort={onSort} className="produced-txns">
-        {avg.transactions === null ? "—" : `${count(Math.round(avg.transactions))} txns`}
-      </SortButton>
-      <SortButton column="filled" sort={sort} onSort={onSort} className="produced-fill">
-        {avg.filled === null ? "—" : `${percent(avg.filled, 1)} full`}
-      </SortButton>
-      <SortButton column="fees" sort={sort} onSort={onSort} className="produced-fees">
-        {avg.fees === null ? (
-          "—"
-        ) : (
-          <>
-            {sol(avg.fees, 5)}
-            <span className="produced-fees-unit"> SOL</span>
-          </>
-        )}
-      </SortButton>
-      <SortButton column="duration" sort={sort} onSort={onSort} className="produced-ms">
-        {avg.durationMillis === null ? "—" : `${Math.round(avg.durationMillis)} ms`}
-      </SortButton>
+      <span className="produced-txns">{txns(figures.transactions)}</span>
+      <span className="produced-fill">{full(figures.filled)}</span>
+      <span className="produced-fees">{fees(figures.fees)}</span>
+      <span className="produced-ms">{millis(figures.durationMillis)}</span>
     </div>
   );
 }
 
-/**
- * One produced block: the row that names it, and what it held once opened.
- *
- * The body is led by the block's compute rather than by the scheduler. What an
- * operator wants from a block they produced is how full it was and what filled
- * it; the scheduler's two dozen counters are nought on a healthy slot, and as a
- * flat list they were most of the height of the page saying nothing happened.
- * They are all still here, one line summarising them and the detail a click
- * away.
- */
+const txns = (value: number | null) => (value === null ? "—" : `${count(Math.round(value))} txns`);
+const full = (value: number | null) => (value === null ? "—" : `${percent(value, 1)} full`);
+const millis = (value: number | null) => (value === null ? "—" : `${Math.round(value)} ms`);
+const fees = (value: number | null) =>
+  value === null ? (
+    "—"
+  ) : (
+    <>
+      {sol(value, 5)}
+      <span className="produced-fees-unit"> SOL</span>
+    </>
+  );
+
+/** One produced block: the row that names it, and what it held once opened,
+ *  led by its compute. */
 function BlockRow({
   block,
+  epoch,
   waterfall,
   cost,
   costs,
@@ -207,6 +249,8 @@ function BlockRow({
   onToggle,
 }: {
   block: ProducedBlock;
+  /** The epoch the slot fell in, or null before the epoch message has arrived. */
+  epoch: number | null;
   waterfall: SlotWaterfall | undefined;
   cost: SlotCost | undefined;
   /** Every produced block's cost, for reading this one against the rest. */
@@ -265,6 +309,7 @@ function BlockRow({
               className="produced-foot-slot"
             />
             <span className="produced-time">{blockTime(block.slot_time_millis)}</span>
+            {epoch !== null && <span className="produced-time">epoch {count(epoch)}</span>}
             {/* The blockhash, which is the hash of the block's last entry and
                 not a transaction signature. Copyable because reading forty-four
                 base58 characters off a screen is nobody's idea of a good time. */}
@@ -299,13 +344,7 @@ function Stat({
   );
 }
 
-/**
- * What the block cost, and what the rest of the limit did.
- *
- * The headline figure of the whole body. A produced block is worth reading for
- * how much of its allowance it used, and the number that answers that was
- * previously one of eight equal figures in a grid.
- */
+/** What the block cost, and what the rest of the limit did. */
 function BlockCompute({
   block,
   cost,
@@ -315,6 +354,7 @@ function BlockCompute({
   cost: SlotCost | undefined;
   rates: TipRates | undefined;
 }) {
+  const alpenglow = useAlpenglow();
   const cap = capacity(block, cost);
   const votes = Math.max(0, block.transactions - block.non_vote_transactions);
   const unused = Math.max(0, block.block_cost_limit - block.block_cost);
@@ -324,7 +364,7 @@ function BlockCompute({
       <div className="sx-head">
         <div className="sx-cu">
           <div className="sx-eyebrow">
-            <Explain text="What this block's transactions cost to execute, against the ceiling consensus puts on a block. A block well under its limit was not necessarily short of work: every account has its own ceiling too, far below this one, so a single busy account can stop a half-empty block taking anything more that touches it.">
+            <Explain text="Compute this block's transactions cost, against the block ceiling. Each account has a far lower ceiling of its own.">
               Compute units used
             </Explain>
           </div>
@@ -334,8 +374,11 @@ function BlockCompute({
           </div>
         </div>
         <div className="sx-stats">
-          <Stat label="Non-vote" value={count(block.non_vote_transactions)} />
-          <Stat label="Votes" value={count(votes)} />
+          <Stat
+            label={alpenglow ? "Transactions" : "Non-vote"}
+            value={count(block.non_vote_transactions)}
+          />
+          {!alpenglow && <Stat label="Votes" value={count(votes)} />}
           {/* Toned only when it happened. A failed transaction is still in the
               block and still paid its fee, so this is worth noticing and is not
               in itself a fault. */}
@@ -367,6 +410,15 @@ function BlockCompute({
               title={`${sol(jitoShare(block.tips, rates), 6)} SOL reached the distribution account, of ${sol(block.tips, 6)} paid. Derived from the configured rates, not measured.`}
             />
           )}
+          {/* Beside the tips, which is what they paid. Absent where no bundle
+              stage reported the slot: a stock validator, or one under BAM. */}
+          {block.bundles && (
+            <Stat
+              label="Bundles"
+              value={bundlesValue(block.bundles)}
+              title={`${count(block.bundles.sanitized)} bundles sanitised, ${count(block.bundles.executed)} executed and in the block.`}
+            />
+          )}
         </div>
       </div>
       {cap && <CapacityBar cap={cap} />}
@@ -374,15 +426,8 @@ function BlockCompute({
   );
 }
 
-/**
- * The limit, cut into what one account took, what everything else took, and
- * what went unused.
- *
- * Three shares of the limit rather than of the block, which is the only reading
- * under which the unused part belongs on the same bar. It does mean the
- * costliest account's segment is smaller than its share of the block, by
- * however empty the block was — the figures beside the account below give both.
- */
+/** The limit cut into the costliest account, everything else, and unused:
+ *  shares of the limit, not of the block. */
 function CapacityBar({ cap }: { cap: Capacity }) {
   return (
     <div className="sx-cap">
@@ -409,14 +454,8 @@ function CapacityBar({ cap }: { cap: Capacity }) {
   );
 }
 
-/**
- * The account that took the most of the block.
- *
- * One account, because one is what the collector reports. Its two percentages
- * are deliberately both shown and are not the same measurement: the share of
- * its own per-account ceiling is what says whether it was throttled, and the
- * share of the block is what says whether it crowded anything else out.
- */
+/** The account that took the most of the block, as a share of its own
+ *  ceiling and of the block. */
 function BlockAccount({
   block,
   cost,
@@ -434,7 +473,7 @@ function BlockAccount({
   return (
     <div className="sx-acct">
       <div className="sx-eyebrow">
-        <Explain text="The account this block charged the most compute to. Every account has its own ceiling within a block, well below the block's own, so this is the figure that says whether one account was what stopped the block taking more.">
+        <Explain text="The account charged the most compute in this block, against the per-account ceiling.">
           Costliest account
         </Explain>
       </div>
@@ -477,20 +516,8 @@ function BlockAccount({
   );
 }
 
-/**
- * What the scheduler did with this slot, in one line and a drawer.
- *
- * The line is the four points every transaction passes through and one figure
- * for everything lost between them. That is the whole of it on a healthy slot,
- * which is nearly all of them. The drawer holds the counters themselves,
- * grouped by the stage that dropped them, and is worth opening only when the
- * line says something was lost.
- *
- * Named for whichever scheduler built the block. A stock validator has one and
- * the name never changes; a jito validator hands the slot to BAM whenever BAM
- * is connected, and which of the two built a given block is not otherwise
- * visible anywhere on the page.
- */
+/** What the scheduler did with this slot: one line, and a drawer of the
+ *  counters grouped by stage. Named for whichever scheduler built it. */
 function BlockScheduler({ waterfall }: { waterfall: SlotWaterfall }) {
   const view = schedulerView(waterfall);
   const [breakdown, setBreakdown] = useState(false);
@@ -502,13 +529,13 @@ function BlockScheduler({ waterfall }: { waterfall: SlotWaterfall }) {
     <div className="sx-sched">
       <div className="sx-strip">
         <span className="sx-strip-label">
-          <Explain text="Every transaction the banking stage was handed during this slot, and what became of it. The counters behind the breakdown say what got no further and why. Received is exactly buffered plus the intake reasons; the later stages do not add up the same way, because the queue holds transactions across slots and some of what was scheduled here arrived before this slot began.">
+          <Explain text="Every transaction the banking stage was handed in this slot, and what became of it. Received equals buffered plus the intake reasons; the later stages hold work across slots and do not.">
             Scheduler
           </Explain>
           {bam && (
             <>
               {" · "}
-              <Explain text="BAM built this block. It is sent atomic transaction batches rather than packets off the wire, so the first figure below is counted in batches and the three after it in transactions.">
+              <Explain text="BAM built this block, so the first figure is counted in batches and the rest in transactions.">
                 BAM
               </Explain>
             </>
@@ -610,14 +637,7 @@ function Breakdown({ view }: { view: SchedulerView }) {
   );
 }
 
-/**
- * One counter.
- *
- * A counter above nought gets a bar of its share of its group; one at nought
- * gets a line and no bar. A bar of zero length beside every quiet counter was
- * the largest part of what made the old list unreadable, and it said nothing a
- * nought in the column did not already say.
- */
+/** One counter: a bar of its share of the group, or no bar at nought. */
 function CounterRow({
   row,
   share,

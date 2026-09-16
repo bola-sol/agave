@@ -8,6 +8,7 @@ import {
   HAS_REPLAYED,
   HAS_SHREDS,
   HAS_TIPS,
+  REWARD_SHIFT,
   type SlotRange,
   type WireRow,
 } from "./slotHistory";
@@ -203,5 +204,17 @@ describe("entriesOf", () => {
     expect(entry.mine).toBe(true);
     expect("leader" in entry).toBe(false);
     expect("leader_name" in entry).toBe(false);
+  });
+});
+
+describe("reward flags", () => {
+  it("reads the two bits as the four verdicts", () => {
+    const rewardOf = (bits: number) =>
+      entriesOf({ first_slot: 1000, rows: [row({ 1: bits << REWARD_SHIFT })] }, epochOf(), undefined)[0]
+        .reward;
+    expect(rewardOf(0)).toBeNull();
+    expect(rewardOf(1)).toBe("paid");
+    expect(rewardOf(2)).toBe("unpaid");
+    expect(rewardOf(3)).toBe("no_certificate");
   });
 });

@@ -1,10 +1,7 @@
-//! Wire protocol for the dashboard websocket.
-//!
-//! Every message is a JSON envelope with a `topic`, a `key` within it, and a
-//! `value`. Retained messages carry state; the newest value per `(topic, key)`
-//! is kept so a client connecting late is caught up in one shot. Ephemeral
-//! messages describe an event and reach only the clients connected at the
-//! time. A request carries an `id`, and its reply goes to that `id` alone.
+//! Wire protocol: JSON envelopes of `topic`, `key` and `value`. Retained
+//! messages keep their newest value per key for clients connecting late;
+//! ephemeral ones reach only the clients connected at the time. A request
+//! carries an `id` and its reply goes to that `id` alone.
 
 use {
     serde::{Deserialize, Serialize},
@@ -15,10 +12,8 @@ use {
     tokio::sync::broadcast,
 };
 
-/// Ceiling on a single websocket message, both directions: soketto takes one
-/// limit per connection, and a client's frame is buffered whole before any
-/// smaller limit applies. The largest server message is the 512-slot overview
-/// at under half a megabyte.
+/// Ceiling on a websocket message in either direction, soketto having one
+/// limit per connection. The largest server message is under half of it.
 pub const MAX_MESSAGE: usize = 1024 * 1024;
 
 /// Messages buffered per client before it counts as too slow and is dropped.
@@ -83,7 +78,7 @@ pub fn encode_with_id<T: Serialize>(topic: &str, key: &str, id: Option<u64>, val
 /// Fans messages out to connected clients and remembers the latest value of
 /// every retained key so new connections can be caught up in one shot.
 pub struct Publisher {
-    retained: Mutex<BTreeMap<(&'static str, String), Message>>,
+    retained: Mutex<BTreeMap<(&'static str, &'static str), Message>>,
     sender: broadcast::Sender<Message>,
 }
 
@@ -103,12 +98,12 @@ impl Publisher {
     }
 
     /// Publish a value that should be replayed to clients connecting later.
-    pub fn publish<T: Serialize>(&self, topic: &'static str, key: &str, value: &T) {
+    pub fn publish<T: Serialize>(&self, topic: &'static str, key: &'static str, value: &T) {
         let message = encode(topic, key, value);
         self.retained
             .lock()
             .unwrap()
-            .insert((topic, key.to_string()), message.clone());
+            .insert((topic, key), message.clone());
         // An error here only means nobody is listening yet.
         let _ = self.sender.send(message);
     }
@@ -120,12 +115,9 @@ impl Publisher {
 
     /// Updates what a future connection receives without sending anything now,
     /// for bulk snapshots whose incremental changes go out separately.
-    pub fn retain_only<T: Serialize>(&self, topic: &'static str, key: &str, value: &T) {
+    pub fn retain_only<T: Serialize>(&self, topic: &'static str, key: &'static str, value: &T) {
         let message = encode(topic, key, value);
-        self.retained
-            .lock()
-            .unwrap()
-            .insert((topic, key.to_string()), message);
+        self.retained.lock().unwrap().insert((topic, key), message);
     }
 
     /// Everything a freshly connected client needs to render a full view.
@@ -163,7 +155,13 @@ impl<T> Debounced<T> {
 }
 
 impl<T: Serialize + PartialEq> Debounced<T> {
-    pub fn publish(&mut self, publisher: &Publisher, topic: &'static str, key: &str, value: T) {
+    pub fn publish(
+        &mut self,
+        publisher: &Publisher,
+        topic: &'static str,
+        key: &'static str,
+        value: T,
+    ) {
         if self.last.as_ref() == Some(&value) {
             return;
         }
@@ -187,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_payload_that_cannot_encode_does_not_take_the_feed_down() {
+    fn test_unencodable_payload_keeps_the_feed_up() {
         // One broken topic costs that topic and nothing else.
         let message = encode("summary", "broken", &Unserializable);
         assert_eq!(

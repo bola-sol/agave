@@ -515,6 +515,30 @@ body {
   gap: 12px;
 }
 
+/* While the validator boots, every card but the one carrying the boot
+   sequence is blurred and dimmed, and takes no clicks. The one that stays
+   sharp is raised so the blur of a neighbour cannot bleed over its edge. */
+.app.is-booting .card:not(.is-lit) {
+  filter: blur(3px);
+  opacity: 0.55;
+  pointer-events: none;
+  user-select: none;
+  transition:
+    filter 300ms ease,
+    opacity 300ms ease;
+}
+
+.app.is-booting .card.is-lit {
+  position: relative;
+  z-index: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app.is-booting .card:not(.is-lit) {
+    transition: none;
+  }
+}
+
 /* Always the first row of the card, never a cell in the body's own layout. */
 .card-head {
   display: flex;
@@ -551,9 +575,19 @@ body {
   font-size: 11px;
 }
 
+/* Four across where four fit, else two, else one: never three, which leaves
+   one card alone on the row below. */
 .grid {
+  --card-min: 300px;
+  --four-across: calc(4 * var(--card-min) + 3 * var(--gap));
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(
+    auto-fit,
+    minmax(
+      max(var(--card-min), min((100% - var(--gap)) / 2, (var(--four-across) - 100%) * 999)),
+      1fr
+    )
+  );
   gap: var(--gap);
 }
 
@@ -801,8 +835,11 @@ body {
   border-radius: 2px;
 }
 
+/* Our leader slots: the track is tinted and capped, a lane that reads at any
+   bar width where a one pixel outline did not. */
 .slot-bar.mine {
-  outline: 1px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 3px 0 var(--accent);
 }
 
 /* The strip is one tab stop; the arrows move within it. */
@@ -812,10 +849,14 @@ body {
   border-radius: 2px;
 }
 
-/* The bar the pointer or the arrow keys are on. Deliberately not an outline:
-   `.mine` is already one, and a leader slot can be the pointed-at slot. */
+/* The bar the pointer or the arrow keys are on. A leader slot keeps its lane
+   when pointed at. */
 .slot-bar.is-active {
   background: color-mix(in srgb, var(--text-faint) 35%, transparent);
+}
+
+.slot-bar.mine.is-active {
+  background: color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
 .slot-bar.is-active .slot-bar-fill {
@@ -1182,6 +1223,38 @@ body {
   color: var(--text-dim);
 }
 
+/* The bar with the share the wait ends at marked on it. */
+.startup-meter {
+  position: relative;
+}
+
+.startup-meter .meter {
+  margin-top: 0;
+}
+
+.startup-target {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 10px;
+  background: var(--warn);
+  transform: translateX(-1px);
+}
+
+.startup-measure-sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.startup-measure-sub b {
+  font-family: ui-monospace, monospace;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
 .startup-detail {
   color: var(--text-faint);
   font-weight: 400;
@@ -1231,9 +1304,8 @@ body {
 }
 
 .slot-key-mine {
-  background: transparent;
-  outline: 1px solid color-mix(in srgb, var(--accent) 60%, transparent);
-  outline-offset: -1px;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 0 2px 0 var(--accent);
 }
 
 /* ---- sidebar ---- */
@@ -1470,6 +1542,14 @@ body {
   letter-spacing: 0.04em;
   color: var(--text-faint);
   margin-bottom: 3px;
+}
+
+.tps-total-unit {
+  margin-left: 8px;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-faint);
 }
 
 .tps-total-value {
@@ -1954,9 +2034,19 @@ body {
    with the column's edge. */
 .produced-averages {
   padding: 5px 6px;
-  margin-bottom: 2px;
   border-bottom: 1px solid var(--border);
   color: var(--text-faint);
+  cursor: default;
+}
+
+/* Three summary rows read as one head: ruled faintly between, and set off
+   from the first block below. */
+.produced-averages:has(+ .produced-averages) {
+  border-bottom-color: color-mix(in srgb, var(--border) 50%, transparent);
+}
+
+.produced-averages + :not(.produced-averages) {
+  margin-top: 2px;
 }
 
 .produced-avg-label {
@@ -2078,6 +2168,30 @@ body {
   min-width: 0;
   font-family: ui-monospace, monospace;
   color: var(--text-faint);
+}
+
+/* Where the list steps from one epoch into the next. Drawn only while the
+   blocks held span more than one epoch. */
+.produced-epoch {
+  padding: 12px 4px 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* On a phone the slot, time and epoch take the width between them, so the
+   hash gets a line of its own rather than seven characters and an ellipsis. */
+@media (max-width: 700px) {
+  .produced-foot {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .produced-hash {
+    flex-basis: 100%;
+  }
 }
 
 /* On a narrow screen the four figure columns leave too little for the slot
@@ -4284,6 +4398,29 @@ body {
   color: var(--text);
 }
 
+.vote-marks {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.vote-mark {
+  font-style: normal;
+}
+
+.vote-mark.is-yes {
+  color: var(--good);
+}
+
+.vote-mark.is-no {
+  color: var(--bad);
+}
+
+.vote-mark.is-unknown,
+.vote-mark.is-none {
+  color: var(--text-faint);
+}
+
 .schedule-level {
   width: 4px;
   height: 12px;
@@ -4367,5 +4504,293 @@ body {
   .schedule-group {
     grid-template-columns: minmax(0, 1fr);
     gap: 8px;
+  }
+}
+
+/* The supermajority wait per validator: columns against the line, and the
+   two lists. */
+.gs-body {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.gs-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+}
+
+.gs-plot {
+  position: relative;
+  height: 200px;
+  margin: 12px 8px 0 28px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-around;
+  align-items: flex-end;
+}
+
+.gs-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 1px dashed var(--text-dim);
+}
+
+.gs-line span,
+.gs-zero {
+  position: absolute;
+  right: 100%;
+  margin-right: 6px;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.gs-line span {
+  top: -7px;
+}
+
+.gs-zero {
+  bottom: -6px;
+}
+
+.gs-col {
+  width: 34%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+}
+
+.gs-col-value {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.gs-col-value.is-seen {
+  color: var(--warn);
+}
+
+.gs-bar {
+  width: 100%;
+  border-radius: 2px 2px 0 0;
+}
+
+.gs-bar.is-seen,
+.gs-fill.is-seen {
+  background: var(--warn);
+}
+
+.gs-bar.is-unseen,
+.gs-fill.is-unseen {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--level-incomplete) 0 4px,
+    var(--panel-raised) 4px 8px
+  );
+}
+
+.gs-axis {
+  display: flex;
+  justify-content: space-around;
+  margin-left: 28px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.gs-note {
+  margin-top: 12px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+/* One scrolling box for heading, group and rows, so every line shares one
+   width and the columns line up beside the scrollbar. */
+.gs-table {
+  min-width: 0;
+  max-height: 380px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.gs-head,
+.gs-row,
+.gs-group {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 132px 64px 64px;
+  gap: 8px;
+  align-items: baseline;
+  padding: 5px 6px;
+}
+
+.gs-head:has(> :nth-child(3):last-child),
+.gs-group:has(> :nth-child(3):last-child),
+.gs-row:has(> :nth-child(3):last-child) {
+  grid-template-columns: minmax(0, 1fr) 64px 64px;
+}
+
+.gs-head > :not(:first-child),
+.gs-group > :not(:first-child),
+.gs-row > :not(:first-child) {
+  text-align: right;
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
+}
+
+.gs-fixed {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+}
+
+.gs-head {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  border-bottom: 1px solid var(--border);
+}
+
+.gs-group {
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+
+.gs-group .gs-n {
+  margin-left: 8px;
+  font-weight: 400;
+  color: var(--text-faint);
+}
+
+.gs-group.is-seen {
+  color: var(--good);
+}
+
+.gs-group.is-unseen {
+  color: var(--bad);
+}
+
+.gs-row {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  font-size: 12px;
+}
+
+.gs-name {
+  font: inherit;
+  color: var(--text);
+  text-align: left;
+}
+
+.gs-name.gs-key {
+  font-family: ui-monospace, monospace;
+  color: var(--text-faint);
+}
+
+.gs-ver {
+  color: var(--text-dim);
+}
+
+.gs-ver.is-odd {
+  color: var(--warn);
+}
+
+.gs-share {
+  color: var(--text-dim);
+}
+
+/* The phone's arrangement. */
+.gs-bars {
+  background: var(--panel-raised);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.gs-bar-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.gs-bar-row b {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.gs-bar-row b.is-seen {
+  color: var(--warn);
+}
+
+.gs-track {
+  position: relative;
+  height: 8px;
+  background: var(--panel);
+  border-radius: 4px;
+}
+
+.gs-fill {
+  height: 100%;
+  border-radius: 4px;
+}
+
+.gs-tick {
+  position: absolute;
+  top: -3px;
+  width: 2px;
+  height: 14px;
+  background: var(--text);
+}
+
+.gs-bars .gs-note {
+  margin-top: 4px;
+}
+
+.gs-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.gs-toggle button {
+  padding: 8px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.gs-toggle button.is-on {
+  color: var(--text);
+  background: var(--panel-raised);
+  font-weight: 600;
+}
+
+@media (max-width: 700px) {
+  .gs-body {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

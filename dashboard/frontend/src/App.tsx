@@ -17,8 +17,10 @@ import { SlotDetailsPage } from "./components/SlotDetailsPage";
 import { Sidebar } from "./components/Sidebar";
 import { VersionsCard } from "./components/VersionsCard";
 import { TpuPathCard } from "./components/TpuPathCard";
+import { GossipStakeCard } from "./components/GossipStakeCard";
 import { SlotStrip } from "./components/SlotStrip";
 import { usePage, type Page } from "./route";
+import type { StartupProgress } from "./types";
 import { useStore } from "./useStore";
 
 /** Base title, kept in step with index.html so the tab reads the same before
@@ -41,14 +43,17 @@ export function App() {
     document.title = label ? `${TITLE} | ${label}` : TITLE;
   }, [name, identity]);
 
-  // Only the overview keeps the slot rail. The schedule lists the same slots in
-  // more detail, so the rail beside it would be the same thing twice, and the
-  // block detail wants the width more than it wants the context. The collapsed
-  // state is remembered rather than reset, so coming back finds it as it was.
+  // Only the overview keeps the slot rail; the collapsed state is remembered
+  // across pages.
   const rail = page === "overview";
   const classes = ["app"];
   if (rail && collapsed) classes.push("is-collapsed");
   if (!rail) classes.push("is-full");
+  // While the validator boots every card but the one showing the boot sequence
+  // is blurred: the rest have nothing to say yet, and the eye goes to the one
+  // that does. The same test the status card makes to show the phases.
+  const startup = store.get<StartupProgress>("summary", "startup_progress");
+  if (startup && !startup.running) classes.push("is-booting");
 
   return (
     <div className={classes.join(" ")}>
@@ -89,6 +94,7 @@ function Overview() {
         <ValidatorsCard />
         <VersionsCard />
       </div>
+      <GossipStakeCard />
       <TransactionsCard />
       {/* Both read the same traffic from opposite ends: bytes on the wire, and
           what the sockets failed to take off it. */}
@@ -122,11 +128,8 @@ const PAGES: { page: Page; label: string }[] = [
   { page: "schedule", label: "Schedule" },
 ];
 
-/**
- * Anchors rather than buttons, so a page can be opened in a new tab and the
- * address bar says which one is on screen. The click is still handled, to keep
- * the switch to a re-render rather than a reload.
- */
+/** Anchors rather than buttons, so a page can open in a new tab; the click is
+ *  still handled to avoid a reload. */
 function Nav({ page, onSelect }: { page: Page; onSelect: (page: Page) => void }) {
   return (
     <nav className="nav" aria-label="Pages">

@@ -1,13 +1,15 @@
 import type { CSSProperties } from "react";
 import { count, decimal, duration, percent, solCompact } from "../format";
+import { readoutMean, READOUT_SECONDS } from "../matrix";
 import { STAKE_TICKS, stakeTicks } from "../stake";
+import { useAlpenglow } from "../consensus";
 import type {
   EpochInfo,
+  GossipStake,
   Health,
   Shreds,
   SkipRate,
   StartupProgress,
-  Tps,
   ValidatorCounts,
 } from "../types";
 import { useNarrow } from "../narrow";
@@ -20,12 +22,8 @@ export function EpochCard() {
   const store = useStore();
   const epoch = store.get<EpochInfo>("epoch", "new");
   const slot = store.get<number>("summary", "completed_slot");
-  // Sent by the server rather than derived here. It used to be the remaining
-  // slots times the configured slot duration, which is what the cluster aims
-  // at rather than what it does, and the gap between the two is an hour or
-  // more across a whole epoch. The server measures the rate instead, and holds
-  // the answer still unless it really moves — neither of which the client can
-  // do from one duration and a slot number.
+  // Sent by the server, which measures the slot rate and holds the answer
+  // still unless it really moves.
   const remainingNanos = store.get<number>("summary", "epoch_remaining_nanos");
 
   if (!epoch) return <Card title="Epoch">{waiting}</Card>;
@@ -56,15 +54,17 @@ export function StatusCard() {
   const behindCluster = store.get<number | null>("summary", "behind_cluster");
   const slotDurationNanos = store.get<number>("summary", "estimated_slot_duration_nanos");
   const startup = store.get<StartupProgress>("summary", "startup_progress");
+  const gossipStake = store.get<GossipStake | null>("summary", "gossip_stake");
   const skip = store.get<SkipRate>("summary", "skip_rate");
   const shreds = store.get<Shreds | null>("summary", "shreds");
 
   // The leader countdown means nothing until the validator is running, so show
-  // where it has got to in its boot sequence instead.
+  // where it has got to in its boot sequence instead. The wait's own card
+  // carries the stake figure where the validator hands over its handles.
   if (startup && !startup.running) {
     return (
-      <Card title="Status">
-        <StartupPhases startup={startup} />
+      <Card title="Status" lit>
+        <StartupPhases startup={startup} withStake={!gossipStake} />
       </Card>
     );
   }
@@ -83,13 +83,8 @@ export function StatusCard() {
         <Stat
           label="Vote Status"
           value={health?.vote === "not_voting" ? "not voting" : (health?.vote ?? "—")}
-          // How far replay trails the cluster, which reads whether or not this
-          // node votes. Named rather than left as a bare "behind": the figure
-          // this replaced said only that, and nobody could tell behind what,
-          // which is how it went years reporting another machine's progress.
-          //
-          // Deliberately untoned. The status word above carries the colour, and
-          // amber on both would be shouting the same thing twice.
+          // How far replay trails the cluster. Untoned: the status word above
+          // carries the colour.
           sub={
             behindCluster === null || behindCluster === undefined
               ? undefined
@@ -107,7 +102,7 @@ export function StatusCard() {
                   ? "warn"
                   : "muted"
           }
-          explain="Whether this process is voting. A validator running its backup identity reports 'not voting': the vote account carries on being voted from wherever the voting identity now runs, and its progress belongs to that machine rather than this one."
+          explain="Whether this process is voting. A node running its backup identity reads not voting."
         />
         <Stat
           label="Next leader slot"
@@ -121,7 +116,7 @@ export function StatusCard() {
         <Stat label="Skip rate" value={percent(skip?.rate)} />
         <Stat
           label="Repaired shreds"
-          explain="The share of shreds this validator had to ask another node for because turbine never delivered them, over the last five minutes. Turbine should carry nearly all of them; a rising share means the cluster is not reaching this node, which shows here before it shows in the skip rate."
+          explain="Share of shreds repaired rather than received over turbine, last five minutes."
           value={percent(shreds?.repair_rate ?? null, 2)}
           sub={shreds ? `${count(shreds.repaired)} of ${count(shreds.received)}` : undefined}
           tone={shreds && shreds.repair_rate > 0.05 ? "bad" : undefined}
@@ -131,19 +126,8 @@ export function StatusCard() {
   );
 }
 
-/**
- * Staked SOL as fifty ticks, with the delinquent share eating them from the
- * right.
- *
- * A ring drawn at this ratio was unreadable: healthy stake sits between 98 and
- * 100 percent, and an arc at 99 percent is the same picture as an arc at 100.
- * Counting marks separates the two, because a share too small to see as an
- * angle is still a visible part of one tick, and severity reads as how far the
- * red has travelled rather than as a curve that was already closed.
- *
- * It grows from the right so the boundary between the two colours starts in
- * one place and moves in one direction.
- */
+/** Staked SOL as fifty ticks, the delinquent share eating them from the
+ *  right. Ticks show a share too small for an arc. */
 function StakeStrip({ delinquent, total }: { delinquent: number; total: number }) {
   const { full, partial } = stakeTicks(delinquent, total);
 
@@ -157,10 +141,8 @@ function StakeStrip({ delinquent, total }: { delinquent: number; total: number }
             <i
               key={index}
               className="is-part"
-              // Filled upwards from the base rather than in from the side: at
-              // the card's narrow width a tick is a few pixels across, and a
-              // fraction of that is a smudge, where a fraction of its height
-              // is still a mark.
+              // Filled upwards: a fraction of a tick's width is a smudge, of
+              // its height a mark.
               style={{ "--fill": `${partial * 100}%` } as CSSProperties}
             />
           );
@@ -188,7 +170,7 @@ export function ValidatorsCard() {
           value={solCompact(counts.delinquent_stake)}
           sub="SOL"
           tone={counts.delinquent_stake > 0 ? "bad" : undefined}
-          explain="Stake behind validators that have not voted recently, which is the figure consensus weighs. Measured against this validator's own bank, so if this node falls behind, the cluster is what appears delinquent: the giveaway is the count and the stake climbing together."
+          explain="Stake of validators whose last vote is more than 128 slots behind this node's own bank."
         />
         <Stat
           label="Validators"
@@ -204,7 +186,7 @@ export function ValidatorsCard() {
           label="RPC Nodes"
           value={count(counts.rpc_nodes)}
           sub="advertising RPC"
-          explain="Peers advertising an RPC address in gossip on this shred version. Nodes started with --private-rpc never publish one, so they are indistinguishable here from nodes running no RPC at all, and an advertised address is not a promise that it answers."
+          explain="Peers advertising an RPC address in gossip on this shred version."
         />
       </div>
       <div className="stake-share">
@@ -227,32 +209,32 @@ export function ValidatorsCard() {
   );
 }
 
-/**
- * Throughput now, and the shape of the last minute.
- *
- * The figures are the chart's key. Each carries the colour its series is lit in
- * beside it, which is what the stacked areas this replaced never had: two bands
- * with nothing anywhere saying which was which, and a green success figure that
- * was not the green in the chart.
- *
- * The window's peak is a figure rather than a line across the grid. A line
- * would have to sit between two rows of dots and would read as one of them.
- */
+/** Throughput now and the shape of the last minute. The figures are the
+ *  chart's key, each in its series' colour. */
 export function TransactionsCard() {
   const store = useStore();
-  const tps = store.get<Tps>("summary", "estimated_tps");
+  const alpenglow = useAlpenglow();
   const samples = store.getTps();
+  const tps = readoutMean(samples);
   const narrow = useNarrow();
   const peak = samples.length > 0 ? Math.max(...samples.map((sample) => sample.total)) : null;
 
   const figures = (
     <div className="tps-rows">
-      <SeriesRow label="Vote" series="vote" value={decimal(tps?.vote)} />
-      <SeriesRow label="Non-vote failed" series="failed" value={decimal(tps?.non_vote_failed)} />
-      <SeriesRow label="Non-vote ok" series="success" value={decimal(tps?.non_vote_success)} />
+      {!alpenglow && <SeriesRow label="Vote" series="vote" value={decimal(tps?.vote)} />}
+      <SeriesRow
+        label={alpenglow ? "Failed" : "Non-vote failed"}
+        series="failed"
+        value={decimal(tps?.non_vote_failed)}
+      />
+      <SeriesRow
+        label={alpenglow ? "Succeeded" : "Non-vote ok"}
+        series="success"
+        value={decimal(tps?.non_vote_success)}
+      />
       <div className="tps-row is-peak">
         <span className="tps-name">
-          <Explain text="The busiest second in the window, and the top of the grid: the scale is set a tenth above it. Fixed rather than fitted to each frame, so the shape of the last minute does not rescale every time a spike arrives and leaves.">
+          <Explain text="The busiest second in the window, which sets the top of the grid.">
             60s peak
           </Explain>
         </span>
@@ -266,11 +248,20 @@ export function TransactionsCard() {
       <div className="tps-readout">
         <div className="tps-total">
           <div className="tps-total-label">
-            <Explain text="Every transaction the cluster is confirming per second, votes included. Votes are consensus traffic rather than user traffic, so they are drawn as the base of each column rather than mixed in with it: how much of the total each accounts for depends on the cluster and on what is being asked of it, and separating them lets either be read without the other moving it.">
+            <Explain
+              text={
+                alpenglow
+                  ? "Transactions confirmed per second, averaged over the newest samples."
+                  : "Transactions confirmed per second, averaged over the newest samples, with votes as the base of each column."
+              }
+            >
               Total TPS
             </Explain>
           </div>
-          <div className="tps-total-value">{decimal(tps?.total)}</div>
+          <div className="tps-total-value">
+            {decimal(tps?.total)}
+            <span className="tps-total-unit">{READOUT_SECONDS}s mean</span>
+          </div>
         </div>
         {!narrow && figures}
       </div>

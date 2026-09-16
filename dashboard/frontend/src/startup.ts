@@ -1,7 +1,4 @@
-/**
- * What the Uptime hover shows: when the validator started, how long the boot
- * took and where, and how long it then trailed the cluster tip.
- */
+/** What the Uptime hover shows: start time, boot phases, catch-up. */
 
 import type { StartupProgress } from "./types";
 
@@ -13,6 +10,38 @@ const NAMED: Record<string, string> = {
 };
 
 const REST = "everything else";
+
+/** The share of stake the validator waits to see in gossip. Private in core,
+ *  so written down here. */
+export const SUPERMAJORITY_PERCENT = 80;
+
+/** What the supermajority wait has seen, in the form the status card draws. */
+export interface StakeSeen {
+  /** In `[0, 1]`. */
+  fraction: number;
+  /** Decimals worth drawing: three from the exact count, none from the whole percent. */
+  decimals: number;
+  /** Lamports, or null while only the whole percent has arrived. */
+  online: number | null;
+  total: number | null;
+}
+
+/** The wait's progress: the validator's count once it has arrived, the whole
+ *  percent before then. Null outside the wait. */
+export function stakeSeen(startup: StartupProgress): StakeSeen | null {
+  if (startup.phase !== "waiting_for_supermajority") return null;
+  const counted = startup.stake_in_gossip;
+  if (counted && counted.total > 0) {
+    return {
+      fraction: Math.min(1, counted.online / counted.total),
+      decimals: 3,
+      online: counted.online,
+      total: counted.total,
+    };
+  }
+  if (startup.stake_percent === null) return null;
+  return { fraction: startup.stake_percent, decimals: 0, online: null, total: null };
+}
 
 export interface BootPhase {
   label: string;
@@ -28,11 +57,8 @@ export interface BootTimes {
   catchUpMillis: number | null;
 }
 
-/**
- * Phases under a second go into the rest rather than showing as nought, and
- * the rest is dropped if that is all it holds, so the lines shown always add
- * up to the total.
- */
+/** Phases under a second fold into the rest, so the lines add up to the
+ *  total. */
 export function bootTimes(
   startup: StartupProgress | undefined,
   uptimeNanos: number | undefined,

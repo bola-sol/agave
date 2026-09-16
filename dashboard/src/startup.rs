@@ -2,14 +2,123 @@
 //! collector, so the handover between them is invisible to the client.
 
 use {
-    crate::proto::{Debounced, Publisher, TOPIC_SUMMARY},
+    crate::{
+        metrics_tap::StakeInGossip,
+        proto::{Debounced, Publisher, TOPIC_SUMMARY},
+        validator_info::ValidatorInfoCache,
+    },
+    crossbeam_channel::Receiver,
     serde::Serialize,
     solana_clock::Slot,
-    solana_core::validator::ValidatorStartProgress,
-    std::time::{Duration, Instant},
+    solana_core::validator::{GossipReady, ValidatorStartProgress},
+    solana_gossip::{
+        cluster_info::ClusterInfo, contact_info::ContactInfo,
+        crds_gossip_pull::CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS,
+    },
+    solana_pubkey::Pubkey,
+    solana_runtime::bank::Bank,
+    std::{
+        collections::HashMap,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    },
 };
 
 pub const KEY_STARTUP_PROGRESS: &str = "startup_progress";
+pub const KEY_GOSSIP_STAKE: &str = "gossip_stake";
+
+/// The handles the validator sends before its supermajority wait.
+pub type GossipReadyReceiver = Receiver<GossipReady>;
+
+/// The wait as this node sees it: every staked validator, and whether gossip
+/// holds it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GossipStake {
+    pub slot: Slot,
+    pub shred_version: u16,
+    pub total: u64,
+    pub seen: u64,
+    /// Stake descending.
+    pub validators: Vec<GossipValidator>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GossipValidator {
+    pub identity: String,
+    pub name: Option<String>,
+    pub icon: Option<String>,
+    /// As gossip reports it. `None` for a node gossip does not hold.
+    pub version: Option<String>,
+    pub stake: u64,
+    pub seen: bool,
+}
+
+/// Walks the bank's staked identities against gossip the way the validator's
+/// own wait does: seen is a TVU peer whose contact is fresh, since contacts
+/// restored from disk outlive the nodes that wrote them, and this node counts
+/// as seen.
+pub fn gossip_stake(
+    cluster_info: &ClusterInfo,
+    bank: &Bank,
+    names: &ValidatorInfoCache,
+) -> GossipStake {
+    let shred_version = cluster_info.my_shred_version();
+    let now = unix_millis();
+    let mut contacts: HashMap<Pubkey, String> = cluster_info
+        .tvu_peers(ContactInfo::clone)
+        .into_iter()
+        .filter(|contact| {
+            now.saturating_sub(contact.wallclock()) < CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS
+        })
+        .map(|contact| (*contact.pubkey(), contact.version().to_string()))
+        .collect();
+    contacts.insert(
+        cluster_info.id(),
+        cluster_info.my_contact_info().version().to_string(),
+    );
+
+    let mut staked: HashMap<Pubkey, u64> = HashMap::new();
+    for (stake, account) in bank.vote_accounts().values() {
+        if *stake > 0 {
+            let held = staked.entry(*account.node_pubkey()).or_insert(0);
+            *held = held.saturating_add(*stake);
+        }
+    }
+
+    let mut validators: Vec<GossipValidator> = staked
+        .into_iter()
+        .map(|(identity, stake)| {
+            let info = names.get(&identity);
+            let version = contacts.get(&identity).cloned();
+            GossipValidator {
+                identity: identity.to_string(),
+                name: info.and_then(|info| info.name.clone()),
+                icon: info.and_then(|info| info.icon_url.clone()),
+                seen: version.is_some(),
+                version,
+                stake,
+            }
+        })
+        .collect();
+    validators.sort_by(|a, b| {
+        b.stake
+            .cmp(&a.stake)
+            .then_with(|| a.identity.cmp(&b.identity))
+    });
+    let total = validators
+        .iter()
+        .fold(0, |sum, v| u64::saturating_add(sum, v.stake));
+    let seen = validators
+        .iter()
+        .filter(|v| v.seen)
+        .fold(0, |sum, v| u64::saturating_add(sum, v.stake));
+    GossipStake {
+        slot: bank.slot(),
+        shred_version,
+        total,
+        seen,
+        validators,
+    }
+}
 
 /// What the client is sent about the boot sequence.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -22,8 +131,12 @@ pub struct StartupProgress {
     /// began.
     pub fraction: Option<f64>,
     /// Share of the cluster's stake seen in gossip while waiting for a
-    /// supermajority, from 0 to 1.
+    /// supermajority, from 0 to 1. A whole percent, truncated by the validator.
     pub stake_percent: Option<f64>,
+    /// The same wait as the validator counted it, in lamports, from the point
+    /// it submits every tenth check. Exact, and a few seconds behind. Only
+    /// during the wait, and only once a point has arrived.
+    pub stake_in_gossip: Option<StakeInGossip>,
     /// How long the validator has been in this phase, and how long each phase
     /// before it took, since most phases cannot say how far along they are.
     pub phase_elapsed_nanos: u64,
@@ -36,9 +149,19 @@ pub struct PhaseTiming {
     pub elapsed_nanos: u64,
 }
 
+/// Gossip's clock: milliseconds since the epoch.
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok())
+        .unwrap_or(u64::MAX)
+}
+
 #[derive(Default)]
 pub struct StartupPublisher {
     debounce: Debounced<StartupProgress>,
+    gossip: Debounced<Option<GossipStake>>,
     /// The first replay slot seen. Replay starts from a snapshot rather than
     /// from zero, so `slot / max_slot` would sit near 100% throughout.
     replay_origin: Option<Slot>,
@@ -51,14 +174,32 @@ pub struct StartupPublisher {
 }
 
 impl StartupPublisher {
-    pub fn publish(&mut self, publisher: &Publisher, progress: ValidatorStartProgress) {
+    /// The wait's validator list, or `None` once the wait is over.
+    pub fn publish_gossip(&mut self, publisher: &Publisher, stake: Option<GossipStake>) {
+        self.gossip
+            .publish(publisher, TOPIC_SUMMARY, KEY_GOSSIP_STAKE, stake);
+    }
+
+    /// `stake_in_gossip` is the tap's latest count, and rides along only while
+    /// the phase is the wait it describes.
+    pub fn publish(
+        &mut self,
+        publisher: &Publisher,
+        progress: ValidatorStartProgress,
+        stake_in_gossip: Option<StakeInGossip>,
+    ) {
         let phase = describe(progress);
+        let waiting = matches!(
+            progress,
+            ValidatorStartProgress::WaitingForSupermajority { .. }
+        );
         let progress = StartupProgress {
             phase: phase.name.to_string(),
             detail: phase.detail,
             running: matches!(progress, ValidatorStartProgress::Running),
             fraction: self.fraction(phase.replay_slots),
             stake_percent: phase.stake_percent,
+            stake_in_gossip: stake_in_gossip.filter(|_| waiting),
             phase_elapsed_nanos: self.elapsed(phase.name, Instant::now()),
             phases_taken: self.taken.clone(),
         };
@@ -273,8 +414,8 @@ mod tests {
     fn test_publishing_fills_in_the_fraction() {
         let publisher = Publisher::new();
         let mut startup = StartupPublisher::default();
-        startup.publish(&publisher, replaying(100, 200));
-        startup.publish(&publisher, replaying(150, 200));
+        startup.publish(&publisher, replaying(100, 200), None);
+        startup.publish(&publisher, replaying(150, 200), None);
 
         let snapshot = publisher.snapshot();
         assert_eq!(
@@ -290,7 +431,37 @@ mod tests {
     }
 
     #[test]
-    fn test_every_phase_has_a_name_and_running_is_the_only_running_one() {
+    fn test_the_stake_count_rides_only_on_the_wait() {
+        // The tap holds the last count for the life of the process; once the
+        // validator is running it describes nothing on screen.
+        let seen = Some(StakeInGossip {
+            online: 3,
+            offline: 7,
+            total: 10,
+        });
+        let waiting = ValidatorStartProgress::WaitingForSupermajority {
+            slot: 5,
+            gossip_stake_percent: 30,
+        };
+        for (phase, carried) in [
+            (waiting, true),
+            (ValidatorStartProgress::Running, false),
+            (ValidatorStartProgress::StartingServices, false),
+        ] {
+            let publisher = Publisher::new();
+            StartupPublisher::default().publish(&publisher, phase, seen);
+            let sent = publisher.snapshot().pop().unwrap();
+            assert_eq!(
+                sent.contains(r#""stake_in_gossip":{"online":3,"offline":7,"total":10}"#),
+                carried,
+                "{sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_phase_is_named_and_only_running_runs() {
+        // Every phase has a name and running is the only running one.
         let phases = [
             ValidatorStartProgress::Initializing,
             ValidatorStartProgress::SearchingForRpcService,
@@ -308,7 +479,7 @@ mod tests {
         ];
         for phase in phases {
             let publisher = Publisher::new();
-            StartupPublisher::default().publish(&publisher, phase);
+            StartupPublisher::default().publish(&publisher, phase, None);
             let sent = publisher.snapshot().pop().unwrap();
             assert!(!sent.contains(r#""phase":"""#), "{sent}");
             assert_eq!(

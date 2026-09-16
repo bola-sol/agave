@@ -1,11 +1,6 @@
-//! Validator display names, read from on-chain `ValidatorInfo` config
-//! accounts.
-//!
-//! The account addresses are not derived from the identity, so the only way to
-//! find them is to search by owner, which is only affordable against the
-//! secondary index (`--account-index program-id`). Without it the search is
-//! skipped and the dashboard shows pubkeys. The cache is kept current
-//! afterwards from each slot's own writes, which costs almost nothing.
+//! Validator display names from on-chain `ValidatorInfo` config accounts,
+//! found by owner through the secondary index and kept current from each
+//! slot's writes. Without the index the dashboard shows pubkeys.
 
 use {
     serde::{Deserialize, Serialize},
@@ -53,10 +48,7 @@ impl ValidatorInfoCache {
         self.by_identity.get(identity)
     }
 
-    /// Everything the cache holds, as three arrays sharing an index, since an
-    /// object would carry the words name and icon once per validator. Separate
-    /// from the epoch message because names change on their own schedule and most
-    /// validators publish neither.
+    /// Everything the cache holds, as three arrays sharing an index.
     pub fn displays(&self) -> Displays {
         let mut keys = Vec::with_capacity(self.by_identity.len());
         let mut names = Vec::with_capacity(self.by_identity.len());
@@ -119,7 +111,8 @@ pub fn scan_all(bank: &Bank) -> Vec<(Pubkey, ValidatorInfo)> {
     // takes hours and cannot be interrupted.
     if !bank.account_indexes_include_key(&config_id) {
         log::info!(
-            "dashboard: the config program is excluded from the account index, so validator              names are unavailable and the dashboard will show pubkeys"
+            "dashboard: the config program is excluded from the account index, so validator \
+             names are unavailable and the dashboard will show pubkeys"
         );
         return Vec::new();
     }
@@ -140,7 +133,9 @@ pub fn scan_all(bank: &Bank) -> Vec<(Pubkey, ValidatorInfo)> {
     // index never built answers none rather than failing.
     if accounts.is_empty() {
         log::info!(
-            "dashboard: found no validator info accounts. Start the validator with              --account-index program-id --account-index-include-key {config_id} to show              validator names instead of pubkeys"
+            "dashboard: found no validator info accounts. Start the validator with \
+             --account-index program-id --account-index-include-key {config_id} to show \
+             validator names instead of pubkeys"
         );
     }
 
