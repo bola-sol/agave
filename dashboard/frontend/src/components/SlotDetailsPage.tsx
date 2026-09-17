@@ -106,6 +106,7 @@ export function SlotDetailsPage() {
             {turnAt(index) && turnAt(index) !== turnAt(index - 1) && (
               <TurnDivider
                 turn={turnAt(index) as LeaderTurn}
+                blocks={blocks}
                 waterfalls={waterfalls ?? []}
                 open={openTurn === (turnAt(index) as LeaderTurn).first}
                 onToggle={() => {
@@ -140,17 +141,22 @@ export function SlotDetailsPage() {
  *  behind a control. Only in the natural order, as the epoch dividers are. */
 function TurnDivider({
   turn,
+  blocks,
   waterfalls,
   open,
   onToggle,
 }: {
   turn: LeaderTurn;
+  blocks: ProducedBlock[];
   waterfalls: SlotWaterfall[];
   open: boolean;
   onToggle: () => void;
 }) {
   const slots = turn.last - turn.first + 1;
   const own = waterfalls.filter((w) => w.slot >= turn.first && w.slot <= turn.last);
+  const landed = blocks
+    .filter((block) => block.slot >= turn.first && block.slot <= turn.last)
+    .reduce((sum, block) => sum + block.transactions, 0);
   return (
     <div className={`turn${open ? " is-open" : ""}`}>
       {/* The whole row opens it, as a block row does. */}
@@ -166,7 +172,7 @@ function TurnDivider({
       </button>
       {open && (
         <div className="turn-drawer">
-          {turnSections(turn, own).map((section) => (
+          {turnSections(turn, own, landed).map((section) => (
             <Section key={section.key} section={section} />
           ))}
         </div>
