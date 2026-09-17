@@ -147,6 +147,13 @@ describe("turnSections", () => {
     expect(last.through).toEqual({ label: "executed · 6,447 landed", count: 6_459 });
     expect(last.note).toBe("workers · 4m 12s since the previous turn drained");
   });
+
+  it("keeps the bank-gone retries behind the retry row rather than beside it", () => {
+    const last = turnSections(turn, [], 6_447)[2];
+    expect(last.losses.map((loss) => loss.key)).toEqual(["exec_retryable"]);
+    expect(last.detail[0]).toMatchObject({ key: "exec_expired_bank", count: 725 });
+    expect(last.detail[0].share).toBeCloseTo(725 / 737, 6);
+  });
 });
 
 describe("schedulerSection", () => {
