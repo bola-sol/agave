@@ -152,8 +152,9 @@ function TurnDivider({
   const slots = turn.last - turn.first + 1;
   const own = waterfalls.filter((w) => w.slot >= turn.first && w.slot <= turn.last);
   return (
-    <div className="turn">
-      <div className="turn-head">
+    <div className={`turn${open ? " is-open" : ""}`}>
+      {/* The whole row opens it, as a block row does. */}
+      <button type="button" className="turn-head" onClick={onToggle} aria-expanded={open}>
         <span className="turn-name">turn</span>
         <span className="turn-span">
           {turnRangeLabel(turn)}
@@ -161,10 +162,8 @@ function TurnDivider({
           {" · "}
           {turnSpanLabel(turn)}
         </span>
-        <button type="button" className="turn-more" onClick={onToggle} aria-expanded={open}>
-          {open ? "hide tpu path" : "tpu path"}
-        </button>
-      </div>
+        <span className="turn-more">{open ? "tpu path ▾" : "tpu path"}</span>
+      </button>
       {open && (
         <div className="turn-drawer">
           {turnSections(turn, own).map((section) => (
