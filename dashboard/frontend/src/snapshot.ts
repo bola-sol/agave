@@ -11,6 +11,17 @@ export interface SnapshotLine {
   title: string | undefined;
 }
 
+/** An age in one unit, the largest that fits: `40s`, `16m`, `2h`, `3d`. */
+export function agoLabel(millis: number): string {
+  const seconds = Math.floor(millis / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
+}
+
 /** Blocks until the next multiple of `interval` above `height`, which is
  *  where the validator takes the next one. */
 export function blocksUntil(height: number, interval: number): number {
@@ -29,7 +40,7 @@ export function snapshotLine(
   if (!newest) return null;
   const parts = [`snapshot ${count(newest.slot)}`];
   if (nowMillis !== undefined && newest.written_millis !== null) {
-    parts.push(`${duration(Math.max(0, nowMillis - newest.written_millis))} ago`);
+    parts.push(agoLabel(Math.max(0, nowMillis - newest.written_millis)));
   }
   if (snapshots.incremental && snapshots.full) parts.push(`full ${count(snapshots.full.slot)}`);
   return { text: parts.join(" · "), title: nextDue(snapshots, blockHeight, slotMillis) };

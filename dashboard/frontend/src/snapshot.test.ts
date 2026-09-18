@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { blocksUntil, snapshotLine } from "./snapshot";
+import { agoLabel, blocksUntil, snapshotLine } from "./snapshot";
 import type { Snapshots } from "./types";
 
 const both: Snapshots = {
@@ -8,6 +8,22 @@ const both: Snapshots = {
   full_interval: 25_000,
   incremental_interval: 100,
 };
+
+describe("agoLabel", () => {
+  it("uses the largest unit that fits, rounded down", () => {
+    expect(agoLabel(40_500)).toBe("40s ago");
+    expect(agoLabel(16 * 60_000 + 40_000)).toBe("16m ago");
+    expect(agoLabel(2 * 3_600_000 + 5 * 60_000)).toBe("2h ago");
+    expect(agoLabel(3 * 86_400_000 + 7 * 3_600_000)).toBe("3d ago");
+  });
+
+  it("changes unit exactly at the boundary", () => {
+    expect(agoLabel(59_999)).toBe("59s ago");
+    expect(agoLabel(60_000)).toBe("1m ago");
+    expect(agoLabel(3_600_000)).toBe("1h ago");
+    expect(agoLabel(86_400_000)).toBe("1d ago");
+  });
+});
 
 describe("blocksUntil", () => {
   it("counts to the next multiple above the height", () => {
@@ -33,7 +49,7 @@ describe("snapshotLine", () => {
 
   it("falls back to the full alone where there is no incremental", () => {
     const line = snapshotLine({ ...both, incremental: null, incremental_interval: null }, 2_000_000, 393_444_647, 400);
-    expect(line?.text).toBe("snapshot 441,600,000 · 16m 40s ago");
+    expect(line?.text).toBe("snapshot 441,600,000 · 16m ago");
     expect(line?.title).toBe("Next full in about 35m 41s.");
   });
 
