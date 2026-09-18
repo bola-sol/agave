@@ -7,8 +7,7 @@ import { Logo } from "./Logo";
 import { Explain } from "./primitives";
 import { ThemeToggle } from "./ThemeToggle";
 
-/** Who this validator is in one line, and what it is worth in the line
- *  under it. One arrangement at every width: the lines wrap. */
+/** Who this validator is, and what it is worth in the line under it. */
 export function Header(): ReactElement {
   const store = useStore();
   const identity = store.get("summary", "identity_key");
@@ -70,8 +69,7 @@ export function Header(): ReactElement {
       </div>
 
       <div className="figures">
-        {/* The vote account has nowhere of its own to live, so it hangs off
-            the figure it belongs to: the stake is the stake delegated to it. */}
+        {/* The vote account hangs off the stake delegated to it. */}
         <Figure
           value={`${solCompact(stake?.activated_stake)} SOL`}
           label={`staked, ${percent(stake?.share, 4)} of the cluster`}
@@ -96,8 +94,7 @@ export function Header(): ReactElement {
   );
 }
 
-/** One figure and what it is. The label opens the detail, where there is
- *  one. */
+/** One figure and what it is; the label opens the detail where there is one. */
 function Figure({
   value,
   label,

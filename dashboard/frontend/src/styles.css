@@ -9,13 +9,9 @@
    driving it. The header toggle sets `data-theme` and the choice is remembered
    per host.
 
-   Greens and sages are Anza's, and every bar cut into parts steps down one
-   sage; the semantic colours keep their hues so that green still reads as
-   running, red as delinquent and amber as caution.
-
-   Labels are set in the body face in sentence case, a size down and a shade
-   dimmer than the figure they name. Figures are set in the monospace face.
-   Nothing on the page is tracked out in capitals. */
+   Greens and sages are Anza's; the semantic colours keep their hues so that
+   green still reads as running, red as delinquent and terracotta as caution.
+   Labels are sentence case in the body face, figures in the monospace. */
 
 :root {
   --bg: #0b1004;
@@ -27,27 +23,26 @@
   --text-faint: #6f7a5c;
 
   --accent: #c9d4ae;
-  /* This validator's own slots and rows: the brightest tone on the page,
-     so ours is told from everything else by light rather than by hue. */
+  /* This validator's own slots and rows: the brightest tone on the page. */
   --ours: #f4f5ef;
   --good: #8fc37a;
-  --warn: #e3a857;
+  /* Terracotta rather than amber, which sat too near the apricot below. */
+  --warn: #d9773f;
   --bad: #e05d5d;
-  /* Vote traffic on the transactions matrix. Deliberately off the green axis
-     the rest of the palette sits on: it is stacked directly against success
-     green and failure red, and a third green would be told apart by saturation
-     alone at the size of a four-pixel dot. Neutral is also the honest reading,
-     since vote traffic is the constant background and is neither good nor bad. */
-  --vote: #7d8a99;
+
+  /* Anza's illustration colours, for marks that are categories: a level, a
+     series, a direction. Shares of a whole stay on the ramp below. */
+  --sky: #7fb4d6;
+  --lavender: #b39ddb;
+  --apricot: #ecb56f;
+  --vote: var(--sky);
   /* Throughput lines and the stake ticks: a green a step greener than the
      sage, for the things that flow. */
   --flow: #7f9a5c;
   --stake: #5f7a44;
 
-  /* One sage stepped by lightness, for every bar cut into parts: the TPU
-     path's losses, replay's phases, a block's compute. Stepped rather than
-     coloured separately because the parts are shares of one quantity, not
-     six severities; the figures beside a bar carry any tone it has earned. */
+  /* One sage stepped by lightness, for every bar cut into parts. The parts
+     are shares of one quantity, not six severities. */
   --path-1: #c9d4ae;
   --path-2: #9aa882;
   --path-3: #75835d;
@@ -55,15 +50,13 @@
   --path-5: #445032;
   --path-6: #343d26;
 
-  /* A slot's consensus level on the same sage: the live edge, rooted but not
-     yet finalized, is the brightest step, and the settled majority behind it
-     a step down. */
+  /* A slot's levels, in the order a slot passes through them. */
   --level-incomplete: #343d26;
-  --level-completed: #445032;
-  --level-optimistically_confirmed: #586444;
-  --level-rooted: #9aa882;
-  --level-finalized: #75835d;
-  --level-skipped: #e05d5d;
+  --level-completed: var(--sky);
+  --level-optimistically_confirmed: var(--lavender);
+  --level-rooted: var(--apricot);
+  --level-finalized: var(--good);
+  --level-skipped: var(--bad);
 
   --sans: system-ui, "Segoe UI", -apple-system, sans-serif;
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
@@ -85,14 +78,16 @@
   --accent: #55742f;
   --ours: #1e2a12;
   --good: #3e7a2a;
-  --warn: #a86b1e;
+  --warn: #b25a1e;
   --bad: #b83a3a;
-  --vote: #4f6172;
+  --sky: #3f89b5;
+  --lavender: #7d64c0;
+  --apricot: #d0862b;
+  --vote: var(--sky);
   --flow: #7a9459;
   --stake: #9fb385;
 
-  /* Stepped the other way against a light panel: the first is the darkest,
-     and each step lightens. */
+  /* Stepped the other way against a light panel. */
   --path-1: #55742f;
   --path-2: #7a9459;
   --path-3: #9fb385;
@@ -100,12 +95,12 @@
   --path-5: #d3ddc6;
   --path-6: #e3e9d9;
 
-  --level-incomplete: #e3e9d9;
-  --level-completed: #d3ddc6;
-  --level-optimistically_confirmed: #bfcdad;
-  --level-rooted: #7a9459;
-  --level-finalized: #9fb385;
-  --level-skipped: #b83a3a;
+  --level-incomplete: #d3ddc6;
+  --level-completed: var(--sky);
+  --level-optimistically_confirmed: var(--lavender);
+  --level-rooted: var(--apricot);
+  --level-finalized: var(--good);
+  --level-skipped: var(--bad);
 }
 
 * {
@@ -144,8 +139,7 @@ body {
   grid-template-columns: minmax(0, 1fr);
 }
 
-/* Held to a reading width and centred past it, the way a page is rather
-   than the way a console fills a wall. */
+/* Held to a reading width and centred past it. */
 .main {
   display: flex;
   flex-direction: column;
@@ -157,8 +151,7 @@ body {
 
 /* ---- header ---- */
 
-/* Who this is, in one line, and the five figures under it. No panel: the
-   header is the top of the page, not a card on it. */
+/* Who this is, in one line, and the five figures under it. */
 .header {
   display: flex;
   flex-direction: column;
@@ -292,8 +285,7 @@ body {
   font-weight: 400;
 }
 
-/* Only while open: closed, the bubble is a clipped pixel, and a minimum
-   width here would widen the page from behind the clip. */
+/* Only while open: closed, the bubble is a clipped pixel. */
 .figure-detail .explain-bubble.is-open {
   min-width: 220px;
 }
@@ -397,8 +389,7 @@ body {
 
 /* ---- verdict ---- */
 
-/* One sentence on what the validator is doing, set in the serif so it reads
-   as a sentence and not as another label. The only serif on the page. */
+/* One sentence on what the validator is doing. The only serif on the page. */
 .verdict {
   display: flex;
   align-items: baseline;
@@ -438,13 +429,14 @@ body {
   font-size: 14px;
   line-height: 1.5;
   color: var(--text-dim);
-  max-width: 72ch;
 }
 
+/* A figure and its unit stay together. */
 .verdict-sub b {
   font-family: var(--mono);
   font-weight: 500;
   color: var(--text);
+  white-space: nowrap;
 }
 
 .verdict-sub .explain-trigger {
@@ -548,8 +540,7 @@ body {
   gap: var(--gap);
 }
 
-/* The three cards under the strip: three across where three fit, else as
-   many as do. The rule above is for four, and would put these two and one. */
+/* Three across where three fit. The rule above is for four cards. */
 .grid.is-three {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
 }
@@ -570,9 +561,8 @@ body {
   gap: 14px;
 }
 
-/* Value first, then what it is, then the rest: the figure is what the eye
-   lands on and the label is read second. The three are ordered here rather
-   than in the markup so the markup keeps saying label, value, detail. */
+/* Value first, then the label, then the detail. Ordered here so the markup
+   keeps saying label, value, detail. */
 .stat {
   display: flex;
   flex-direction: column;
@@ -709,7 +699,7 @@ body {
 
 /* The staked total this validator is one of, set beside the active count in
    the same figure rather than under it, so the two read as a fraction. */
-/* On its own line under the count, so the fraction never breaks mid-figure. */
+/* On its own line, so the fraction never breaks mid-figure. */
 .stat-of {
   display: block;
   font-size: 12px;
@@ -719,8 +709,7 @@ body {
 
 /* ---- slot strip ---- */
 
-/* Ruled off from the verdict above rather than boxed: the strip is a
-   section of the page, and the six positions under it are its axis. */
+/* A section of the page, with the positions under the bars as its axis. */
 .slot-strip {
   margin-top: 8px;
   padding-top: 14px;
@@ -750,8 +739,7 @@ body {
   color: var(--text);
 }
 
-/* The positions, ordered from most settled to least, each a label over its
-   slot with the distance from Processed beside it. */
+/* The positions, most settled first, with the distance from Processed. */
 .slot-axis {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
@@ -997,8 +985,7 @@ body {
   color: var(--ours);
 }
 
-/* Sixty-four bars on a phone: the three pixel gap of the wide layout costs
-   more than the bars themselves have. */
+/* Sixty-four bars on a phone leave no room for a three pixel gap. */
 @media (max-width: 700px) {
   .slot-bars {
     gap: 2px;
@@ -1061,8 +1048,7 @@ body {
   border-radius: 6px;
   background: var(--panel-raised);
   color: var(--text);
-  /* The triggers sit in labels of every size, and the explanation is one
-     size whatever it hangs from. */
+  /* One size whatever the trigger's is. */
   font-family: var(--sans);
   font-size: 12px;
   font-weight: 400;
@@ -1767,20 +1753,17 @@ body {
   font-style: normal;
 }
 
-/* Both directions are drawn the same way, a line over a wash of the same
-   hue, in the two greens the page has: in on the flow green, out on the sage.
-   Given a fill on one and not the other, two halves of one measurement read
-   as different kinds of thing. */
+/* In on sky, out on apricot, each a line over a wash of its own hue. */
 .net-swatch.is-ingress,
 .net-line.is-ingress {
-  background: var(--flow);
-  stroke: var(--flow);
+  background: var(--sky);
+  stroke: var(--sky);
 }
 
 .net-swatch.is-egress,
 .net-line.is-egress {
-  background: var(--accent);
-  stroke: var(--accent);
+  background: var(--apricot);
+  stroke: var(--apricot);
 }
 
 .net-line {
@@ -1794,11 +1777,11 @@ body {
 }
 
 .net-fill.is-ingress {
-  fill: color-mix(in srgb, var(--flow) 18%, transparent);
+  fill: color-mix(in srgb, var(--sky) 16%, transparent);
 }
 
 .net-fill.is-egress {
-  fill: color-mix(in srgb, var(--accent) 12%, transparent);
+  fill: color-mix(in srgb, var(--apricot) 12%, transparent);
 }
 
 /* The egress split, on the rows' own three columns so the bar sits under the
@@ -1860,12 +1843,13 @@ body {
   border-radius: 2px;
 }
 
+/* The two senders in the line colours above, since this divides the out line. */
 .net-split .is-gossip {
-  background: var(--accent);
+  background: var(--sky);
 }
 
 .net-split .is-repair {
-  background: var(--path-3);
+  background: var(--apricot);
 }
 
 .net-split .is-unattributed {
@@ -2291,11 +2275,8 @@ body {
 /* Said once, at the top, where the advertised TPU address is answered off this
    host and the ports below it therefore have almost nothing to report.
 
-   Slate rather than amber, and bordered rather than filled. A validator behind
-   a relayer or a proxy is configured, not broken, and the one thing this must
-   not do is read as a fault: the operator put it there. The colour is the same
-   neutral the vote series carries on the transactions matrix, chosen there for
-   the same reason — a constant background that is neither good nor bad. */
+   Sky rather than a tone: a validator behind a relayer is configured, not
+   broken. */
 .path-notice {
   padding: 9px 12px;
   margin-bottom: 11px;
@@ -2968,8 +2949,8 @@ body {
 }
 
 /* Where the banking stage's time went, in the compute headline's shape. The
-   workers' stages step down the sage ramp, largest first; the vote worker is
-   the last step, and is simply absent under alpenglow. */
+   workers' stages step down the ramp; the vote worker is sky, as votes are
+   everywhere, and is absent under alpenglow. */
 .sx-exec {
   display: flex;
   flex-direction: column;
@@ -3008,7 +2989,7 @@ body {
 }
 .sx-exec-seg.is-votes,
 .sx-sw.is-votes {
-  background: var(--path-6);
+  background: var(--sky);
 }
 
 .sx-acct {
@@ -3458,9 +3439,7 @@ body {
     gap: 18px;
   }
 
-  /* The in-and-out figure takes a line of its own: set in the monospace it
-     no longer fits beside the title, and clipped it lost the figure that
-     is the whole point of it. */
+  /* The in-and-out figure takes a line of its own rather than clipping. */
   .path-section-head {
     flex-wrap: wrap;
   }
@@ -4158,8 +4137,7 @@ body {
 
   /* The sparkline gives up its width first: the two figures are what gets
      read, and the line is the shape behind them. */
-  /* Both tracks fractional: an auto track takes the sparkline's intrinsic
-     three hundred pixels and runs off the card. */
+  /* Both tracks fractional: an auto track takes the SVG's intrinsic width. */
   .net-row {
     grid-template-columns: minmax(0, 1.2fr) minmax(96px, 1fr);
     gap: 2px 12px;
@@ -4265,8 +4243,8 @@ body {
 
 /* ---- folding sections ---- */
 
-/* The four sections under the cards: ruled off, named, and summed up in one
-   line, so a folded section still says what it would say. */
+/* The sections under the cards, each summed up in a line for while it is
+   folded. */
 .fold {
   margin-top: 12px;
   padding-top: 12px;
@@ -4438,7 +4416,7 @@ body {
   outline-offset: -1px;
 }
 
-/* A turn is a row under a rule, the leader down the left, not a card. */
+/* A turn is a row under a rule, the leader down the left. */
 .schedule-group {
   display: grid;
   grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
@@ -4659,12 +4637,13 @@ body {
   height: 100%;
 }
 
+/* Waiting in apricot, then replay in green. */
 .schedule-tl-track .is-wait {
-  background: var(--path-3);
+  background: var(--apricot);
 }
 
 .schedule-tl-track .is-run {
-  background: var(--path-1);
+  background: var(--good);
 }
 
 .schedule-tl-text {

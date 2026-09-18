@@ -207,9 +207,8 @@ export function Meter({ fraction }: { fraction: number }): ReactElement {
   );
 }
 
-/** One of the sections under the cards: named, summed up in a line, and
- *  folded or not as the viewer last left it. The head is the control; the
- *  word at its end says which way it will go. */
+/** A section under the cards, summed up in a line and folded as the viewer
+ *  last left it. */
 export function Fold({
   id,
   title,

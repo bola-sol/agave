@@ -160,10 +160,8 @@ export function SlotStrip(): ReactElement {
     <section className="slot-strip">
       <div className="slot-strip-head">
         <span className="slot-strip-title">Slots</span>
-        {/* Said in the head rather than marked on the strip. The peak line
-            describes the bars on screen, whereas a minute covers more slots
-            than the strip holds, so drawn across them it would claim to be
-            their level and would not be. */}
+        {/* In the head, not on the strip: a minute covers more slots than
+            the strip holds. */}
         <span>
           <Explain text="Mean time between slots arriving here over the last minute: the cluster's rate as seen from this node.">
             slot time

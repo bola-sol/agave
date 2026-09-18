@@ -6,17 +6,15 @@ import { useStore } from "../useStore";
 import { Card, Explain } from "./primitives";
 import { StartupPhases } from "./StartupPhases";
 
-/** One sentence on what the validator is doing, and one under it on what is
- *  coming: the next leader turn, the epoch's skips, repair, the snapshot.
+/** One sentence on what the validator is doing, and one on what is coming.
  *  While the validator boots, the boot sequence stands in for both. */
 export function Verdict(): ReactElement {
   const store = useStore();
   const startup = store.get("summary", "startup_progress");
   const gossipStake = store.get("summary", "gossip_stake");
 
-  // The sentence means nothing until the validator is running, so show where
-  // it has got to in its boot sequence instead. The wait's own card carries
-  // the stake figure where the validator hands over its handles.
+  // Nothing to say until the validator is running. The wait's own card
+  // carries the stake figure where the validator hands over its handles.
   if (startup && !startup.running) {
     return (
       <Card title="Starting up" lit>
@@ -116,8 +114,7 @@ function Snapshot() {
   const text = line.title ? `${line.detail}. ${line.title}` : line.detail;
   return (
     <>
-      {/* The bubble rather than a title: a title is redrawn on every change,
-          and the countdown inside changes every second. */}
+      {/* A bubble rather than a title, which is redrawn on every change. */}
       <Explain text={text}>Snapshot</Explain>{" "}
       {age ? <b>{age}</b> : <>at slot <b>{count(newest?.slot)}</b></>}.
     </>
