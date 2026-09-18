@@ -1,6 +1,7 @@
 import type { CSSProperties, ReactElement } from "react";
 import { count, decimal, duration, percent, solCompact } from "../format";
 import { readoutMean, READOUT_SECONDS } from "../matrix";
+import { leaderSlotsLeft } from "../schedule";
 import { STAKE_TICKS, stakeTicks } from "../stake";
 import { useAlpenglow } from "../consensus";
 import type { Health } from "../types";
@@ -28,9 +29,11 @@ export function EpochCard(): ReactElement {
 
   if (!epoch) return <Card title="Epoch">{waiting}</Card>;
 
-  const elapsed = Math.max(0, (slot ?? epoch.start_slot) - epoch.start_slot);
+  const completed = slot ?? epoch.start_slot;
+  const elapsed = Math.max(0, completed - epoch.start_slot);
   const progress = elapsed / Math.max(1, epoch.slots_in_epoch);
   const remainingMs = remainingNanos === undefined ? undefined : remainingNanos / 1e6;
+  const left = leaderSlotsLeft(epoch.my_leader_slots, completed);
 
   return (
     <Card title="Epoch" className="epoch-body">
@@ -39,7 +42,7 @@ export function EpochCard(): ReactElement {
       <Meter fraction={progress} />
       <div className="card-footnote">
         slot {count(elapsed)} of {count(epoch.slots_in_epoch)} · {count(epoch.my_leader_slots.length)}{" "}
-        leader slots this epoch
+        leader slots · {count(left)} left
       </div>
     </Card>
   );
