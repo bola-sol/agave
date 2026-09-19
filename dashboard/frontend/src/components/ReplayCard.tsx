@@ -153,10 +153,11 @@ function Section({
         {rows.map((row, index) => (
           <i
             key={row.key}
+            className={`is-${index + 1}`}
             // Grown from a basis of nothing rather than given a width, so that
             // the gaps in a broken bar come out of the track before the shares
             // are shared out, instead of pushing the total past its width.
-            style={{ flexGrow: row.share, ...segment(index) }}
+            style={{ flexGrow: row.share }}
           />
         ))}
       </div>
@@ -164,7 +165,7 @@ function Section({
       <div className="replay-legend">
         {rows.map((row, index) => (
           <div key={row.key} className="replay-item">
-            <i className="replay-swatch" style={segment(index)} aria-hidden="true" />
+            <i className={`replay-swatch is-${index + 1}`} aria-hidden="true" />
             <Explain text={row.explain} className="replay-name">
               {row.label}
             </Explain>
@@ -175,15 +176,6 @@ function Section({
       </div>
     </div>
   );
-}
-
-/** How dark a segment is, by its place in the order: a ramp from the accent
- *  towards the panel, stopping where the legend swatches lose contrast. */
-const SEGMENT_MIX = [100, 82, 68, 57, 48, 40];
-
-function segment(index: number) {
-  const mix = SEGMENT_MIX[Math.min(index, SEGMENT_MIX.length - 1)];
-  return { background: `color-mix(in srgb, var(--accent) ${mix}%, var(--panel-raised))` };
 }
 
 /** One nested figure, named in the sentence under the card. */

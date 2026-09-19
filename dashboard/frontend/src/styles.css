@@ -36,6 +36,14 @@
   --lavender: #b39ddb;
   --apricot: #ecb56f;
   --vote: var(--sky);
+  /* The named phases of a stacked bar, where a ramp's steps were too close
+     to key a legend by. Votes keep sky. */
+  --part-1: var(--apricot);
+  --part-2: var(--lavender);
+  --part-3: var(--good);
+  --part-4: #e6a0a6;
+  --part-5: var(--sky);
+  --part-6: var(--path-2);
   /* Throughput lines and the stake ticks: a green a step greener than the
      sage, for the things that flow. */
   --flow: #7f9a5c;
@@ -84,6 +92,7 @@
   --lavender: #7d64c0;
   --apricot: #d0862b;
   --vote: var(--sky);
+  --part-4: #c76b74;
   --flow: #7a9459;
   --stake: #9fb385;
 
@@ -2722,6 +2731,7 @@ body {
 .replay-bar i {
   display: block;
   height: 100%;
+  background: var(--part-6);
   /* A phase worth a fraction of a percent still leaves a mark. The share is
      printed in the legend, so nothing is lost by refusing to draw a segment
      thinner than the eye can find. */
@@ -2770,6 +2780,32 @@ body {
   width: 9px;
   height: 9px;
   border-radius: 2px;
+  background: var(--part-6);
+}
+
+.replay-bar i.is-1,
+.replay-swatch.is-1 {
+  background: var(--part-1);
+}
+
+.replay-bar i.is-2,
+.replay-swatch.is-2 {
+  background: var(--part-2);
+}
+
+.replay-bar i.is-3,
+.replay-swatch.is-3 {
+  background: var(--part-3);
+}
+
+.replay-bar i.is-4,
+.replay-swatch.is-4 {
+  background: var(--part-4);
+}
+
+.replay-bar i.is-5,
+.replay-swatch.is-5 {
+  background: var(--part-5);
 }
 
 .replay-name {
@@ -2949,8 +2985,8 @@ body {
 }
 
 /* Where the banking stage's time went, in the compute headline's shape. The
-   workers' stages step down the ramp; the vote worker is sky, as votes are
-   everywhere, and is absent under alpenglow. */
+   workers' stages take the part colours; the vote worker is sky, as votes
+   are everywhere, and is absent under alpenglow. */
 .sx-exec {
   display: flex;
   flex-direction: column;
@@ -2969,23 +3005,23 @@ body {
 
 .sx-exec-seg.is-load,
 .sx-sw.is-load {
-  background: var(--accent);
+  background: var(--part-1);
 }
 .sx-exec-seg.is-commit,
 .sx-sw.is-commit {
-  background: var(--path-2);
+  background: var(--part-2);
 }
 .sx-exec-seg.is-record,
 .sx-sw.is-record {
-  background: var(--path-5);
+  background: var(--part-4);
 }
 .sx-exec-seg.is-send,
 .sx-sw.is-send {
-  background: var(--path-3);
+  background: var(--part-3);
 }
 .sx-exec-seg.is-fixed,
 .sx-sw.is-fixed {
-  background: var(--path-4);
+  background: var(--part-6);
 }
 .sx-exec-seg.is-votes,
 .sx-sw.is-votes {
