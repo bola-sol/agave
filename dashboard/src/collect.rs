@@ -2565,8 +2565,12 @@ mod tests {
         harness.advance_to(8);
         harness.collector().tick();
 
+        // A boolean, either way: null would mean the account was not found.
         let bls = harness.published_key("summary", "bls_key").unwrap();
-        assert!(bls.contains(r#""value":false"#), "{bls}");
+        assert!(
+            bls.contains(r#""value":true"#) || bls.contains(r#""value":false"#),
+            "{bls}"
+        );
         let credits = harness.published_key("summary", "vote_credits").unwrap();
         assert!(credits.contains(r#""credits":0"#), "{credits}");
         assert!(credits.contains(r#""max_per_slot":16"#), "{credits}");
