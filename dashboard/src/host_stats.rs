@@ -270,7 +270,7 @@ pub fn process_resident() -> io::Result<u64> {
     ))
 }
 
-/// `VmRSS:	  123456 kB`, one line of the status file.
+/// `VmRSS:    123456 kB`, one line of the status file.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_resident(status: &str) -> Option<u64> {
     let line = status

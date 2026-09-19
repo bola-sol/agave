@@ -1541,7 +1541,7 @@ impl TurbineMeter {
                 .saturating_add(layer_2)
                 .saturating_add(layer_3)
                 > 0;
-        let turbine = reported.then(|| Turbine {
+        let turbine = reported.then_some(Turbine {
             window_seconds: self.window.len() as u64,
             root,
             layer_1,
