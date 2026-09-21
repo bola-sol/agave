@@ -3,7 +3,7 @@ import { count, decimal, duration, percent, sol, solCompact } from "../format";
 import { readoutMean, READOUT_SECONDS } from "../matrix";
 import { noSeatDetail } from "../admission";
 import { creditsShare, participationShare } from "../credits";
-import { leaderLabel, lostNote, MISS_PLACES, missMarks, missTotal, turnMarks } from "../misses";
+import { leaderLabel, lostNote, MISS_PLACES, missMarks, missTotal, placeExplain, turnMarks } from "../misses";
 import { leaderSlotsLeft } from "../schedule";
 import type { Admission, EpochInfo, VoteParticipation } from "../types";
 import { STAKE_TICKS, stakeTicks } from "../stake";
@@ -117,7 +117,7 @@ function MissesStat({ epoch }: { epoch: EpochInfo }) {
       label="votes not rewarded, and where"
       value={count(total)}
       sub={total > 0 ? <MissesSplit participation={participation} /> : undefined}
-      explain="Slots whose certificate paid others but not this validator, by where they fell: the epoch's first thousand slots, our own leader slots, a snapshot write, a certificate thinner than the epoch's lowest tenth, a slot we replayed after its certificate's writer had begun, or lost on the way."
+      explain="Slots whose certificate paid other validators but not this one. A slot with more than one cause counts in the first."
     />
   );
 }
@@ -137,10 +137,12 @@ function MissesSplit({ participation }: { participation: VoteParticipation }) {
       </div>
       <div className="misses-legend">
         {places.map((place) => (
-          <span key={place}>
+          <Explain key={place} text={placeExplain(place, participation)}>
             <i className={`misses-swatch is-${place}`} />
-            <b>{count(misses[place])}</b> {place}
-          </span>
+            <span>
+              <b>{count(misses[place])}</b> {place}
+            </span>
+          </Explain>
         ))}
       </div>
       {note && (

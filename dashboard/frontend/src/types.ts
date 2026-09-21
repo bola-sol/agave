@@ -781,6 +781,11 @@ export interface VoteParticipation {
   miss_bins: number[];
   /** The leaders whose certificates left the most lost votes out, most first. */
   lost_leaders: LostLeader[];
+  /** Ranks in the epoch's certificates, one per admitted validator. */
+  ranks: number;
+  /** A certificate paying fewer ranks than this is thin. Null until a
+   *  hundred certificates are in. */
+  thin_below: number | null;
 }
 
 export interface LostLeader {
@@ -799,6 +804,8 @@ export interface Admission {
    *  the vote account covers it. */
   ticket_short: number | null;
 }
+
+export type MissPlace = "boundary" | "leader" | "snapshot" | "thin" | "late" | "lost";
 
 /** Slots that paid others but not this validator, by where they fell. A
  *  slot in more than one place counts in the first. */

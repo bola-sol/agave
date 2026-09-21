@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { leaderLabel, leaderTurns, lostNote, MAX_TURN_MARKS, missMarks, missTotal, turnMarks } from "./misses";
+import {
+  leaderLabel,
+  leaderTurns,
+  lostNote,
+  MAX_TURN_MARKS,
+  missMarks,
+  missTotal,
+  placeExplain,
+  turnMarks,
+} from "./misses";
 import type { VoteParticipation } from "./types";
 
 describe("leaderTurns", () => {
@@ -50,8 +59,26 @@ function participation(lost: number, counts: number[]): VoteParticipation {
     misses: { boundary: 0, leader: 0, snapshot: 0, thin: 0, late: 0, lost },
     miss_bins: [],
     lost_leaders: counts.map((count, index) => ({ identity: `Key${index}`, name: null, count })),
+    ranks: 114,
+    thin_below: 108,
   };
 }
+
+describe("placeExplain", () => {
+  it("puts the cutoff on the thin place", () => {
+    expect(placeExplain("thin", participation(0, []))).toBe(
+      "The certificate paid fewer validators than the lowest tenth of this epoch's certificates, now under 108 of 114.",
+    );
+    expect(placeExplain("thin", { ...participation(0, []), thin_below: null })).toBe(
+      "The certificate paid fewer validators than the lowest tenth of this epoch's certificates.",
+    );
+  });
+
+  it("gives each place a sentence", () => {
+    expect(placeExplain("boundary", participation(0, []))).toBe("The slot is in the first 1,000 slots of the epoch.");
+    expect(placeExplain("lost", participation(0, []))).toMatch(/^No other cause applies/);
+  });
+});
 
 describe("lostNote", () => {
   it("names the leaders once they hold half the lost votes", () => {

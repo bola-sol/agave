@@ -1,14 +1,25 @@
 /** Where this validator's unrewarded votes fell, for the epoch card. */
 
 import { count, shortKey } from "./format";
-import type { LostLeader, Misses, VoteParticipation } from "./types";
+import type { LostLeader, MissPlace, Misses, VoteParticipation } from "./types";
 
 /** More leader turns than this read as a band on the meter, not marks, and
  *  are left off it. */
 export const MAX_TURN_MARKS = 80;
 
 /** The places, in the order the legend lists them. */
-export const MISS_PLACES = ["boundary", "leader", "snapshot", "thin", "late", "lost"] as const;
+export const MISS_PLACES: readonly MissPlace[] = ["boundary", "leader", "snapshot", "thin", "late", "lost"];
+
+/** One sentence on what puts a miss in each place. The thin one is ended
+ *  by `placeExplain`, with the cutoff. */
+const PLACE_EXPLAIN: Record<MissPlace, string> = {
+  boundary: "The slot is in the first 1,000 slots of the epoch.",
+  leader: "The slot is one of the leader slots of this validator.",
+  snapshot: "This node wrote a snapshot archive during the slot.",
+  thin: "The certificate paid fewer validators than the lowest tenth of this epoch's certificates",
+  late: "This node completed replay of the slot after the first shred of the certificate writer's slot arrived.",
+  lost: "No other cause applies, but the certificate did not pay this validator.",
+};
 
 /** Fewer lost votes than this are not worth a line about who wrote them out. */
 export const LOST_NOTE_MIN = 5;
@@ -50,6 +61,15 @@ export function missMarks(bins: number[]): MissMark[] {
 
 export function missTotal(misses: Misses): number {
   return MISS_PLACES.reduce((total, place) => total + misses[place], 0);
+}
+
+/** The place's sentence, with the cutoff on the thin one once it is known. */
+export function placeExplain(place: MissPlace, participation: VoteParticipation): string {
+  const text = PLACE_EXPLAIN[place];
+  if (place !== "thin") return text;
+  const { thin_below, ranks } = participation;
+  if (thin_below === null) return `${text}.`;
+  return `${text}, now under ${count(thin_below)} of ${count(ranks)}.`;
 }
 
 /** A line naming how many of the lost votes a few leaders wrote out, once

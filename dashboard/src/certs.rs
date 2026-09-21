@@ -74,6 +74,11 @@ pub struct Participation {
     pub miss_bins: Vec<u32>,
     /// The leaders whose certificates left the most lost votes out, most first.
     pub lost_leaders: Vec<LostLeader>,
+    /// Ranks in the epoch's certificates, one per admitted validator.
+    pub ranks: u32,
+    /// A certificate paying fewer ranks than this is thin. Absent until
+    /// `THIN_MIN_CERTIFICATES` are in.
+    pub thin_below: Option<u32>,
 }
 
 /// Slots that paid others but not this validator, by where they fell. A slot
@@ -333,6 +338,8 @@ impl Tally {
                     count,
                 })
                 .collect(),
+            ranks: u32::try_from(self.per_rank.len()).unwrap_or(u32::MAX),
+            thin_below,
         }
     }
 }
@@ -657,6 +664,18 @@ mod tests {
         tally.add(&mark(3_000, Reward::Unpaid, &[1]), &[], None);
         assert_eq!(misses(&tally).thin, 0);
         assert_eq!(misses(&tally).lost, 1);
+        assert_eq!(read(&tally).thin_below, None);
+    }
+
+    #[test]
+    fn test_the_cutoff_and_the_rank_count_are_published() {
+        let mut tally = tally();
+        fill(&mut tally, 1_000);
+        let participation = read(&tally);
+        assert_eq!(
+            (participation.ranks, participation.thin_below),
+            (4, Some(3))
+        );
     }
 
     #[test]
