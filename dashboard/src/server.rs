@@ -4,7 +4,7 @@
 
 use {
     crate::{
-        collect::EpochInfo,
+        collect::{EpochInfo, MissList},
         history::SlotHistory,
         proto::{MAX_MESSAGE, Message, Publisher, Request, encode_with_id},
         validator_info::ValidatorInfoCache,
@@ -99,6 +99,7 @@ pub async fn serve(
     history: Arc<RwLock<SlotHistory>>,
     info: Arc<RwLock<ValidatorInfoCache>>,
     epochs: Arc<RwLock<Vec<EpochInfo>>>,
+    misses: Arc<RwLock<MissList>>,
     allowed_hosts: Arc<[String]>,
 ) {
     let limits = Limits::new();
@@ -114,6 +115,7 @@ pub async fn serve(
         let history = history.clone();
         let info = info.clone();
         let epochs = epochs.clone();
+        let misses = misses.clone();
         let limits = limits.clone();
         let allowed_hosts = allowed_hosts.clone();
         tokio::spawn(async move {
@@ -123,6 +125,7 @@ pub async fn serve(
                 history,
                 info,
                 epochs,
+                misses,
                 limits,
                 &allowed_hosts,
             )
@@ -140,6 +143,7 @@ async fn handle(
     history: Arc<RwLock<SlotHistory>>,
     info: Arc<RwLock<ValidatorInfoCache>>,
     epochs: Arc<RwLock<Vec<EpochInfo>>>,
+    misses: Arc<RwLock<MissList>>,
     limits: Limits,
     allowed_hosts: &[String],
 ) -> Result<(), ConnectionError> {
@@ -538,7 +542,7 @@ async fn serve_websocket(
         if incoming.len() > MAX_CLIENT_MESSAGE {
             return Err(ConnectionError::Oversized(incoming.len()));
         }
-        if let Some(reply) = respond(&incoming, &history, &info, &epochs) {
+        if let Some(reply) = respond(&incoming, &history, &info, &epochs, &misses) {
             send_or_timeout!(sender.send_text(&*reply));
             send_or_timeout!(sender.flush());
         }
@@ -587,6 +591,7 @@ fn respond(
     history: &RwLock<SlotHistory>,
     info: &RwLock<ValidatorInfoCache>,
     epochs: &RwLock<Vec<EpochInfo>>,
+    misses: &RwLock<MissList>,
 ) -> Option<Message> {
     let request: Request = serde_json::from_slice(payload).ok()?;
     let id = request.id;
@@ -601,6 +606,15 @@ fn respond(
                 Err(_) => return Some(encode_with_id("summary", "displays", id, &())),
             };
             Some(encode_with_id("summary", "displays", id, &displays))
+        }
+        ("summary", "misses") => {
+            // The epoch's unpaid slots, asked for when the list is opened: a few
+            // kilobytes on a good node and far more on a bad one.
+            let list = match misses.read() {
+                Ok(list) => list.clone(),
+                Err(_) => return Some(encode_with_id("summary", "misses", id, &())),
+            };
+            Some(encode_with_id("summary", "misses", id, &list))
         }
         ("epoch", "query") => {
             let Ok(params) = serde_json::from_value::<EpochParams>(request.params) else {
@@ -696,6 +710,15 @@ mod tests {
         Arc::new(no_epochs())
     }
 
+    /// No unpaid slots, which is a validator under TowerBFT or a lucky one.
+    fn no_misses() -> RwLock<MissList> {
+        RwLock::new(MissList::default())
+    }
+
+    fn no_misses_shared() -> Arc<RwLock<MissList>> {
+        Arc::new(no_misses())
+    }
+
     fn epoch_record(epoch: u64) -> EpochInfo {
         EpochInfo {
             epoch,
@@ -719,6 +742,7 @@ mod tests {
             &empty(),
             &no_info(),
             &epochs,
+            &no_misses(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":11"#), "{reply}");
@@ -736,6 +760,7 @@ mod tests {
             &empty(),
             &no_info(),
             &epochs,
+            &no_misses(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":12"#), "{reply}");
@@ -759,6 +784,7 @@ mod tests {
             &empty(),
             &info,
             &no_epochs(),
+            &no_misses(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":4"#), "{reply}");
@@ -782,6 +808,7 @@ mod tests {
             &empty(),
             &info,
             &no_epochs(),
+            &no_misses(),
         )
         .unwrap();
         assert!(reply.contains(r#""keys":[]"#), "{reply}");
@@ -795,6 +822,7 @@ mod tests {
             &history,
             &no_info(),
             &no_epochs(),
+            &no_misses(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":9"#), "{reply}");
@@ -811,6 +839,7 @@ mod tests {
             &empty(),
             &no_info(),
             &no_epochs(),
+            &no_misses(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":3"#), "{reply}");
@@ -981,6 +1010,7 @@ mod tests {
                     empty_history(),
                     no_info_shared(),
                     no_epochs_shared(),
+                    no_misses_shared(),
                     limits,
                     &allowed_hosts,
                 )
@@ -1011,6 +1041,7 @@ mod tests {
                 empty_history(),
                 no_info_shared(),
                 no_epochs_shared(),
+                no_misses_shared(),
                 limits,
                 &allowed_hosts,
             )
@@ -1103,6 +1134,7 @@ mod tests {
                     empty_history(),
                     no_info_shared(),
                     no_epochs_shared(),
+                    no_misses_shared(),
                     limits,
                     &allowed_hosts,
                 )
@@ -1242,12 +1274,27 @@ mod tests {
     }
 
     #[test]
+    fn test_the_miss_list_is_answered_with_its_id() {
+        let reply = respond(
+            br#"{"topic":"summary","key":"misses","id":9}"#,
+            &empty(),
+            &no_info(),
+            &no_epochs(),
+            &no_misses(),
+        )
+        .unwrap();
+        assert!(reply.contains(r#""id":9"#), "{reply}");
+        assert!(reply.contains(r#""rows":[]"#), "{reply}");
+    }
+
+    #[test]
     fn test_ping_is_answered_with_its_id() {
         let reply = respond(
             br#"{"topic":"summary","key":"ping","id":7}"#,
             &empty(),
             &no_info(),
             &no_epochs(),
+            &no_misses(),
         )
         .unwrap();
         assert!(reply.contains(r#""id":7"#));
@@ -1260,6 +1307,7 @@ mod tests {
             &empty(),
             &no_info(),
             &no_epochs(),
+            &no_misses(),
         )
         .unwrap();
         assert!(reply.contains("unsupported request"));
@@ -1267,7 +1315,16 @@ mod tests {
 
     #[test]
     fn test_malformed_requests_are_ignored() {
-        assert!(respond(b"not json", &empty(), &no_info(), &no_epochs()).is_none());
+        assert!(
+            respond(
+                b"not json",
+                &empty(),
+                &no_info(),
+                &no_epochs(),
+                &no_misses()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1364,6 +1421,7 @@ mod tests {
                 empty_history(),
                 no_info_shared(),
                 no_epochs_shared(),
+                no_misses_shared(),
                 Limits::new(),
                 &allowed_hosts,
             )
