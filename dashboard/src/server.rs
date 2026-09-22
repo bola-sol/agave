@@ -186,7 +186,7 @@ async fn handle(
             return refuse(socket, head_len, 503, b"too many dashboard clients").await;
         };
         let path = request_path(&head).to_string();
-        serve_websocket(socket, publisher, history, info, epochs, &path).await
+        serve_websocket(socket, publisher, history, info, epochs, misses, &path).await
     } else {
         // Consume the peeked bytes. Closing with unread data makes the kernel send
         // RST rather than FIN, which truncates a large response.
@@ -438,6 +438,7 @@ async fn serve_websocket(
     history: Arc<RwLock<SlotHistory>>,
     info: Arc<RwLock<ValidatorInfoCache>>,
     epochs: Arc<RwLock<Vec<EpochInfo>>>,
+    misses: Arc<RwLock<MissList>>,
     path: &str,
 ) -> Result<(), ConnectionError> {
     let mut server = Server::new(socket.compat());
