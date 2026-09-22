@@ -125,6 +125,21 @@ impl Message {
     }
 }
 
+/// The JSON, as the string it is; the deflated form is a cache of it.
+impl std::ops::Deref for Message {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// zlib-wrapped deflate, the format a browser's `DecompressionStream`
 /// reads as "deflate".
 fn deflate(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -505,7 +520,8 @@ mod tests {
         while let Ok(message) = receiver.try_recv() {
             burst.push(message);
         }
-        let sent: Vec<&str> = coalesce(burst).iter().map(Message::text).collect();
+        let kept = coalesce(burst);
+        let sent: Vec<&str> = kept.iter().map(Message::text).collect();
         // Every ephemeral message, in order; the older root slot gone, the
         // newer in its own place.
         assert_eq!(
