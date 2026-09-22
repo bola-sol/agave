@@ -457,6 +457,8 @@ async fn serve_websocket(
     path: &str,
 ) -> Result<(), ConnectionError> {
     let mut server = Server::new(socket.compat());
+    // Only a protocol the server lists is reported back from the request.
+    server.add_protocol(DEFLATE_PROTOCOL);
     // The request borrows the server, so the key is copied out and the borrow
     // dropped before the response goes back over that same server.
     let (key, deflate) = {
