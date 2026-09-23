@@ -1434,8 +1434,9 @@ impl Validator {
                     .name("solBankNotifRly".to_string())
                     .spawn(move || {
                         for notification in receiver {
+                            // A full receiver misses this one rather than hold up the rest.
                             for subscriber in &subscribers {
-                                let _ = subscriber.send(notification.clone());
+                                let _ = subscriber.try_send(notification.clone());
                             }
                         }
                     })

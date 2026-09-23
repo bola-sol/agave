@@ -17,7 +17,7 @@ use {
     arc_swap::ArcSwap,
     bytesize::ByteSize,
     clap::{ArgMatches, crate_name, value_t, value_t_or_exit, values_t, values_t_or_exit},
-    crossbeam_channel::unbounded,
+    crossbeam_channel::{bounded, unbounded},
     log::*,
     rand::{rng, seq::SliceRandom},
     solana_accounts_db::{
@@ -563,7 +563,8 @@ pub fn execute(
     });
     // Frozen banks reach the collector from replay rather than by polling bank
     // forks, which under alpenglow prunes a bank within a slot of freezing.
-    let dashboard_banks = dashboard_config.is_some().then(unbounded);
+    // Bounded at a few minutes of slots, so a stalled collector holds no banks.
+    let dashboard_banks = dashboard_config.is_some().then(|| bounded(512));
     // The handles the supermajority wait reads, sent before it starts, so the
     // page can show the wait per validator.
     let dashboard_gossip = dashboard_config.is_some().then(unbounded);
