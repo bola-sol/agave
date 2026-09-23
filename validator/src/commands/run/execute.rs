@@ -561,9 +561,8 @@ pub fn execute(
             .extend(values_t!(matches, "dashboard_allowed_host", String).unwrap_or_default());
         config
     });
-    // Frozen banks reach the collector from replay rather than by polling bank
-    // forks, which under alpenglow prunes a bank within a slot of freezing.
-    // Bounded at a few minutes of slots, so a stalled collector holds no banks.
+    // Replay sends frozen banks, since alpenglow prunes bank forks within a
+    // slot; bounded so a stalled collector holds no banks.
     let dashboard_banks = dashboard_config.is_some().then(|| bounded(512));
     // The handles the supermajority wait reads, sent before it starts, so the
     // page can show the wait per validator.
@@ -1076,9 +1075,8 @@ pub fn execute(
             .incremental_snapshot_archives_dir,
     );
 
-    // Started before the bootstrap below, which is where the RPC search and the
-    // snapshot download happen, so the page is up through the slowest part of
-    // a cold start. The collector attaches once the validator exists.
+    // Started before the bootstrap below, so the page is up through the RPC
+    // search and snapshot download. The collector attaches later.
     let mut dashboard_service = match dashboard_config {
         None => None,
         Some(dashboard_config) => {
