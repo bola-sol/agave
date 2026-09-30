@@ -1425,7 +1425,8 @@ impl Validator {
             } else {
                 let (should_send_parents, dependency_tracker) = match &bank_notification_sender {
                     Some(rpc) => (rpc.should_send_parents, rpc.dependency_tracker.clone()),
-                    None => (geyser_plugin_service.is_some(), None),
+                    // Geyser hears of banks only through the RPC tracker.
+                    None => (false, None),
                 };
                 let mut subscribers = config.extra_bank_notification_senders.clone();
                 subscribers.extend(bank_notification_sender.map(|rpc| rpc.sender));
