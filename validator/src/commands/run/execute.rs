@@ -566,7 +566,7 @@ pub fn execute(
     let dashboard_banks = dashboard_config.is_some().then(|| bounded(512));
     // The handles the supermajority wait reads, sent before it starts, so the
     // page can show the wait per validator.
-    let dashboard_gossip = dashboard_config.is_some().then(unbounded);
+    let dashboard_gossip = dashboard_config.is_some().then(|| bounded(1));
 
     let contact_debug_interval = value_t_or_exit!(matches, "contact_debug_interval", u64);
 
