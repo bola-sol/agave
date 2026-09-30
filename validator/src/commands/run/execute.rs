@@ -807,11 +807,6 @@ pub fn execute(
 
     let mut validator_config = ValidatorConfig {
         log_config,
-        extra_bank_notification_senders: dashboard_banks
-            .iter()
-            .map(|(sender, _)| sender.clone())
-            .collect(),
-        gossip_ready_sender: dashboard_gossip.as_ref().map(|(sender, _)| sender.clone()),
         require_tower: matches.is_present("require_tower"),
         require_vote_history: !matches.is_present("do_not_require_vote_history"),
         tower_storage,
@@ -938,6 +933,11 @@ pub fn execute(
             "snapshot_packager_niceness_adj",
             i8
         ),
+        extra_bank_notification_senders: dashboard_banks
+            .iter()
+            .map(|(sender, _)| sender.clone())
+            .collect(),
+        gossip_ready_sender: dashboard_gossip.as_ref().map(|(sender, _)| sender.clone()),
     };
     validator_config
         .block_production_method
