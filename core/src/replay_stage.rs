@@ -1082,6 +1082,7 @@ impl ReplayStage {
                     &vote_account,
                     &mut replay_timing,
                     &footer_certs_sender,
+                    &mut slot_event_publisher,
                 ) {
                     Ok(new_frozen_slots) => new_frozen_slots,
                     Err(err) => {
@@ -4109,6 +4110,7 @@ impl ReplayStage {
         mut tbft_structs: Option<&mut TowerBFTStructures>,
         replay_result_vec: &[ReplaySlotFromBlockstore],
         my_pubkey: &Pubkey,
+        slot_event_publisher: &mut Publisher<SlotEvent>,
     ) -> Result<Vec<Slot>, ReplayStageError> {
         let bank_forks = &process_active_banks_context.bank_forks;
 
@@ -4272,6 +4274,15 @@ impl ReplayStage {
 
                     continue;
                 }
+
+                let (tid, pid) = cached_thread_and_process_id();
+                let _ = slot_event_publisher.publish(&SlotEvent::ExecutionComplete {
+                    pid,
+                    tid,
+                    timestamp_ns: monotonic_timestamp_ns(),
+                    slot: bank_slot,
+                    bank_id: bank.bank_id().into(),
+                });
 
                 let r_replay_stats = completed_replay.replay_stats.read().unwrap();
                 let r_replay_progress = completed_replay.replay_progress.read().unwrap();
@@ -4487,6 +4498,7 @@ impl ReplayStage {
         vote_account: &Pubkey,
         replay_timing: &mut ReplayLoopTiming,
         finalization_cert_sender: &Sender<SmallVec<[Certificate; 2]>>,
+        slot_event_publisher: &mut Publisher<SlotEvent>,
     ) -> Result<Vec<Slot>, ReplayStageError> /* completed slots */ {
         let bank_replay_result_trackers = Self::prepare_active_banks_for_replay(
             process_active_banks_context,
@@ -4519,6 +4531,7 @@ impl ReplayStage {
             tbft_structs,
             &replay_result_vec,
             my_pubkey,
+            slot_event_publisher,
         )
     }
 
