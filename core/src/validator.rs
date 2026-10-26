@@ -1836,6 +1836,7 @@ impl Validator {
                 highest_finalized: highest_finalized.clone(),
             },
             reward_aggregates_sender,
+            &event_system,
         )
         .map_err(ValidatorError::Other)?;
 
