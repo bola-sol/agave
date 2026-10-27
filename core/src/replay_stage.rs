@@ -4124,6 +4124,7 @@ impl ReplayStage {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_replay_results(
         process_active_banks_context: &ProcessActiveBanksContext,
         progress: &mut ProgressMap,
