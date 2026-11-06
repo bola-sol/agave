@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode, type ReactElement
 import { blockStamp, blockTime, bytes, count, micros, percent, shortKey, sol, units } from "../format";
 import {
   blockSummary,
+  certificateExplain,
   certificateVerdict,
   earnedOf,
   epochTotals,
@@ -46,6 +47,7 @@ import {
   type SchedulerView,
 } from "../slotDetail";
 import type { WaterfallRow } from "../waterfall";
+import { BlockFeeTables } from "./BlockFeeTables";
 import { Copyable } from "./Copyable";
 import { IpAddress } from "./IpAddress";
 import { FeePayersFold } from "./FeePayersFold";
@@ -600,6 +602,7 @@ function BlockDrawer({ slot, epoch, rates }: { slot: number; epoch: number | nul
     <div className="produced-detail">
       <BlockCompute block={block} cost={cost} rates={rates} />
       {cost && <BlockAccount block={block} cost={cost} recurrence={asked?.recurrence ?? null} />}
+      {detail?.fees && <BlockFeeTables fees={detail.fees} total={block.total_fees} />}
       {waterfall && <BlockScheduler waterfall={waterfall} />}
       {cost && <BlockFigures cost={cost} />}
       {block.certificate && <BlockCertificateStrip certificate={block.certificate} />}
@@ -650,9 +653,7 @@ function BlockCertificateStrip({ certificate }: { certificate: BlockCertificate 
     <div className="sx-cert">
       <div className="sx-strip">
         <span className="sx-strip-label">
-          <Explain text="The reward certificate this block wrote, for the slot eight back, against what the epoch's certificates usually pay.">
-            Reward certificate
-          </Explain>
+          <Explain text={certificateExplain(certificate)}>Reward certificate</Explain>
         </span>
         <div className="sx-cert-figures">
           <span>
@@ -700,11 +701,6 @@ function BlockCertificateStrip({ certificate }: { certificate: BlockCertificate 
               {validator.ip && <IpAddress ip={validator.ip} country={validator.country} />}
             </span>
           ))}
-        </div>
-      )}
-      {certificate.usual !== null && (
-        <div className="sx-cert-note">
-          The epoch's usual certificate pays {count(certificate.usual)} of {count(certificate.ranks)}.
         </div>
       )}
     </div>
