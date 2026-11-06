@@ -25,8 +25,6 @@ export interface GossipPeer {
   /** Slots behind our root, or null without that snapshot. */
   full: number | null;
   incremental: number | null;
-  /** Slots from the peer's lowest slot to our root. */
-  ledger: number | null;
   /** Under Alpenglow, the share of recent blocks whose finalization certificate carried its vote. */
   finalization: number | null;
   voteArrival: VoteArrival | null;
@@ -73,7 +71,6 @@ export function gossipPeers(list: GossipPeers): GossipPeer[] {
       started: list.started[index] ?? 0,
       full: behind(list.root, list.snapshot_full[index]),
       incremental: behind(list.root, list.snapshot_incremental[index]),
-      ledger: behind(list.root, list.lowest[index]),
       finalization: list.finalization[index] ?? null,
       voteArrival: arrivalOf(list.vote_arrival?.[index] ?? null),
       delinquent: list.delinquent?.[index] ?? false,
@@ -179,7 +176,6 @@ export type PeerColumn =
   | "heard"
   | "up"
   | "snapshot"
-  | "ledger"
   | "finalization"
   | "arrival";
 
@@ -220,7 +216,6 @@ const COLUMNS: Record<PeerColumn, { key: Key; ascending: boolean }> = {
   heard: { key: (peer) => peer.heardAgo, ascending: false },
   up: { key: (peer, now) => (peer.started > 0 ? now - peer.started : null), ascending: false },
   snapshot: { key: snapshotAge, ascending: false },
-  ledger: { key: (peer) => peer.ledger, ascending: false },
   finalization: { key: (peer) => peer.finalization, ascending: false },
   arrival: { key: (peer) => peer.voteArrival?.mean ?? null, ascending: true },
 };
@@ -284,13 +279,6 @@ export function spanParts(millis: number | null | undefined): Part[] | null {
   const days = Math.floor(hours / 24);
   const rest = hours % 24;
   return days < 10 && rest > 0 ? [part(days, "d"), part(rest, "h")] : [part(days, "d")];
-}
-
-/** As a time at the slot rate we observe, or in slots without one. */
-export function ledgerParts(slots: number | null, slotMillis: number | null | undefined): Part[] | null {
-  if (slots === null) return null;
-  if (!slotMillis) return [{ value: count(slots), unit: " slots" }];
-  return spanParts(slots * slotMillis);
 }
 
 /** Labelled figures, each label ahead of its figure; an empty value reads as none. */

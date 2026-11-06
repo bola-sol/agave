@@ -6,10 +6,7 @@ use {
     crate::{geoip, metrics_tap::VoteArrival},
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_gossip::{
-        contact_info::ContactInfo,
-        crds_data::{LowestSlot, SnapshotHashes},
-    },
+    solana_gossip::{contact_info::ContactInfo, crds_data::SnapshotHashes},
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     std::{
@@ -28,7 +25,7 @@ pub type VoteArrivalCell = (u64, Option<u64>, Option<u64>, Option<u64>, Option<u
 /// One array per column, so several thousand rows stay compact.
 #[derive(Debug, Default, Serialize)]
 pub struct GossipPeers {
-    /// Our root, which the snapshot and lowest slots are read against.
+    /// Our root, which the snapshot slots are read against.
     pub root: Slot,
     /// Active stake in lamports, of which `stake` is each node's share.
     pub total_stake: u64,
@@ -55,7 +52,6 @@ pub struct GossipPeers {
     pub vote_arrival: Vec<Option<VoteArrivalCell>>,
     pub snapshot_full: Vec<Option<Slot>>,
     pub snapshot_incremental: Vec<Option<Slot>>,
-    pub lowest: Vec<Option<Slot>>,
     /// Staked and not voting: never, or too far behind the tip.
     pub delinquent: Vec<bool>,
     /// The oldest last vote among a staked node's vote accounts.
@@ -131,7 +127,7 @@ impl Collector {
             ..GossipPeers::default()
         };
         // What each peer advertises, read in one short hold of the gossip table's lock.
-        let advertised: Vec<(Option<Slot>, Option<Slot>, Option<Slot>)> = {
+        let advertised: Vec<(Option<Slot>, Option<Slot>)> = {
             let crds = self.ctx.cluster_info.gossip.crds.read();
             rows.iter()
                 .map(|(contact, _)| {
@@ -142,7 +138,6 @@ impl Collector {
                         hashes.and_then(|hashes| {
                             hashes.incremental.iter().map(|(slot, _)| *slot).max()
                         }),
-                        crds.get::<&LowestSlot>(key).map(|lowest| lowest.lowest),
                     )
                 })
                 .collect()
@@ -150,7 +145,7 @@ impl Collector {
 
         let mut client_at: HashMap<(String, String), usize> = HashMap::new();
         let info = self.info_cache.read().unwrap();
-        for ((contact, heard_at), (full, incremental, lowest)) in rows.into_iter().zip(advertised) {
+        for ((contact, heard_at), (full, incremental)) in rows.into_iter().zip(advertised) {
             let key = contact.pubkey();
             let client = (
                 contact.version().client().to_string(),
@@ -191,7 +186,6 @@ impl Collector {
                 }));
             list.snapshot_full.push(full);
             list.snapshot_incremental.push(incremental);
-            list.lowest.push(lowest);
             let last_vote = stalest.get(key).copied();
             list.delinquent
                 .push(last_vote.is_some_and(|vote| is_delinquent(vote, tip)));

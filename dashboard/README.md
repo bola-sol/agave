@@ -74,7 +74,7 @@ the domain in the site block is the name to allow, and nothing else is needed.
   anyone who can reach it.
 - The Gossip page lists every node this validator hears in gossip, with its
   stake, client, gossip address, RPC port, start time and advertised snapshot
-  and lowest slots. Every node holds the same table, so none of it is private,
+  slots. Every node holds the same table, so none of it is private,
   but the page gathers it in one place.
 - The Cluster page totals the cluster's stake by client and by country, and
   names the leaders that skipped most this epoch. All of it is public on chain

@@ -181,7 +181,6 @@ export interface GossipPeers {
   started: number[];
   snapshot_full: (number | null)[];
   snapshot_incremental: (number | null)[];
-  lowest: (number | null)[];
   /** Under Alpenglow, the share of recent blocks whose finalization certificate carried its vote. */
   finalization: (number | null)[];
   /** The epoch `vote_arrival` describes; null until votor has reported one. */

@@ -33,8 +33,7 @@ type KeyName =
   | "arrival"
   | "heard"
   | "up"
-  | "snapshot"
-  | "ledger";
+  | "snapshot";
 
 type PeerGroup = "only" | "validator" | "votes" | "node";
 
@@ -69,7 +68,6 @@ const KEYS: readonly PeerKey[] = [
   { name: "heard", kind: "time", group: "node", label: "Last heard", unit: "", op: ">", example: "1m", what: "last heard" },
   { name: "up", kind: "time", group: "node", label: "Up for", unit: "", op: "<", example: "1d", what: "up for" },
   { name: "snapshot", kind: "number", group: "node", label: "Snapshot", unit: "slots", op: ">", example: "5000", what: "newest snapshot, slots behind our root" },
-  { name: "ledger", kind: "time", group: "node", label: "Ledger from", unit: "", op: "<", example: "1d", what: "how far back it can serve repair" },
 ];
 
 const ONLY_WHAT: Readonly<Record<PeerFilter, string>> = {
@@ -282,8 +280,6 @@ function figure(key: KeyName, peer: GossipPeer, clock: PeerClock): number | null
       return peer.started > 0 ? (clock.now - peer.started) / 1000 : null;
     case "snapshot":
       return peer.incremental ?? peer.full;
-    case "ledger":
-      return peer.ledger === null || !clock.slotMillis ? null : (peer.ledger * clock.slotMillis) / 1000;
     default:
       return null;
   }

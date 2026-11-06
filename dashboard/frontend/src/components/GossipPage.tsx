@@ -15,7 +15,6 @@ import {
   gossipPeers,
   gossipVerdict,
   inFilter,
-  ledgerParts,
   matchesSearch,
   MESSAGE_LABELS,
   nextSort,
@@ -383,7 +382,6 @@ const HEADINGS: { column: PeerColumn; label: string; numeric: boolean }[] = [
   { column: "heard", label: "Last heard", numeric: true },
   { column: "up", label: "Up for", numeric: true },
   { column: "snapshot", label: "Snapshot", numeric: true },
-  { column: "ledger", label: "Ledger from", numeric: true },
 ];
 
 function PeersCard({
@@ -566,7 +564,7 @@ function PeersCard({
         />
       )}
       <div className="card-footnote">
-        Snapshot: slots behind our root. Ledger from: how far back the peer can serve repair.
+        Snapshot: slots behind our root.
       </div>
     </Card>
   );
@@ -767,9 +765,6 @@ const PeerLine = memo(function PeerLine({
       </td>
       <td className="is-num">
         <SnapshotAges peer={peer} />
-      </td>
-      <td className="is-num">
-        <Parts parts={ledgerParts(peer.ledger, slotMillis)} />
       </td>
     </tr>
   );

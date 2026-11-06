@@ -11,7 +11,6 @@ import {
   FIRST_SORT,
   gossipPeers,
   gossipVerdict,
-  ledgerParts,
   matchesSearch,
   nextSort,
   rate,
@@ -44,7 +43,6 @@ const LIST: GossipPeers = {
   started: [NOW - 6 * 86_400_000, NOW - 3_600_000, NOW - 840_000, 0],
   snapshot_full: [6_188, 6_188, null, 0],
   snapshot_incremental: [9_958, null, null, null],
-  lowest: [9_000, 9_900, 9_990, null],
   finalization: [0.98, 0.25, null, 0.93],
   vote_arrival_epoch: 1_048,
   vote_arrival: [
@@ -70,7 +68,6 @@ describe("gossipPeers", () => {
       client: "Agave v4.3.0",
       full: 3_812,
       incremental: 42,
-      ledger: 1_000,
     });
     expect(PEERS[1].client).toBe("JitoLabs v4.3.0");
     expect(PEERS[2]).toMatchObject({ full: null, incremental: null, rpc: 8899 });
@@ -198,7 +195,7 @@ describe("text", () => {
     expect(spanParts(undefined)).toBeNull();
   });
 
-  it("describes snapshots and ledger depth", () => {
+  it("describes snapshots", () => {
     expect(snapshotParts(PEERS[0])).toEqual([
       { label: "full", value: "3,812" },
       { label: "inc", value: "42" },
@@ -208,9 +205,6 @@ describe("text", () => {
       { label: "inc", value: null },
     ]);
     expect(snapshotParts(PEERS[2])).toBeNull();
-    expect(ledgerParts(1_000, 400)).toEqual([{ value: "6", unit: "min" }]);
-    expect(ledgerParts(1_000, null)).toEqual([{ value: "1,000", unit: " slots" }]);
-    expect(ledgerParts(null, 400)).toBeNull();
   });
 
   it("keeps two decimals of stake under one SOL", () => {

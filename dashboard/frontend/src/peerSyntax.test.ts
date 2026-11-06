@@ -36,7 +36,6 @@ const LIST: GossipPeers = {
   started: [NOW - 6 * DAY, NOW - 3_600_000, NOW - 840_000, 0],
   snapshot_full: [6_188, 6_188, null, 0],
   snapshot_incremental: [9_958, null, null, null],
-  lowest: [9_000, 9_900, 9_990, null],
   finalization: [0.98, 0.254, null, 0.93],
   vote_arrival_epoch: 1_048,
   vote_arrival: [[92_400, 21_000, 388_000, 141_000, 1_802], [412_000, null, null, null, 1], null, [151_000, 34_000, 612_000, 203_000]],
@@ -113,11 +112,9 @@ describe("peerHolds", () => {
     expect(matching(number("up", "lt", 86_400))).toEqual(["Mid2222", "Rpc3333"]);
   });
 
-  it("reads the newest snapshot, and the ledger as a time", () => {
+  it("reads the newest snapshot", () => {
     expect(matching(number("snapshot", "lt", 100))).toEqual(["Big1111"]);
     expect(matching(number("snapshot", "gt", 9_000))).toEqual(["Old4444"]);
-    expect(matching(number("ledger", "ge", 400))).toEqual(["Big1111"]);
-    expect(PEERS.filter((peer) => peerHolds(number("ledger", "ge", 0), peer, { ...CLOCK, slotMillis: null }))).toEqual([]);
   });
 
   it("follows a finalize bar's votes when one is picked", () => {

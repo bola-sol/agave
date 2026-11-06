@@ -3211,7 +3211,6 @@ mod tests {
             "started",
             "snapshot_full",
             "snapshot_incremental",
-            "lowest",
             "finalization",
             "vote_arrival",
             "delinquent",
