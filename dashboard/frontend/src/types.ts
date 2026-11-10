@@ -1162,7 +1162,6 @@ export interface PhaseTiming {
 
 export interface StakeInGossip {
   online: number;
-  offline: number;
   total: number;
 }
 
