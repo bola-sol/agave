@@ -405,9 +405,7 @@ impl<T: Clone> HeldSlots<T> {
             Some(_) => return false,
             None => {
                 self.held.insert(slot, value);
-                while self.held.len() > MAX_HELD_SLOTS {
-                    self.held.pop_first();
-                }
+                keep_newest(&mut self.held, MAX_HELD_SLOTS);
             }
         }
         self.changed.insert(slot);
@@ -1177,9 +1175,7 @@ impl MetricsTap {
                 timing.scheduler_schedule_micros = field("schedule_time_us");
             }
         }
-        while timings.len() > PENDING_SLOTS {
-            timings.pop_first();
-        }
+        keep_newest(&mut timings, PENDING_SLOTS);
     }
 
     fn remember_vote_arrival(&self, point: &DataPoint) {
@@ -1253,9 +1249,7 @@ impl MetricsTap {
             return;
         };
         tracks.insert(slot, vote);
-        while tracks.len() > VOTE_TRACKS {
-            tracks.pop_first();
-        }
+        keep_newest(&mut tracks, VOTE_TRACKS);
     }
 
     /// Every time counts from votor's start on the slot, and the block's arrival from its first
@@ -1313,9 +1307,7 @@ impl MetricsTap {
             return;
         };
         closed.closed_at.insert(slot, closed_at_nanos);
-        while closed.closed_at.len() > SHRED_FILLS {
-            closed.closed_at.pop_first();
-        }
+        keep_newest(&mut closed.closed_at, SHRED_FILLS);
         let waiting = closed.waiting.remove(&slot);
         drop(closed);
         if let Some(finality_us) = waiting {
@@ -1330,9 +1322,7 @@ impl MetricsTap {
         };
         let Some(&closed_at_nanos) = closed.closed_at.get(&slot) else {
             closed.waiting.insert(slot, finality_us);
-            while closed.waiting.len() > SHRED_FILLS {
-                closed.waiting.pop_first();
-            }
+            keep_newest(&mut closed.waiting, SHRED_FILLS);
             return;
         };
         drop(closed);
@@ -1448,9 +1438,7 @@ impl MetricsTap {
         // A slot replayed twice keeps the later report. Bounded from the lowest
         // slot, which is the oldest during ordinary running.
         slots.insert(slot.slot, slot);
-        while slots.len() > REPLAY_SLOTS {
-            slots.pop_first();
-        }
+        keep_newest(&mut slots, REPLAY_SLOTS);
     }
 
     /// The -1 the blockstore sends for an unknown last index drops the point.
@@ -1489,9 +1477,7 @@ impl MetricsTap {
             return;
         };
         fills.insert(slot, fill);
-        while fills.len() > SHRED_FILLS {
-            fills.pop_first();
-        }
+        keep_newest(&mut fills, SHRED_FILLS);
     }
 
     fn remember_worker_timing(&self, point: &DataPoint, at_millis: u64) {
@@ -1544,9 +1530,7 @@ impl MetricsTap {
             return;
         };
         slots.insert(slot, times);
-        while slots.len() > PENDING_SLOTS {
-            slots.pop_first();
-        }
+        keep_newest(&mut slots, PENDING_SLOTS);
     }
 
     fn remember_bundles(&self, point: &DataPoint) {
@@ -1577,9 +1561,7 @@ impl MetricsTap {
         });
         landing.sanitized = landing.sanitized.saturating_add(sanitized);
         landing.executed = landing.executed.saturating_add(executed);
-        while slots.len() > PENDING_SLOTS {
-            slots.pop_first();
-        }
+        keep_newest(&mut slots, PENDING_SLOTS);
     }
 
     fn remember_cost(&self, point: &DataPoint) {
@@ -2292,6 +2274,13 @@ fn number_named(point: &DataPoint, wanted: &str) -> Option<u64> {
 fn tag_named<'a>(point: &'a DataPoint, wanted: &str) -> Option<&'a str> {
     let (_, value) = point.tags.iter().find(|(name, _)| *name == wanted)?;
     Some(value.as_str())
+}
+
+/// Drops the lowest keys until `map` holds at most `cap`.
+pub(crate) fn keep_newest<K: Ord, V>(map: &mut BTreeMap<K, V>, cap: usize) {
+    while map.len() > cap {
+        map.pop_first();
+    }
 }
 
 fn add_named(counter: &AtomicU64, point: &DataPoint, wanted: &str) {
