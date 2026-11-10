@@ -331,7 +331,6 @@ struct VoteArrivals {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct StakeInGossip {
     pub online: u64,
-    pub offline: u64,
     pub total: u64,
 }
 
@@ -1700,7 +1699,6 @@ impl MetricsTap {
             };
             match *name {
                 "online_stake" => seen.online = number,
-                "offline_stake" => seen.offline = number,
                 "total_activated_stake" => seen.total = number,
                 _ => (),
             }
@@ -4091,7 +4089,6 @@ mod tests {
             tap.stake_in_gossip(),
             Some(StakeInGossip {
                 online: 2_350_000_000_000_000,
-                offline: 401_650_000_000_000_000,
                 total: 404_000_000_000_000_000,
             })
         );
