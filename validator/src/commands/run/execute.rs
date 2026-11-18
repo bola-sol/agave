@@ -559,6 +559,7 @@ pub fn execute(
         config
             .allowed_hosts
             .extend(values_t!(matches, "dashboard_allowed_host", String).unwrap_or_default());
+        config.history_dir = matches.value_of("dashboard_history_dir").map(PathBuf::from);
         config
     });
     // Replay sends frozen banks, since alpenglow prunes bank forks within a
