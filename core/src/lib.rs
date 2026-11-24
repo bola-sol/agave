@@ -31,6 +31,7 @@ mod result;
 pub mod sample_performance_service;
 #[cfg(unix)]
 mod scheduler_bindings_server;
+pub mod shred_fetch_events;
 mod shred_fetch_stage;
 pub mod sigverify;
 pub mod sigverify_stage;
