@@ -7,6 +7,7 @@ pub mod certs;
 pub mod collect;
 pub mod config;
 pub mod context;
+pub mod event_input;
 #[cfg(test)]
 pub(crate) mod fixture;
 pub mod geoip;
