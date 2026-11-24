@@ -8,6 +8,7 @@
 //!
 
 pub mod admin_rpc_post_init;
+pub mod bank_state_events;
 pub mod banking_channels;
 pub mod banking_stage;
 pub(crate) mod block_creation_loop;
