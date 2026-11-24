@@ -1,9 +1,16 @@
 //! The `shred_fetch_stage` pulls shreds from UDP sockets and sends it to a channel.
 
 use {
-    crate::repair::{
-        repair_service::OutstandingShredRepairs, serve_repair::PendingRepairPingRingBuffer,
+    crate::{
+        repair::{
+            repair_service::OutstandingShredRepairs, serve_repair::PendingRepairPingRingBuffer,
+        },
+        shred_fetch_events::{
+            SHRED_FETCH_PATH_REPAIR, SHRED_FETCH_PATH_TURBINE, SHRED_FETCH_STREAM,
+            ShredFetchCounters, ShredFetchTotals,
+        },
     },
+    agave_event_system::{EventSystem, PublisherFactory, StreamConfig},
     crossbeam_channel::{RecvError, TryRecvError},
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::shred::{
@@ -63,11 +70,20 @@ impl ShredFetchStage {
         name: &'static str,
         ingress: ShredIngress,
         turbine_mode: TurbineMode,
+        counters_factory: PublisherFactory<ShredFetchCounters>,
     ) {
-        let (flags, repair_context) = match &ingress {
-            ShredIngress::Turbine => (PacketFlags::empty(), None),
-            ShredIngress::Repair(repair_context) => (PacketFlags::REPAIR, Some(repair_context)),
+        let (flags, repair_context, path) = match &ingress {
+            ShredIngress::Turbine => (PacketFlags::empty(), None, SHRED_FETCH_PATH_TURBINE),
+            ShredIngress::Repair(repair_context) => (
+                PacketFlags::REPAIR,
+                Some(repair_context),
+                SHRED_FETCH_PATH_REPAIR,
+            ),
         };
+        let mut counters_publisher = counters_factory
+            .try_create_publisher()
+            .expect("shred fetch stream has a publisher slot per modifier thread");
+        let mut totals = ShredFetchTotals::default();
         const STATS_SUBMIT_CADENCE: Duration = Duration::from_secs(1);
         let mut shred_filter_ctx = ShredFilterContext::new_with_turbine_mode(
             sharable_banks.root(),
@@ -101,6 +117,7 @@ impl ShredFetchStage {
             };
             shred_filter_ctx.maybe_update(sharable_banks.root());
             shred_filter_ctx.stats.shred_count += packet_batch.len();
+            let batch_len = packet_batch.len();
 
             if let Some(repair_context) = repair_context {
                 pending_pings.take_pings_from_batch(&mut packet_batch, &mut shred_filter_ctx.stats);
@@ -132,10 +149,14 @@ impl ShredFetchStage {
                     num_valid_packets += 1;
                 }
             }
-            if shred_filter_ctx.maybe_submit_stats(name, STATS_SUBMIT_CADENCE)
-                && let Some(stats) = recvr_stats.as_ref()
-            {
-                stats.report();
+            totals.add_batch(batch_len, num_valid_packets);
+            if shred_filter_ctx.maybe_submit_stats(name, STATS_SUBMIT_CADENCE) {
+                if let Some(stats) = recvr_stats.as_ref() {
+                    stats.report();
+                }
+                if counters_publisher.is_enabled() {
+                    let _ = counters_publisher.publish(&totals.event(path));
+                }
             }
             if num_valid_packets == 0 {
                 continue;
@@ -144,6 +165,7 @@ impl ShredFetchStage {
                 match send_err {
                     crossbeam_channel::TrySendError::Full(v) => {
                         shred_filter_ctx.stats.overflow_shreds += v.len();
+                        totals.add_overflow(v.len());
                     }
                     _ => unreachable!("EvictingSender holds on to both ends of the channel"),
                 }
@@ -164,6 +186,7 @@ impl ShredFetchStage {
         receiver_name: &'static str,
         ingress: ShredIngress,
         turbine_mode: TurbineMode,
+        counters_factory: PublisherFactory<ShredFetchCounters>,
     ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
         let sharable_banks = bank_forks.read().unwrap().sharable_banks();
         let channel_size = match &ingress {
@@ -199,6 +222,7 @@ impl ShredFetchStage {
                     name,
                     ingress,
                     turbine_mode,
+                    counters_factory,
                 )
             })
             .unwrap();
@@ -216,7 +240,18 @@ impl ShredFetchStage {
         outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
         turbine_mode: TurbineMode,
         exit: Arc<AtomicBool>,
-    ) -> Self {
+        event_system: &EventSystem,
+    ) -> Result<Self, String> {
+        let counters_factory = event_system
+            .create_stream::<ShredFetchCounters>(
+                SHRED_FETCH_STREAM,
+                StreamConfig {
+                    capacity: 256,
+                    publisher_slots: 2,
+                    subscriber_slots: 8,
+                },
+            )
+            .map_err(|err| format!("Failed to create shred fetch stream: {err}"))?;
         let repair_context = RepairContext {
             repair_socket: repair_socket.clone(),
             cluster_info,
@@ -235,6 +270,7 @@ impl ShredFetchStage {
             "shred_fetch_receiver",
             ShredIngress::Turbine,
             turbine_mode.clone(),
+            counters_factory.clone(),
         );
 
         let (repair_receiver, repair_handler) = Self::packet_modifier(
@@ -249,14 +285,15 @@ impl ShredFetchStage {
             "shred_fetch_repair_receiver",
             ShredIngress::Repair(repair_context),
             turbine_mode.clone(),
+            counters_factory,
         );
 
         tvu_threads.extend(repair_receiver);
         tvu_threads.push(tvu_filter);
         tvu_threads.push(repair_handler);
-        Self {
+        Ok(Self {
             thread_hdls: tvu_threads,
-        }
+        })
     }
 
     pub(crate) fn join(self) -> thread::Result<()> {

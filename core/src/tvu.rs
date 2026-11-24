@@ -388,7 +388,8 @@ impl Tvu {
             outstanding_repair_requests.clone(),
             turbine_mode,
             exit.clone(),
-        );
+            event_system,
+        )?;
 
         let (verified_sender, verified_receiver) = unbounded();
 
