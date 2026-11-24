@@ -120,7 +120,9 @@ dependencies = [
 name = "agave-dashboard"
 version = "4.5.0-rc.1"
 dependencies = [
+ "agave-event-system",
  "agave-feature-set",
+ "agave-logger",
  "agave-snapshots",
  "agave-votor-messages",
  "bincode",

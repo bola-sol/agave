@@ -42,7 +42,7 @@ use {
 
 pub const METER_INTERVAL: Duration = Duration::from_secs(1);
 
-const CHART_HISTORY: usize = 300;
+pub(crate) const CHART_HISTORY: usize = 300;
 
 /// Leader slots' waterfalls and costs sent to a connecting client, as many as its blocks.
 const SLOT_LISTS_SENT: usize = 500;
