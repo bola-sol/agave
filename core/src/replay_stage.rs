@@ -27,7 +27,7 @@ use {
                 AncestorDuplicateSlotsReceiver, DumpedSlotsSender, PopularPrunedForksReceiver,
             },
         },
-        replay_stage::events::SlotEvent,
+        replay_stage::events::{BankFrozenEvent, SlotEvent},
         unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
         voting_service::VoteOp,
         window_service::DuplicateSlotReceiver,
@@ -846,6 +846,16 @@ impl ReplayStage {
                 },
             )
             .map_err(|err| format!("Failed to create replay slot-event stream: {err}"))?;
+        let bank_frozen_factory = event_system
+            .create_stream::<BankFrozenEvent>(
+                events::BANK_FROZEN_STREAM,
+                StreamConfig {
+                    capacity: 1024,
+                    publisher_slots: 1,
+                    subscriber_slots: 8,
+                },
+            )
+            .map_err(|err| format!("Failed to create replay bank-frozen stream: {err}"))?;
 
         // Start the replay stage loop
         let migration_status = bank_forks.read().unwrap().migration_status();
@@ -861,6 +871,9 @@ impl ReplayStage {
 
         let run_replay = move || {
             let mut slot_event_publisher = slot_event_factory
+                .try_create_publisher()
+                .expect("fresh replay stream has one publisher slot");
+            let mut bank_frozen_publisher = bank_frozen_factory
                 .try_create_publisher()
                 .expect("fresh replay stream has one publisher slot");
             if let Some(arena) = replay_arena {
@@ -1084,6 +1097,7 @@ impl ReplayStage {
                     &mut replay_timing,
                     &footer_certs_sender,
                     &mut slot_event_publisher,
+                    &mut bank_frozen_publisher,
                 ) {
                     Ok(new_frozen_slots) => new_frozen_slots,
                     Err(err) => {
@@ -4136,6 +4150,7 @@ impl ReplayStage {
         replay_result_vec: &[ReplaySlotFromBlockstore],
         my_pubkey: &Pubkey,
         slot_event_publisher: &mut Publisher<SlotEvent>,
+        bank_frozen_publisher: &mut Publisher<BankFrozenEvent>,
     ) -> Result<Vec<Slot>, ReplayStageError> {
         let bank_forks = &process_active_banks_context.bank_forks;
 
@@ -4321,6 +4336,9 @@ impl ReplayStage {
                     bank.bank_id().into(),
                     true,
                 ));
+                if bank_frozen_publisher.is_enabled() {
+                    let _ = bank_frozen_publisher.publish(&BankFrozenEvent::new(bank));
+                }
 
                 let r_replay_stats = completed_replay.replay_stats.read().unwrap();
                 let r_replay_progress = completed_replay.replay_progress.read().unwrap();
@@ -4537,6 +4555,7 @@ impl ReplayStage {
         replay_timing: &mut ReplayLoopTiming,
         finalization_cert_sender: &Sender<SmallVec<[Certificate; 2]>>,
         slot_event_publisher: &mut Publisher<SlotEvent>,
+        bank_frozen_publisher: &mut Publisher<BankFrozenEvent>,
     ) -> Result<Vec<Slot>, ReplayStageError> /* completed slots */ {
         let bank_replay_result_trackers = Self::prepare_active_banks_for_replay(
             process_active_banks_context,
@@ -4570,6 +4589,7 @@ impl ReplayStage {
             &replay_result_vec,
             my_pubkey,
             slot_event_publisher,
+            bank_frozen_publisher,
         )
     }
 
