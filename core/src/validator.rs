@@ -4,6 +4,7 @@ pub use solana_perf::report_target_features;
 use {
     crate::{
         admin_rpc_post_init::{AdminRpcRequestMetadataPostInit, KeyUpdaterType, KeyUpdaters},
+        bank_state_events::BankStateEvents,
         banking_channels::Channels,
         banking_stage::{
             BankingStage, transaction_scheduler::scheduler_controller::SchedulerConfig,
@@ -746,6 +747,7 @@ pub struct Validator {
     accounts_background_service: AccountsBackgroundService,
     xdp_transmitter: Option<Transmitter>,
     bank_notification_relay: Option<JoinHandle<()>>,
+    bank_state_events: BankStateEvents,
     // This runtime is used to run the client owned by SendTransactionService.
     // We don't wait for its JoinHandle here because ownership and shutdown
     // are managed elsewhere. This variable is intentionally unused.
@@ -1935,6 +1937,15 @@ impl Validator {
             );
         }
 
+        let bank_state_events = BankStateEvents::new(
+            &event_system,
+            bank_forks.clone(),
+            leader_schedule_cache.clone(),
+            *vote_account,
+            exit.clone(),
+        )
+        .map_err(ValidatorError::Other)?;
+
         *admin_rpc_service_post_init.write().unwrap() = Some(AdminRpcRequestMetadataPostInit {
             event_system: event_system.clone(),
             bank_forks: bank_forks.clone(),
@@ -1987,6 +1998,7 @@ impl Validator {
             accounts_background_service,
             xdp_transmitter,
             bank_notification_relay,
+            bank_state_events,
             _tpu_client_next_runtime: tpu_client_next_runtime,
         })
     }
@@ -2148,6 +2160,7 @@ impl Validator {
         }
         self.tpu.join().expect("tpu");
         self.tvu.join().expect("tvu");
+        self.bank_state_events.join().expect("bank_state_events");
         if let Some(relay) = self.bank_notification_relay {
             relay.join().expect("bank_notification_relay");
         }
