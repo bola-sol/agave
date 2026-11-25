@@ -290,7 +290,7 @@ pub struct MetricsTap {
     forward: std::sync::OnceLock<crossbeam_channel::Sender<(DataPoint, u64)>>,
     forwarding: AtomicBool,
     forward_drops: AtomicU64,
-    /// Test branch only: points sent once a run or once an epoch, kept to resend.
+    /// Test branch only: points sent once an hour, a run or an epoch, kept to resend.
     latched: Mutex<Latched>,
 }
 
@@ -298,7 +298,7 @@ pub struct MetricsTap {
 #[derive(Debug, Default)]
 struct Latched {
     once: Vec<(DataPoint, u64)>,
-    arrival_epoch: Option<u64>,
+    arrival_epoch: Option<Epoch>,
     arrivals: Vec<(DataPoint, u64)>,
 }
 
@@ -1049,7 +1049,7 @@ impl MetricsTap {
         self.forward_drops.load(Ordering::Relaxed)
     }
 
-    /// Points sent once a run or once an epoch, with when each was observed.
+    /// Points sent once an hour, a run or an epoch, with when each was observed.
     pub fn latched_points(&self) -> Vec<(DataPoint, u64)> {
         let latched = locked(&self.latched);
         latched
