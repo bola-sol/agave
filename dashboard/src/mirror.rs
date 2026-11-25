@@ -636,6 +636,8 @@ struct State {
 pub struct Mirror {
     state: RwLock<State>,
     start_progress: StartProgress,
+    /// The publishing validator's process id, 0 until its node info arrives.
+    validator_pid: std::sync::atomic::AtomicU32,
 }
 
 impl Mirror {
@@ -643,7 +645,16 @@ impl Mirror {
         Self {
             state: RwLock::new(State::default()),
             start_progress,
+            validator_pid: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// The process id of the validator whose node info arrived last.
+    pub fn validator_pid(&self) -> Option<u32> {
+        let pid = self
+            .validator_pid
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (pid != 0).then_some(pid)
     }
 
     /// Whether enough has arrived for the collector to start. It reads some things once, as a
@@ -691,6 +702,8 @@ impl Mirror {
         // The validator's memory and threads, not this process's.
         if let Ok(pid) = u32::try_from(event.pid) {
             crate::host_stats::read_process(pid);
+            self.validator_pid
+                .store(pid, std::sync::atomic::Ordering::Relaxed);
         }
         self.state.write().unwrap().node = Some(Node::from(event));
     }
