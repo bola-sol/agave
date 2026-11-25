@@ -629,6 +629,26 @@ pub struct Collector {
 /// The shared failed count until the collector first stores one.
 pub const FAILED_UNREAD: u64 = u64::MAX;
 
+/// The slots `leader` leads in `epoch`, where the schedule is known.
+pub(crate) fn leader_slots_in_epoch(
+    src: &dyn Source,
+    bank: &dyn BankView,
+    epoch: Epoch,
+    leader: &Pubkey,
+) -> Option<Vec<Slot>> {
+    let epoch_schedule = bank.epoch_schedule();
+    let start_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
+    let end_slot = epoch_schedule.get_last_slot_in_epoch(epoch);
+    let slots = end_slot.saturating_sub(start_slot).saturating_add(1);
+    src.leader_slot_indexes(epoch, leader, slots)
+        .map(|indexes| {
+            indexes
+                .into_iter()
+                .map(|index| start_slot.saturating_add(index))
+                .collect()
+        })
+}
+
 pub struct CollectorShared {
     pub publisher: Arc<Publisher>,
     pub info_cache: Arc<RwLock<ValidatorInfoCache>>,
@@ -2141,19 +2161,7 @@ impl Collector {
 
     /// `None` means the schedule is not known yet, which is not an empty list.
     fn leader_slots_in_epoch(&self, bank: &dyn BankView, epoch: Epoch) -> Option<Vec<Slot>> {
-        let epoch_schedule = bank.epoch_schedule();
-        let start_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
-        let end_slot = epoch_schedule.get_last_slot_in_epoch(epoch);
-        let slots = end_slot.saturating_sub(start_slot).saturating_add(1);
-        let me = self.src.identity();
-        self.src
-            .leader_slot_indexes(epoch, &me, slots)
-            .map(|indexes| {
-                indexes
-                    .into_iter()
-                    .map(|index| start_slot.saturating_add(index))
-                    .collect()
-            })
+        leader_slots_in_epoch(self.src.as_ref(), bank, epoch, &self.src.identity())
     }
 
     /// Returns each validator's stalest vote, which the certificate lists mark delinquency by.
