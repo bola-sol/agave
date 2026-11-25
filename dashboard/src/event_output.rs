@@ -164,6 +164,8 @@ const HISTORY_EVERY: Duration = Duration::from_secs(30);
 const PEERS_EVERY: Duration = Duration::from_secs(15);
 /// How often every validator info entry goes out; changes go out as banks freeze.
 const INFO_EVERY: Duration = Duration::from_secs(600);
+/// How often points sent once a run or once an epoch go again, for a subscriber that missed them.
+const LATCHED_EVERY: Duration = Duration::from_secs(60);
 /// Set events sent before a pause, so a set larger than its stream arrives whole.
 const PACE_BATCH: usize = 512;
 const PACE_PAUSE: Duration = Duration::from_millis(50);
@@ -1145,6 +1147,7 @@ impl MetricOutput {
             .name("solEvtMetric".to_string())
             .spawn(move || {
                 let mut checked = Instant::now();
+                let mut latched_sent: Option<Instant> = None;
                 tap.set_forwarding(self.enabled());
                 while !exit.load(Ordering::Relaxed) {
                     match points.recv_timeout(TICK) {
@@ -1154,7 +1157,16 @@ impl MetricOutput {
                     }
                     if checked.elapsed() >= TICK {
                         checked = Instant::now();
-                        tap.set_forwarding(self.enabled());
+                        let enabled = self.enabled();
+                        tap.set_forwarding(enabled);
+                        if !enabled {
+                            latched_sent = None;
+                        } else if latched_sent.is_none_or(|at| at.elapsed() >= LATCHED_EVERY) {
+                            latched_sent = Some(Instant::now());
+                            for (point, observed_ms) in tap.latched_points() {
+                                self.publish(&point, observed_ms);
+                            }
+                        }
                     }
                 }
                 tap.set_forwarding(false);
