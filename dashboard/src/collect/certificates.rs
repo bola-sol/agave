@@ -7,13 +7,12 @@ use {
         certs, geoip,
         history::HAS_CLOCK,
         produced::{BlockCertificate, CertificateValidator},
+        source::{BankView, PeerRow},
         validator_info::ValidatorInfoCache,
     },
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_gossip::contact_info::ContactInfo,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
     std::{
         collections::HashMap,
         sync::{Arc, atomic::Ordering},
@@ -39,7 +38,7 @@ pub struct MissList {
 /// A peer's contact and when this node last took something new from it over gossip, in unix
 /// milliseconds.
 pub(super) struct GossipEntry<'a> {
-    pub(super) contact: &'a ContactInfo,
+    pub(super) contact: &'a PeerRow,
     pub(super) at_millis: u64,
 }
 
@@ -77,11 +76,11 @@ struct Described {
 fn describe(key: &Pubkey, info: &ValidatorInfoCache, heard: &Contacts) -> Described {
     let entry = heard.get(key);
     let contact = entry.map(|entry| entry.contact);
-    let gossip = contact.and_then(|contact| contact.gossip());
+    let gossip = contact.and_then(|contact| contact.gossip);
     Described {
         name: info.get(key).and_then(|info| info.name.clone()),
-        client: contact.map(|contact| contact.version().client().to_string()),
-        version: contact.map(|contact| contact.version().to_string()),
+        client: contact.map(|contact| contact.client.clone()),
+        version: contact.map(|contact| contact.version.clone()),
         ip: gossip.map(|addr| addr.ip().to_string()),
         country: gossip.and_then(|addr| geoip::country(addr.ip())),
         heard_millis: entry.map(|entry| entry.at_millis),
@@ -184,7 +183,7 @@ pub(super) struct CertificateWalk {
 }
 
 impl Collector {
-    pub(super) fn collect_vote_certs(&mut self, root_bank: &Bank) {
+    pub(super) fn collect_vote_certs(&mut self, root_bank: &dyn BankView) {
         if !root_bank.is_alpenglow() || self.last_completed_slot == 0 {
             return;
         }
@@ -204,9 +203,9 @@ impl Collector {
             closed_at,
             readings,
         } = certs::walk(
-            &self.ctx.blockstore,
+            self.src.as_ref(),
             root_bank,
-            &self.ctx.vote_account,
+            &self.src.vote_account(),
             from,
             to,
         );
@@ -281,7 +280,7 @@ impl Collector {
 
     pub(super) fn collect_miss_list(
         &mut self,
-        bank: &Bank,
+        bank: &dyn BankView,
         heard: &Contacts,
         votes: &LastVotes,
         now_millis: u64,
@@ -299,7 +298,8 @@ impl Collector {
         }
         let records = tally.records();
         let epoch_start = bank.epoch_schedule().get_first_slot_in_epoch(tally.epoch());
-        let rank_map = bank.get_rank_map(epoch_start);
+        let rank_map = bank.rank_map(epoch_start);
+        let rank_map = rank_map.as_deref();
         let mut writers: Vec<MissWriter> = Vec::new();
         let mut writer_at: HashMap<Pubkey, u32> = HashMap::new();
         let mut validators: Vec<MissValidator> = Vec::new();
@@ -317,10 +317,8 @@ impl Collector {
                             return Some(*at);
                         }
                         let key = rank_map
-                            .and_then(|map| {
-                                map.get_pubkey_stake_entry(usize::try_from(*rank).ok()?)
-                            })
-                            .map(|entry| entry.node_pubkey)?;
+                            .and_then(|map| map.entry(usize::try_from(*rank).ok()?))
+                            .map(|entry| entry.identity)?;
                         let described = describe(&key, &info, heard);
                         let (_, delinquent) = standing(&key, votes, bank.slot());
                         validators.push(MissValidator {
@@ -377,8 +375,8 @@ impl Collector {
         let written_rows = (0..summary.unpaid_everywhere.len())
             .filter_map(|rank| {
                 let key = rank_map
-                    .and_then(|map| map.get_pubkey_stake_entry(rank))
-                    .map(|entry| entry.node_pubkey)?;
+                    .and_then(|map| map.entry(rank))
+                    .map(|entry| entry.identity)?;
                 let described = describe(&key, &info, heard);
                 let (last_vote, delinquent) = standing(&key, votes, bank.slot());
                 Some(WrittenRow {
@@ -416,7 +414,7 @@ impl Collector {
         self.certificates.listed = Some((list.epoch, now_millis));
     }
 
-    pub(super) fn fill_certificates(&mut self, bank: &Bank, heard: &Contacts) -> bool {
+    pub(super) fn fill_certificates(&mut self, bank: &dyn BankView, heard: &Contacts) -> bool {
         let Some(tally) = &self.certificates.tally else {
             return false;
         };
@@ -434,13 +432,14 @@ impl Collector {
             let Some(written) = tally.written_for(rewards) else {
                 continue;
             };
-            let map = bank.get_rank_map(rewards);
+            let map = bank.rank_map(rewards);
+            let map = map.as_deref();
             let ranks = map.map_or(0, |map| map.len());
             let stake_of = |rank: usize| {
-                map.and_then(|map| map.get_pubkey_stake_entry(rank))
-                    .map_or(0, |entry| entry.stake.get().get())
+                map.and_then(|map| map.entry(rank))
+                    .map_or(0, |entry| entry.stake)
             };
-            let total = map.map_or(0, |map| map.total_stake().get().get());
+            let total = map.map_or(0, |map| map.total_stake());
             let unpaid = written
                 .unpaid
                 .iter()
@@ -460,11 +459,11 @@ impl Collector {
                         return None;
                     }
                     let key = map
-                        .and_then(|map| map.get_pubkey_stake_entry(at))
-                        .map(|entry| entry.node_pubkey)?;
+                        .and_then(|map| map.entry(at))
+                        .map(|entry| entry.identity)?;
                     let ip = heard
                         .get(&key)
-                        .and_then(|entry| entry.contact.gossip())
+                        .and_then(|entry| entry.contact.gossip)
                         .map(|addr| addr.ip());
                     Some(CertificateValidator {
                         identity: key,
@@ -476,11 +475,7 @@ impl Collector {
                 .collect();
             // Held with the block, so kept without growth slack.
             left_out.shrink_to_fit();
-            let leader = self
-                .ctx
-                .leader_schedule_cache
-                .slot_leader_at(rewards, Some(bank))
-                .map(|leader| leader.id);
+            let leader = self.src.slot_leader(rewards, bank);
             found.push((
                 slot,
                 BlockCertificate {
@@ -513,8 +508,8 @@ impl Collector {
     /// An unknown leader schedule counts as no leader slots; it is known for every slot the root
     /// has passed.
     /// A swapped identity leads other slots; certificates already tallied keep their writer.
-    fn follow_identity(&mut self, bank: &Bank) {
-        let me = self.ctx.identity();
+    fn follow_identity(&mut self, bank: &dyn BankView) {
+        let me = self.src.identity();
         if self.certificates.identity.replace(me) == Some(me) {
             return;
         }
@@ -526,7 +521,7 @@ impl Collector {
         }
     }
 
-    fn new_tally(&self, bank: &Bank, epoch: Epoch, since_slot: Slot) -> certs::Tally {
+    fn new_tally(&self, bank: &dyn BankView, epoch: Epoch, since_slot: Slot) -> certs::Tally {
         let schedule = bank.epoch_schedule();
         certs::Tally::new(
             epoch,
@@ -539,13 +534,9 @@ impl Collector {
 
     /// Who wrote the certificate for `slot`, and whether this node finished
     /// replaying `slot` only after that leader's own slot had begun arriving.
-    fn miss_detail(&self, bank: &Bank, slot: Slot) -> certs::MissDetail {
+    fn miss_detail(&self, bank: &dyn BankView, slot: Slot) -> certs::MissDetail {
         let writer_slot = certs::writer_slot(slot);
-        let writer = self
-            .ctx
-            .leader_schedule_cache
-            .slot_leader_at(writer_slot, Some(bank))
-            .map(|leader| leader.id);
+        let writer = self.src.slot_leader(writer_slot, bank);
         let replayed_at = self.slots.get(slot).and_then(|voted| {
             let (arrived, replayed) = voted.time_millis.zip(voted.replayed_millis)?;
             Some(arrived.saturating_add(replayed))

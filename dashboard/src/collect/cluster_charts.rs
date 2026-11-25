@@ -13,12 +13,11 @@ use {
             SlotHistory,
         },
         search::leader_index,
+        source::{BankView, PeerRow},
     },
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_gossip::contact_info::ContactInfo,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
     solana_slot_history::Check,
     std::{
         collections::HashMap,
@@ -703,9 +702,9 @@ impl Collector {
 
     pub(super) fn collect_cluster_charts(
         &mut self,
-        root_bank: &Bank,
-        bank: &Bank,
-        peers: &[(ContactInfo, u64)],
+        root_bank: &dyn BankView,
+        bank: &dyn BankView,
+        peers: &[(PeerRow, u64)],
         now_millis: u64,
     ) {
         let epoch = root_bank.epoch();
@@ -760,7 +759,7 @@ impl Collector {
                         identity: identity.clone(),
                         name: key
                             .and_then(|key| names.get(&key).and_then(|info| info.name.clone())),
-                        country: key.and_then(|key| country_of(&self.ctx.cluster_info, &key)),
+                        country: key.and_then(|key| country_of(self.src.as_ref(), &key)),
                         slots,
                         skipped,
                     })
@@ -770,27 +769,22 @@ impl Collector {
         }
         drop(epochs);
         let staked = tally_bank_stake(bank).staked;
-        let ours_country = self
-            .ctx
-            .cluster_info
-            .my_contact_info()
-            .gossip()
-            .and_then(|addr| geoip::country(addr.ip()));
-        let contacts: HashMap<Pubkey, &ContactInfo> = peers
+        let me = self.src.my_contact();
+        let ours_country = me.gossip.and_then(|addr| geoip::country(addr.ip()));
+        let contacts: HashMap<Pubkey, &PeerRow> = peers
             .iter()
-            .map(|(contact, _)| (*contact.pubkey(), contact))
+            .map(|(contact, _)| (contact.pubkey, contact))
             .collect();
-        let me = self.ctx.cluster_info.my_contact_info();
         let lookup = |key: &Pubkey| -> Option<Described> {
-            let contact = if *key == *me.pubkey() {
+            let contact = if *key == me.pubkey {
                 &me
             } else {
                 *contacts.get(key)?
             };
             Some(Described {
-                client: contact.version().client().to_string(),
-                release: strip_prerelease(&contact.version().to_string()).to_string(),
-                country: contact.gossip().and_then(|addr| geoip::country(addr.ip())),
+                client: contact.client.clone(),
+                release: strip_prerelease(&contact.version).to_string(),
+                country: contact.gossip.and_then(|addr| geoip::country(addr.ip())),
             })
         };
         let described: Vec<(u64, Option<Described>)> = staked

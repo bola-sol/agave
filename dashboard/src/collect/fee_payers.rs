@@ -4,6 +4,7 @@
 use {
     crate::{
         produced::{BlockFees, TopFeePayer, TopFeeTransaction},
+        source::{BankView, Source},
         versions::is_simple_vote,
     },
     agave_feature_set::FeatureSet,
@@ -11,11 +12,11 @@ use {
     solana_clock::{Epoch, Slot},
     solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
     solana_entry::entry::Entry,
-    solana_ledger::blockstore::Blockstore,
     solana_message::VersionedMessage,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_sdk_ids::{ed25519_program, secp256k1_program, secp256r1_program},
+    solana_signature::Signature,
     solana_svm_transaction::instruction::SVMInstruction,
     solana_transaction::versioned::VersionedTransaction,
     std::{
@@ -138,9 +139,9 @@ pub struct FeePayerSummary {
     pub alerts: Vec<PayerRow>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct FeePayers {
-    waiting: BTreeMap<Slot, (Arc<Bank>, bool)>,
+    waiting: BTreeMap<Slot, (Arc<dyn BankView>, bool)>,
     unsettled: BTreeMap<Slot, BlockTally>,
     epochs: BTreeMap<Epoch, EpochPayers>,
     /// The root last settled to; read from bank forks, the same banks come back every tick.
@@ -148,7 +149,7 @@ pub(super) struct FeePayers {
 }
 
 impl FeePayers {
-    pub(super) fn note_frozen(&mut self, bank: &Arc<Bank>, ours: bool) {
+    pub(super) fn note_frozen(&mut self, bank: &Arc<dyn BankView>, ours: bool) {
         let slot = bank.slot();
         if self.settled_root.is_some_and(|root| slot <= root)
             || self.waiting.contains_key(&slot)
@@ -162,25 +163,25 @@ impl FeePayers {
 
     /// Reads each held block once the blockstore has all of it, and lets its bank go. Returns what
     /// our own blocks paid.
-    pub(super) fn read(&mut self, blockstore: &Blockstore) -> Vec<BlockFees> {
+    pub(super) fn read(&mut self, src: &dyn Source) -> Vec<BlockFees> {
         let mut fees = Vec::new();
         let full: Vec<Slot> = self
             .waiting
             .keys()
             .copied()
-            .filter(|slot| blockstore.is_full(*slot))
+            .filter(|slot| src.is_full(*slot))
             .collect();
         for slot in full {
             let Some((bank, ours)) = self.waiting.remove(&slot) else {
                 continue;
             };
-            let Ok(entries) = blockstore.get_slot_entries(slot, 0) else {
+            let followed = self.epochs.get(&bank.epoch());
+            let followed =
+                |payer: &Pubkey| followed.is_some_and(|epoch| epoch.payers.contains_key(payer));
+            let Some(outcomes) = src.tx_outcomes(slot, bank.as_ref(), ours, &followed) else {
                 continue;
             };
-            let followed = self.epochs.get(&bank.epoch());
-            let (tally, paid) = tally_block(&bank, &entries, ours, |payer| {
-                followed.is_some_and(|epoch| epoch.payers.contains_key(payer))
-            });
+            let (tally, paid) = tally_outcomes(bank.epoch(), slot, ours, &outcomes);
             self.unsettled.insert(slot, tally);
             fees.extend(paid);
         }
@@ -325,8 +326,8 @@ fn alert(ours: &Tally, away: &Tally) -> Option<Alert> {
 }
 
 #[derive(Debug)]
-struct PaidTransaction<'a> {
-    transaction: &'a VersionedTransaction,
+struct PaidTransaction {
+    signature: Option<Signature>,
     payer: Pubkey,
     failed: Option<bool>,
     priority: u64,
@@ -335,15 +336,15 @@ struct PaidTransaction<'a> {
 
 /// What one of our blocks' non-vote transactions paid, as they are read.
 #[derive(Debug, Default)]
-struct BlockPaid<'a> {
+struct BlockPaid {
     payers: HashMap<Pubkey, TopFeePayer>,
-    transactions: Vec<PaidTransaction<'a>>,
+    transactions: Vec<PaidTransaction>,
 }
 
-impl<'a> BlockPaid<'a> {
+impl BlockPaid {
     fn note(
         &mut self,
-        transaction: &'a VersionedTransaction,
+        signature: Option<Signature>,
         payer: Pubkey,
         failed: Option<bool>,
         priority: u64,
@@ -364,7 +365,7 @@ impl<'a> BlockPaid<'a> {
         fees.priority = fees.priority.saturating_add(priority);
         fees.paid = fees.paid.saturating_add(paid);
         self.transactions.push(PaidTransaction {
-            transaction,
+            signature,
             payer,
             failed,
             priority,
@@ -389,10 +390,8 @@ impl<'a> BlockPaid<'a> {
                 .into_iter()
                 .map(|row| TopFeeTransaction {
                     signature: row
-                        .transaction
-                        .signatures
-                        .first()
-                        .map_or_else(String::new, ToString::to_string),
+                        .signature
+                        .map_or_else(String::new, |signature| signature.to_string()),
                     payer: row.payer,
                     failed: row.failed,
                     priority: row.priority,
@@ -406,51 +405,102 @@ impl<'a> BlockPaid<'a> {
 /// Every non-vote transaction of our block, or only the followed payers' in another's. A result
 /// not found in the status cache leaves the transaction out of the tally, though not out of what
 /// the block paid.
+#[cfg(test)]
 fn tally_block(
     bank: &Bank,
     entries: &[Entry],
     ours: bool,
     followed: impl Fn(&Pubkey) -> bool,
 ) -> (BlockTally, Option<BlockFees>) {
+    let outcomes = tx_outcomes(bank, entries, ours, &followed);
+    tally_outcomes(bank.epoch(), bank.slot(), ours, &outcomes)
+}
+
+/// One non-vote transaction of a block as the fee tallies read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxOutcome {
+    pub signature: Option<Signature>,
+    pub payer: Pubkey,
+    /// `None` where the status cache held no result.
+    pub failed: Option<bool>,
+    /// Read for our own blocks only.
+    pub priority: u64,
+    pub base: u64,
+}
+
+/// Every non-vote transaction of our block, or only the followed payers' in another's.
+pub(crate) fn tx_outcomes(
+    bank: &Bank,
+    entries: &[Entry],
+    ours: bool,
+    followed: &dyn Fn(&Pubkey) -> bool,
+) -> Vec<TxOutcome> {
+    let lamports_per_signature = bank.get_lamports_per_signature();
+    entries
+        .iter()
+        .flat_map(|entry| &entry.transactions)
+        .filter(|transaction| !is_simple_vote(transaction))
+        .filter_map(|transaction| {
+            let payer = *transaction.message.static_account_keys().first()?;
+            if !ours && !followed(&payer) {
+                return None;
+            }
+            let (priority, base) = if ours {
+                (
+                    priority_fee(transaction, &bank.feature_set),
+                    base_fee(transaction, lamports_per_signature),
+                )
+            } else {
+                (0, 0)
+            };
+            Some(TxOutcome {
+                signature: transaction.signatures.first().copied(),
+                payer,
+                failed: failed_in(bank, transaction),
+                priority,
+                base,
+            })
+        })
+        .collect()
+}
+
+/// A result not found in the status cache leaves the transaction out of the tally, though not
+/// out of what the block paid.
+fn tally_outcomes(
+    epoch: Epoch,
+    slot: Slot,
+    ours: bool,
+    outcomes: &[TxOutcome],
+) -> (BlockTally, Option<BlockFees>) {
     let mut tally = BlockTally {
-        epoch: bank.epoch(),
+        epoch,
         ours,
         ..BlockTally::default()
     };
     let mut paid = BlockPaid::default();
-    let lamports_per_signature = bank.get_lamports_per_signature();
-    for transaction in entries.iter().flat_map(|entry| &entry.transactions) {
-        if is_simple_vote(transaction) {
-            continue;
+    for outcome in outcomes {
+        if ours {
+            paid.note(
+                outcome.signature,
+                outcome.payer,
+                outcome.failed,
+                outcome.priority,
+                outcome.base,
+            );
         }
-        let Some(payer) = transaction.message.static_account_keys().first() else {
-            continue;
-        };
-        if !ours && !followed(payer) {
-            continue;
-        }
-        let result = failed_in(bank, transaction);
-        let priority = if ours {
-            let priority = priority_fee(transaction, &bank.feature_set);
-            let base = base_fee(transaction, lamports_per_signature);
-            paid.note(transaction, *payer, result, priority, base);
-            priority
-        } else {
-            0
-        };
-        let Some(failed) = result else {
+        let Some(failed) = outcome.failed else {
             continue;
         };
         tally
             .payers
-            .entry(*payer)
+            .entry(outcome.payer)
             .or_default()
-            .note(failed, priority);
+            .note(failed, outcome.priority);
         if ours {
-            tally.total.note(failed, priority);
+            tally.total.note(failed, outcome.priority);
         }
     }
-    (tally, ours.then(|| paid.top(bank.slot())))
+    (tally, ours.then(|| paid.top(slot)))
 }
 
 /// Charged for each of the transaction's signatures and each a precompile verifies, whose count
@@ -744,11 +794,23 @@ mod tests {
         let mut paid = BlockPaid::default();
         let payers: Vec<Pubkey> = (0..7).map(|_| Pubkey::new_unique()).collect();
         for (fee, payer) in (1u64..).zip(&payers) {
-            paid.note(&transaction, *payer, Some(false), fee, 0);
+            paid.note(
+                transaction.signatures.first().copied(),
+                *payer,
+                Some(false),
+                fee,
+                0,
+            );
         }
         // Many small payments outrank the larger single ones, by payer but not by transaction.
         for _ in 0..30 {
-            paid.note(&transaction, payers[0], Some(true), 1, 0);
+            paid.note(
+                transaction.signatures.first().copied(),
+                payers[0],
+                Some(true),
+                1,
+                0,
+            );
         }
         let fees = paid.top(9);
         assert_eq!(fees.slot, 9);

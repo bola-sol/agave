@@ -2,15 +2,14 @@
 //! blocks earn for the votes their reward certificates carry.
 
 use {
-    super::{Collector, count_epoch_credits},
-    crate::certs,
+    super::Collector,
+    crate::{
+        certs::{self, FooterFacts},
+        source::{BankView, Ranks, Source},
+    },
     serde::Serialize,
-    solana_account::ReadableAccount,
     solana_clock::{Epoch, Slot},
-    solana_entry::block_component::BlockFooterV1,
-    solana_ledger::blockstore::Blockstore,
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, epoch_stakes::BLSPubkeyToRankMap},
 };
 
 /// Where the runtime keeps each epoch's inflation: `vote_reward_account` under the alpenglow
@@ -97,26 +96,23 @@ fn block_bonus(
     })
 }
 
-fn rank_stakes(map: &BLSPubkeyToRankMap) -> impl Iterator<Item = u64> + '_ {
-    (0..map.len()).map(|rank| {
-        map.get_pubkey_stake_entry(rank)
-            .map_or(0, |entry| entry.stake.get().get())
-    })
+fn rank_stakes(map: &dyn Ranks) -> impl Iterator<Item = u64> + '_ {
+    (0..map.len()).map(|rank| map.entry(rank).map_or(0, |entry| entry.stake))
 }
 
 /// Ranks in either reward certificate; `None` where one does not decode.
-fn paid_ranks(footer: &BlockFooterV1, len: usize) -> Option<Vec<bool>> {
+fn paid_ranks(footer: &FooterFacts, len: usize) -> Option<Vec<bool>> {
     let mut paid = vec![false; len];
     let mut mark = |ranks: Vec<bool>| {
         for (flag, set) in paid.iter_mut().zip(ranks) {
             *flag |= set;
         }
     };
-    if let Some(cert) = &footer.notar_reward_cert {
-        mark(certs::decode_paid(cert.bitmap(), len)?);
+    if let Some(bitmap) = &footer.notar_bitmap {
+        mark(certs::decode_paid(bitmap, len)?);
     }
-    if let Some(cert) = &footer.skip_reward_cert {
-        mark(certs::decode_paid(cert.to_bitmap(), len)?);
+    if let Some(bitmap) = &footer.skip_bitmap {
+        mark(certs::decode_paid(bitmap, len)?);
     }
     Some(paid)
 }
@@ -129,8 +125,8 @@ enum BlockRead {
 
 /// A skipped block of ours earns nothing of what its certificate could have paid.
 fn read_bonus(
-    blockstore: &Blockstore,
-    bank: &Bank,
+    src: &dyn Source,
+    bank: &dyn BankView,
     slot: Slot,
     inflation: &Inflation,
     held_from: Slot,
@@ -139,7 +135,7 @@ fn read_bonus(
     if slot < held_from {
         return BlockRead::Unread;
     }
-    let block = certs::read_block(blockstore, slot, bank.slot());
+    let block = src.block(slot, bank.slot());
     let footer = match block {
         certs::Block::Pending => return BlockRead::Pending,
         certs::Block::Opaque => return BlockRead::Unread,
@@ -153,7 +149,7 @@ fn read_bonus(
     let Some(stakes) = bank.epoch_stakes_from_slot(rewarded) else {
         return BlockRead::Unread;
     };
-    let map = stakes.bls_pubkey_to_rank_map();
+    let map = stakes.ranks.as_ref();
     let paid = match &footer {
         Some(footer) => match paid_ranks(footer, map.len()) {
             Some(paid) => paid,
@@ -161,7 +157,7 @@ fn read_bonus(
         },
         None => vec![false; map.len()],
     };
-    let (got, full) = block_bonus(rank_stakes(map).zip(paid), inflation, stakes.total_stake());
+    let (got, full) = block_bonus(rank_stakes(map).zip(paid), inflation, stakes.total_stake);
     BlockRead::Counted { got, full }
 }
 
@@ -189,7 +185,7 @@ pub(super) struct EarningsWalk {
 }
 
 impl Collector {
-    pub(super) fn collect_earnings(&mut self, root_bank: &Bank) {
+    pub(super) fn collect_earnings(&mut self, root_bank: &dyn BankView) {
         let earnings = self.read_earnings(root_bank);
         self.debounces
             .epoch_earnings
@@ -197,12 +193,12 @@ impl Collector {
     }
 
     /// `None` until every block of ours the root has passed is read.
-    fn read_earnings(&mut self, bank: &Bank) -> Option<EpochEarnings> {
+    fn read_earnings(&mut self, bank: &dyn BankView) -> Option<EpochEarnings> {
         if !bank.is_alpenglow() {
             return None;
         }
         let epoch = bank.epoch();
-        let me = self.ctx.identity();
+        let me = self.src.identity();
         if self.earnings.key != Some((epoch, me)) {
             self.earnings = self.start_earnings(bank, epoch, me)?;
         }
@@ -216,8 +212,8 @@ impl Collector {
             if slot > root || read == BLOCKS_PER_TICK {
                 break;
             }
-            let held_from = *held_from.get_or_insert_with(|| self.ctx.blockstore.lowest_slot());
-            match read_bonus(&self.ctx.blockstore, bank, slot, &inflation, held_from) {
+            let held_from = *held_from.get_or_insert_with(|| self.src.lowest_slot());
+            match read_bonus(self.src.as_ref(), bank, slot, &inflation, held_from) {
                 BlockRead::Pending => break,
                 BlockRead::Unread => walk.unread = walk.unread.saturating_add(1),
                 BlockRead::Counted { got, full } => {
@@ -236,10 +232,8 @@ impl Collector {
             return None;
         }
 
-        let vote_accounts = bank.vote_accounts();
-        let (_, account) = vote_accounts.get(&self.ctx.vote_account)?;
-        let view = account.vote_state_view();
-        let voting = count_epoch_credits(view, epoch).saturating_sub(walk.bonus);
+        let row = bank.vote_row(&self.src.vote_account())?;
+        let voting = row.credits_in(epoch).saturating_sub(walk.bonus);
         let start = bank.epoch_schedule().get_first_slot_in_epoch(epoch);
         let passed = root.saturating_sub(start).saturating_add(1);
         let blocks = u64::try_from(walk.leader_slots.len()).unwrap_or(u64::MAX);
@@ -253,13 +247,18 @@ impl Collector {
             bonus: walk.bonus,
             bonus_lost: walk.bonus_lost,
             bonus_max: blocks.saturating_mul(rates.full_block),
-            commission_bps: view.inflation_rewards_commission(),
+            commission_bps: row.inflation_rewards_commission_bps,
             unread: walk.unread,
         })
     }
 
     /// Latched once the schedule is in hand; reading it walks the whole epoch.
-    fn start_earnings(&self, bank: &Bank, epoch: Epoch, me: Pubkey) -> Option<EarningsWalk> {
+    fn start_earnings(
+        &self,
+        bank: &dyn BankView,
+        epoch: Epoch,
+        me: Pubkey,
+    ) -> Option<EarningsWalk> {
         Some(EarningsWalk {
             key: Some((epoch, me)),
             rates: self.read_rates(bank, epoch),
@@ -268,17 +267,13 @@ impl Collector {
         })
     }
 
-    fn read_rates(&self, bank: &Bank, epoch: Epoch) -> Option<Rates> {
-        let inflation = read_inflation(bank.get_account(&VOTE_REWARD_ACCOUNT)?.data(), epoch)?;
+    fn read_rates(&self, bank: &dyn BankView, epoch: Epoch) -> Option<Rates> {
+        let inflation = read_inflation(&bank.account_data(&VOTE_REWARD_ACCOUNT)?, epoch)?;
         let stakes = bank.epoch_stakes(epoch)?;
-        let total = stakes.total_stake();
-        let map = stakes.bls_pubkey_to_rank_map();
-        let rank = *map.get_rank_for_vote_pubkey(&self.ctx.vote_account)?;
-        let ours = map
-            .get_pubkey_stake_entry(usize::from(rank))?
-            .stake
-            .get()
-            .get();
+        let total = stakes.total_stake;
+        let map = stakes.ranks.as_ref();
+        let rank = map.rank_of(&self.src.vote_account())?;
+        let ours = map.entry(usize::from(rank))?.stake;
         let all_paid = rank_stakes(map).map(|stake| (stake, true));
         let (_, full_block) = block_bonus(all_paid, &inflation, total);
         Some(Rates {
@@ -317,8 +312,8 @@ mod tests {
         let fixture = crate::fixture::fixture();
         let bank = fixture.advance_to(20);
         let inflation = read_inflation(&bytes(MAINNET), 1079).unwrap();
-        let read =
-            |held_from| read_bonus(&fixture.ctx.blockstore, &bank, 12, &inflation, held_from);
+        let src = crate::source::Direct::new(fixture.ctx.clone(), None);
+        let read = |held_from| read_bonus(&src, bank.as_ref(), 12, &inflation, held_from);
         assert!(matches!(read(0), BlockRead::Counted { got: 0, .. }));
         assert!(matches!(read(13), BlockRead::Unread));
     }

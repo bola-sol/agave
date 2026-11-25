@@ -17,6 +17,7 @@ use {
         net_stats::{self, Counted, InterfaceCounters, NetCounters, NetReading},
         proto::{Debounced, Publisher, TOPIC_SUMMARY},
         snapshot::{self, ArchiveBytes},
+        source::{BankView, Direct, PeerRow, Source},
         thread_stats::{self, ThreadGroup, ThreadReading},
         udp_drops::{self, PortCounters, PortWindow},
     },
@@ -24,10 +25,8 @@ use {
     serde::{Deserialize, Deserializer, Serialize},
     solana_clock::{Epoch, Slot},
     solana_core::validator::ValidatorStartProgress,
-    solana_gossip::contact_info::{ContactInfo, Protocol},
     solana_ledger::blockstore_options::BLOCKSTORE_DIRECTORY_ROCKS_LEVEL,
     solana_program_runtime::loaded_programs::MAX_LOADED_ENTRY_COUNT,
-    solana_runtime::{bank::Bank, bank_forks::SharableBanks},
     std::{
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
         net::SocketAddr,
@@ -489,7 +488,7 @@ struct TxnCounters {
 }
 
 impl TxnCounters {
-    fn read(bank: &Bank, errors: u64) -> Self {
+    fn read(bank: &dyn BankView, errors: u64) -> Self {
         Self {
             slot: bank.slot(),
             total: bank.transaction_count(),
@@ -532,14 +531,12 @@ struct DiskLayout {
     incremental: Option<u64>,
 }
 
-fn resolve_disk_layout(ctx: &DashboardContext) -> DiskLayout {
-    let rocksdb = ctx
-        .blockstore
-        .ledger_path()
-        .join(BLOCKSTORE_DIRECTORY_ROCKS_LEVEL);
+fn resolve_disk_layout(src: &dyn Source) -> DiskLayout {
+    let rocksdb = src.ledger_path().join(BLOCKSTORE_DIRECTORY_ROCKS_LEVEL);
+    let snapshot_config = src.snapshot_config();
     let mut account_ids = HashSet::new();
     let mut account_parents = Vec::new();
-    for path in &ctx.account_paths {
+    for path in &src.account_paths() {
         let Ok(id) = host_stats::filesystem_id(path) else {
             continue;
         };
@@ -551,7 +548,7 @@ fn resolve_disk_layout(ctx: &DashboardContext) -> DiskLayout {
         }
     }
     let archives = |dir: fn(&SnapshotConfig) -> &PathBuf| {
-        let config = ctx.snapshot_config.as_ref()?;
+        let config = snapshot_config.as_ref()?;
         host_stats::filesystem_id(dir(config)).ok()
     };
     DiskLayout {
@@ -623,18 +620,18 @@ fn read_leftovers(layout: &DiskLayout) -> Vec<(u64, String)> {
     leftovers
 }
 
-fn resolve_host_paths(ctx: &DashboardContext) -> Vec<HostPath> {
+fn resolve_host_paths(src: &dyn Source) -> Vec<HostPath> {
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
 
-    let ledger = ctx.blockstore.ledger_path().clone();
+    let ledger = src.ledger_path();
     if let Ok(id) = host_stats::filesystem_id(&ledger) {
         seen.insert(id);
         paths.push(HostPath::new("ledger".to_owned(), ledger, id));
     }
 
     let mut accounts = Vec::new();
-    for path in &ctx.account_paths {
+    for path in &src.account_paths() {
         let Ok(id) = host_stats::filesystem_id(path) else {
             continue;
         };
@@ -653,8 +650,8 @@ fn resolve_host_paths(ctx: &DashboardContext) -> Vec<HostPath> {
         paths.push(HostPath::new(name, path, id));
     }
 
-    if let Some(archives) = ctx
-        .snapshot_config
+    let snapshot_config = src.snapshot_config();
+    if let Some(archives) = snapshot_config
         .as_ref()
         .map(|config| &config.full_snapshot_archives_dir)
         && let Ok(id) = host_stats::filesystem_id(archives)
@@ -950,9 +947,7 @@ impl GossipMeter {
 }
 
 pub struct Meters {
-    ctx: DashboardContext,
-    /// The working bank without bank forks' lock.
-    sharable_banks: SharableBanks,
+    src: Arc<dyn Source>,
     publisher: Arc<Publisher>,
     startup_progress: StartProgress,
     started: SystemTime,
@@ -983,10 +978,26 @@ impl Meters {
         metrics_tap: Arc<MetricsTap>,
         failed_total: Arc<AtomicU64>,
     ) -> Self {
-        let sharable_banks = ctx.bank_forks.read().unwrap().sharable_banks();
+        Self::with_source(
+            Arc::new(Direct::new(ctx, None)),
+            publisher,
+            startup_progress,
+            started,
+            metrics_tap,
+            failed_total,
+        )
+    }
+
+    pub fn with_source(
+        src: Arc<dyn Source>,
+        publisher: Arc<Publisher>,
+        startup_progress: StartProgress,
+        started: SystemTime,
+        metrics_tap: Arc<MetricsTap>,
+        failed_total: Arc<AtomicU64>,
+    ) -> Self {
         Self {
-            ctx,
-            sharable_banks,
+            src,
             publisher,
             startup_progress,
             started,
@@ -1012,9 +1023,9 @@ impl Meters {
         self.collect_clock();
 
         let alpenglow = {
-            let working_bank = self.sharable_banks.working();
-            self.throughput.tick(&working_bank, &self.publisher);
-            self.tpu.note_epoch(&working_bank);
+            let working_bank = self.src.working_bank();
+            self.throughput.tick(working_bank.as_ref(), &self.publisher);
+            self.tpu.note_epoch(working_bank.as_ref());
             working_bank.is_alpenglow()
         };
 
@@ -1027,7 +1038,7 @@ impl Meters {
         let watched = self.publisher.subscriber_count() > 0;
         if watched {
             self.host
-                .tick(&self.ctx, &self.metrics_tap, &self.publisher);
+                .tick(self.src.as_ref(), &self.metrics_tap, &self.publisher);
             self.threads.tick(&self.publisher);
         }
         // Until startup ends whether or not anyone watches, so the totals begin there.
@@ -1037,7 +1048,7 @@ impl Meters {
                 ValidatorStartProgress::Running
             );
             self.sockets.tick(
-                &self.ctx,
+                self.src.as_ref(),
                 &self.metrics_tap.counters(),
                 running,
                 alpenglow,
@@ -1104,7 +1115,7 @@ impl Throughput {
         }
     }
 
-    fn tick(&mut self, working_bank: &Bank, publisher: &Publisher) {
+    fn tick(&mut self, working_bank: &dyn BankView, publisher: &Publisher) {
         let errors = self.failed_total.load(Ordering::Relaxed);
         // The collector's first count spans every bank drained at attach, so it is a baseline only.
         if errors == FAILED_UNREAD {
@@ -1412,7 +1423,7 @@ const RESIDENT_HISTORY: Duration = Duration::from_secs(3600);
 const RESIDENT_HOUR_AGO: Duration = Duration::from_secs(3300);
 
 impl HostMeter {
-    fn tick(&mut self, ctx: &DashboardContext, tap: &MetricsTap, publisher: &Publisher) {
+    fn tick(&mut self, src: &dyn Source, tap: &MetricsTap, publisher: &Publisher) {
         if self.unavailable {
             return;
         }
@@ -1425,11 +1436,11 @@ impl HostMeter {
             }
         };
         let now = Instant::now();
-        let paths = self.paths.get_or_insert_with(|| resolve_host_paths(ctx));
+        let paths = self.paths.get_or_insert_with(|| resolve_host_paths(src));
         let snapshot_device = self
             .snapshot_device
             .get_or_insert_with(|| {
-                ctx.snapshot_config
+                src.snapshot_config()
                     .as_ref()
                     .and_then(|config| {
                         host_stats::device_for(&config.full_snapshot_archives_dir).ok()
@@ -1470,12 +1481,12 @@ impl HostMeter {
             .memory
             .swap_total
             .saturating_sub(current.memory.swap_free);
-        let layout = self.layout.get_or_insert_with(|| resolve_disk_layout(ctx));
+        let layout = self.layout.get_or_insert_with(|| resolve_disk_layout(src));
         let readings = DiskReadings {
             ledger: tap.ledger_files(),
             accounts: tap.accounts_files(),
-            archives: ctx
-                .snapshot_config
+            archives: src
+                .snapshot_config()
                 .as_ref()
                 .and_then(snapshot::archive_bytes),
         };
@@ -1665,7 +1676,7 @@ impl SocketMeter {
 
     fn tick(
         &mut self,
-        ctx: &DashboardContext,
+        src: &dyn Source,
         tap: &TapCounters,
         running: bool,
         alpenglow: bool,
@@ -1687,7 +1698,7 @@ impl SocketMeter {
         };
         self.sampled = true;
         let now = Instant::now();
-        let ports = ingest_ports(&ctx.cluster_info.my_contact_info(), tap, alpenglow);
+        let ports = ingest_ports(&src.my_contact(), tap, alpenglow);
 
         for port in &ports {
             if let Some(counters) = current.get(&port.port) {
@@ -1767,7 +1778,7 @@ impl SocketMeter {
 
 /// Under alpenglow votes reach votor's port and nothing reaches the TPU vote ports, so the one
 /// replaces the other.
-fn ingest_ports(info: &ContactInfo, tap: &TapCounters, alpenglow: bool) -> Vec<IngestPort> {
+fn ingest_ports(info: &PeerRow, tap: &TapCounters, alpenglow: bool) -> Vec<IngestPort> {
     let port = |name, addr: Option<SocketAddr>, received, received_in_packets, quic| {
         Some(IngestPort {
             name,
@@ -1783,14 +1794,14 @@ fn ingest_ports(info: &ContactInfo, tap: &TapCounters, alpenglow: bool) -> Vec<I
     let mut ports = vec![
         // Everything arriving on the TVU port is a shred, so the count the
         // shred receiver keeps is the count of what the port delivered.
-        datagrams("turbine", info.tvu(Protocol::UDP), Some(tap.shreds_turbine)),
-        quic("tpu", info.tpu(Protocol::QUIC)),
-        quic("tpu forwards", info.tpu_forwards(Protocol::QUIC)),
+        datagrams("turbine", info.tvu_udp, Some(tap.shreds_turbine)),
+        quic("tpu", info.tpu_quic),
+        quic("tpu forwards", info.tpu_forwards_quic),
     ];
     if alpenglow {
         ports.push(port(
             "votor",
-            info.alpenglow(),
+            info.alpenglow,
             Some(tap.votes_votor),
             false,
             false,
@@ -1798,19 +1809,15 @@ fn ingest_ports(info: &ContactInfo, tap: &TapCounters, alpenglow: bool) -> Vec<I
     } else {
         ports.push(datagrams(
             "tpu vote",
-            info.tpu_vote(Protocol::UDP),
+            info.tpu_vote_udp,
             Some(tap.packets_tpu_vote),
         ));
-        ports.push(quic("tpu vote quic", info.tpu_vote(Protocol::QUIC)));
+        ports.push(quic("tpu vote quic", info.tpu_vote_quic));
     }
-    ports.push(datagrams("gossip", info.gossip(), Some(tap.packets_gossip)));
+    ports.push(datagrams("gossip", info.gossip, Some(tap.packets_gossip)));
     // The one port that could have a count and does not: its receiver keeps
     // counters nothing reports. Reaching them means a change to `core`.
-    ports.push(datagrams(
-        "serve repair",
-        info.serve_repair(Protocol::UDP),
-        None,
-    ));
+    ports.push(datagrams("serve repair", info.serve_repair_udp, None));
     ports.into_iter().flatten().collect()
 }
 
@@ -2122,7 +2129,7 @@ impl TpuMeter {
         }
     }
 
-    fn note_epoch(&mut self, working_bank: &Bank) {
+    fn note_epoch(&mut self, working_bank: &dyn BankView) {
         let schedule = working_bank.epoch_schedule();
         let slot = working_bank.slot();
         let epoch = schedule.get_epoch(slot);
@@ -2727,7 +2734,7 @@ mod tests {
         // Only this join knows `shred_fetch_receiver` is the socket gossip advertises as `tvu`.
         let harness = fixture();
         let counted = ingest_ports(
-            &harness.ctx.cluster_info.my_contact_info(),
+            &PeerRow::from(&harness.ctx.cluster_info.my_contact_info()),
             &TapCounters {
                 shreds_turbine: 900,
                 packets_gossip: 40,
@@ -2762,7 +2769,7 @@ mod tests {
     fn test_the_quic_ports_are_flagged_and_the_udp_vote_port_is_not() {
         let harness = fixture();
         let ports = ingest_ports(
-            &harness.ctx.cluster_info.my_contact_info(),
+            &PeerRow::from(&harness.ctx.cluster_info.my_contact_info()),
             &TapCounters::default(),
             false,
         );
@@ -2779,7 +2786,8 @@ mod tests {
 
     #[test]
     fn test_under_alpenglow_votor_takes_the_place_of_the_vote_ports() {
-        let mut info = ContactInfo::new_localhost(&Pubkey::new_unique(), 0);
+        let mut info =
+            solana_gossip::contact_info::ContactInfo::new_localhost(&Pubkey::new_unique(), 0);
         info.set_alpenglow((Ipv4Addr::LOCALHOST, 8011)).unwrap();
         let tap = TapCounters {
             packets_tpu_vote: 70,
@@ -2788,6 +2796,7 @@ mod tests {
         };
         let names = |ports: &[IngestPort]| ports.iter().map(|port| port.name).collect::<Vec<_>>();
 
+        let info = PeerRow::from(&info);
         let tower = ingest_ports(&info, &tap, false);
         assert_eq!(
             names(&tower),

@@ -2,7 +2,7 @@
 //! a frozen bank and its parent. Only the measured figure is kept; shares are
 //! derived where drawn.
 
-use {serde::Serialize, solana_pubkey::Pubkey, solana_runtime::bank::Bank};
+use {crate::source::BankView, serde::Serialize, solana_pubkey::Pubkey};
 
 /// Derived from the program id, which differs between clusters.
 const TIP_ACCOUNT_SEEDS: [&[u8]; 8] = [
@@ -55,7 +55,7 @@ impl TipMeter {
     }
 
     /// The caller keeps the parent's total, since the parent may be pruned by now.
-    pub fn measure(&mut self, bank: &Bank, before: u64) -> u64 {
+    pub fn measure(&mut self, bank: &dyn BankView, before: u64) -> u64 {
         let now = self.total(bank);
         self.floor = self.floor.min(now);
 
@@ -74,7 +74,7 @@ impl TipMeter {
         paid
     }
 
-    pub fn total(&self, bank: &Bank) -> u64 {
+    pub fn total(&self, bank: &dyn BankView) -> u64 {
         self.accounts
             .iter()
             .map(|account| bank.get_balance(account))
