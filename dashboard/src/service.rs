@@ -16,6 +16,7 @@ use {
         refill::{self, Refilled},
         rewind_log::{Recorder, RewindLog, Settings},
         server,
+        source::{Direct, Source},
         startup::{GossipReadyReceiver, StartupPublisher, gossip_stake},
         tips::TipMeter,
         validator_info::ValidatorInfoCache,
@@ -296,20 +297,24 @@ impl DashboardService {
         context: DashboardContext,
         frozen_banks: Option<BankNotificationReceiver>,
     ) -> io::Result<()> {
+        self.attach_source(Arc::new(Direct::new(context, frozen_banks)))
+    }
+
+    /// Starts the collector and meters on `src`.
+    pub fn attach_source(&mut self, src: Arc<dyn Source>) -> io::Result<()> {
         let info_cache = self.info_cache.clone();
         let failed_total = Arc::new(AtomicU64::new(FAILED_UNREAD));
 
         self.info_loader = Some({
-            let context = context.clone();
+            let src = src.clone();
             let info_cache = info_cache.clone();
             thread::Builder::new()
                 .name("solDashInfo".to_string())
                 .spawn(move || {
-                    let bank = context.bank_forks.read().unwrap().root_bank();
                     let started = std::time::Instant::now();
-                    let entries = crate::validator_info::scan_all(&bank);
+                    let (slot, entries) = src.validator_info_all();
                     let found = entries.len();
-                    let loaded = info_cache.write().unwrap().merge(bank.slot(), entries);
+                    let loaded = info_cache.write().unwrap().merge(slot, entries);
                     log::info!(
                         "dashboard: read validator info in {:?}, {found} accounts, {loaded} cached",
                         started.elapsed()
@@ -322,14 +327,14 @@ impl DashboardService {
             let publisher = self.publisher.clone();
             let startup_progress = self.startup_progress.clone();
             let started = self.started;
-            let context = context.clone();
+            let src = src.clone();
             let metrics_tap = self.metrics_tap.clone();
             let failed_total = failed_total.clone();
             thread::Builder::new()
                 .name("solDashMeter".to_string())
                 .spawn(move || {
-                    let mut meters = Meters::new(
-                        context,
+                    let mut meters = Meters::with_source(
+                        src,
                         publisher,
                         startup_progress,
                         started,
@@ -369,8 +374,7 @@ impl DashboardService {
                         metrics_tap,
                         failed_total,
                     };
-                    let mut collector =
-                        Collector::new(context, shared, tips, commission_bps, frozen_banks);
+                    let mut collector = Collector::with_source(src, shared, tips, commission_bps);
                     if let Some(refill) = refill {
                         collector.refill_from(refill);
                     }

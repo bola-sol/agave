@@ -45,7 +45,9 @@ solana-compute-budget-instruction = { workspace = true }
 solana-config-interface = { workspace = true }
 solana-core = { workspace = true }
 solana-entry = { workspace = true }
+solana-epoch-schedule = { workspace = true }
 solana-gossip = { workspace = true }
+solana-hash = { workspace = true }
 solana-leader-schedule = { workspace = true }
 solana-ledger = { workspace = true }
 solana-message = { workspace = true, features = ["blake3", "wincode"] }
@@ -56,6 +58,7 @@ solana-rpc = { workspace = true }
 solana-rpc-client-types = { workspace = true }
 solana-runtime = { workspace = true }
 solana-sdk-ids = { workspace = true }
+solana-signature = { workspace = true }
 solana-signer-store = { workspace = true }
 solana-slot-history = { workspace = true }
 solana-svm-transaction = { workspace = true }

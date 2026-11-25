@@ -3,12 +3,14 @@
 
 use {
     super::{Collector, WANTED_FOR_MILLIS, is_delinquent, json_or_null, tally_bank_stake},
-    crate::{geoip, metrics_tap::VoteArrival},
+    crate::{
+        geoip,
+        metrics_tap::VoteArrival,
+        source::{BankView, PeerRow},
+    },
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_gossip::{contact_info::ContactInfo, crds_data::SnapshotHashes},
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
     std::{collections::HashMap, sync::atomic::Ordering},
 };
 
@@ -55,9 +57,9 @@ pub struct GossipPeers {
 impl Collector {
     pub(super) fn collect_gossip_peers(
         &mut self,
-        bank: &Bank,
+        bank: &dyn BankView,
         root: Slot,
-        peers: &[(ContactInfo, u64)],
+        peers: &[(PeerRow, u64)],
         now_millis: u64,
     ) {
         let wanted = self.replies.gossip_peers_wanted.load(Ordering::Relaxed);
@@ -72,9 +74,9 @@ impl Collector {
 
     fn gossip_peers(
         &self,
-        bank: &Bank,
+        bank: &dyn BankView,
         root: Slot,
-        peers: &[(ContactInfo, u64)],
+        peers: &[(PeerRow, u64)],
         now_millis: u64,
     ) -> GossipPeers {
         let tally = tally_bank_stake(bank);
@@ -86,16 +88,17 @@ impl Collector {
         let stake_of = |key: &Pubkey| stakes.get(key).copied().unwrap_or(0);
         let finalization = self.finalization_by_node(bank, now_millis);
         let (arrival_epoch, arrivals) = self.metrics_tap.vote_arrivals();
-        let arrival_by_node: HashMap<Pubkey, VoteArrival> = bank
-            .vote_accounts()
-            .iter()
-            .filter_map(|(vote, (_, account))| Some((*account.node_pubkey(), *arrivals.get(vote)?)))
-            .collect();
-        let mut rows: Vec<&(ContactInfo, u64)> = peers.iter().collect();
+        let mut arrival_by_node: HashMap<Pubkey, VoteArrival> = HashMap::new();
+        bank.for_each_vote_row(&mut |row| {
+            if let Some(arrival) = arrivals.get(&row.vote) {
+                arrival_by_node.insert(row.identity, *arrival);
+            }
+        });
+        let mut rows: Vec<&(PeerRow, u64)> = peers.iter().collect();
         rows.sort_by(|(a, _), (b, _)| {
-            stake_of(b.pubkey())
-                .cmp(&stake_of(a.pubkey()))
-                .then_with(|| a.pubkey().cmp(b.pubkey()))
+            stake_of(&b.pubkey)
+                .cmp(&stake_of(&a.pubkey))
+                .then_with(|| a.pubkey.cmp(&b.pubkey))
         });
 
         let mut list = GossipPeers {
@@ -104,31 +107,14 @@ impl Collector {
             vote_arrival_epoch: arrival_epoch,
             ..GossipPeers::default()
         };
-        // What each peer advertises, read in one short hold of the gossip table's lock.
-        let advertised: Vec<(Option<Slot>, Option<Slot>)> = {
-            let crds = self.ctx.cluster_info.gossip.crds.read();
-            rows.iter()
-                .map(|(contact, _)| {
-                    let key = *contact.pubkey();
-                    let hashes = crds.get::<&SnapshotHashes>(key);
-                    (
-                        hashes.map(|hashes| hashes.full.0),
-                        hashes.and_then(|hashes| {
-                            hashes.incremental.iter().map(|(slot, _)| *slot).max()
-                        }),
-                    )
-                })
-                .collect()
-        };
+        let keys: Vec<Pubkey> = rows.iter().map(|(contact, _)| contact.pubkey).collect();
+        let advertised = self.src.snapshot_slots(&keys);
 
         let mut client_at: HashMap<(String, String), usize> = HashMap::new();
         let info = self.info_cache.read().unwrap();
         for ((contact, heard_at), (full, incremental)) in rows.into_iter().zip(advertised) {
-            let key = contact.pubkey();
-            let client = (
-                contact.version().client().to_string(),
-                contact.version().to_string(),
-            );
+            let key = &contact.pubkey;
+            let client = (contact.client.clone(), contact.version.clone());
             let index = match client_at.get(&client) {
                 Some(index) => *index,
                 None => {
@@ -143,13 +129,13 @@ impl Collector {
                 .push(info.get(key).and_then(|info| info.name.clone()));
             list.stake.push(stake_of(key));
             list.client.push(index);
-            let ip = contact.gossip().map(|addr| addr.ip());
+            let ip = contact.gossip.map(|addr| addr.ip());
             list.ip.push(ip.map(|ip| ip.to_string()));
             list.country.push(ip.and_then(geoip::country));
-            list.rpc.push(contact.rpc().map(|addr| addr.port()));
+            list.rpc.push(contact.rpc.map(|addr| addr.port()));
             list.heard_ago.push(now_millis.saturating_sub(*heard_at));
             list.started
-                .push(contact.outset().checked_div(1_000).unwrap_or(0));
+                .push(contact.outset.checked_div(1_000).unwrap_or(0));
             list.finalization
                 .push(finalization.get(key).map(|share| *share as f32));
             list.vote_arrival

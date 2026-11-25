@@ -26,6 +26,7 @@ pub mod server;
 pub mod service;
 pub mod slots;
 pub mod snapshot;
+pub mod source;
 pub mod startup;
 pub mod thread_stats;
 pub mod tips;
