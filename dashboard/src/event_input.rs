@@ -5,10 +5,11 @@ use {
     crate::{
         collect::EpochInfo,
         events::{
-            BLOCK_STREAM, BlockEvent, EPOCH_STREAM, EpochEvent, LEDGER_SLOT_STREAM,
-            LedgerSlotEvent, NODE_INFO_STREAM, NodeInfoEvent, SLOT_CLOCK_STREAM,
-            SLOT_STATUS_STREAM, START_PROGRESS_STREAM, SlotClockEvent, SlotStatusEvent,
-            StartProgressEvent,
+            ADMITTED_STREAM, AdmittedEvent, BLOCK_STREAM, BlockEvent, EPOCH_STREAM, EpochEvent,
+            LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM, MessageVersionsEvent,
+            NODE_INFO_STREAM, NodeInfoEvent, SLOT_CLOCK_STREAM, SLOT_HISTORY_STREAM,
+            SLOT_STATUS_STREAM, START_PROGRESS_STREAM, SlotClockEvent, SlotHistoryEvent,
+            SlotStatusEvent, StartProgressEvent, TX_OUTCOME_STREAM, TxOutcomeEvent,
         },
         metric_events::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -98,7 +99,11 @@ stamped!(
     EpochEvent,
     SlotClockEvent,
     LedgerSlotEvent,
-    BlockEvent
+    BlockEvent,
+    AdmittedEvent,
+    SlotHistoryEvent,
+    TxOutcomeEvent,
+    MessageVersionsEvent
 );
 
 macro_rules! stamped_metric {
@@ -502,6 +507,10 @@ pub struct EventInput {
     pub clock: Stream<SlotClockEvent>,
     pub ledger: Stream<LedgerSlotEvent>,
     pub blocks: Stream<BlockEvent>,
+    pub admitted: Stream<AdmittedEvent>,
+    pub history: Stream<SlotHistoryEvent>,
+    pub outcomes: Stream<TxOutcomeEvent>,
+    pub versions: Stream<MessageVersionsEvent>,
     pub metric_slot: Stream<MetricSlot>,
     pub metric_leader: Stream<MetricLeader>,
     pub metric_votor: Stream<MetricVotor>,
@@ -539,6 +548,10 @@ impl EventInput {
             clock: Stream::new(SLOT_CLOCK_STREAM),
             ledger: Stream::new(LEDGER_SLOT_STREAM),
             blocks: Stream::new(BLOCK_STREAM),
+            admitted: Stream::new(ADMITTED_STREAM),
+            history: Stream::new(SLOT_HISTORY_STREAM),
+            outcomes: Stream::new(TX_OUTCOME_STREAM),
+            versions: Stream::new(MESSAGE_VERSIONS_STREAM),
             metric_slot: Stream::new(METRIC_SLOT_STREAM),
             metric_leader: Stream::new(METRIC_LEADER_STREAM),
             metric_votor: Stream::new(METRIC_VOTOR_STREAM),
@@ -584,6 +597,10 @@ impl EventInput {
         self.clock.connect(dir, &explorer);
         self.ledger.connect(dir, &explorer);
         self.blocks.connect(dir, &explorer);
+        self.admitted.connect(dir, &explorer);
+        self.history.connect(dir, &explorer);
+        self.outcomes.connect(dir, &explorer);
+        self.versions.connect(dir, &explorer);
         self.metric_slot.connect(dir, &explorer);
         self.metric_leader.connect(dir, &explorer);
         self.metric_votor.connect(dir, &explorer);
@@ -607,6 +624,10 @@ impl EventInput {
         self.clock.disconnect();
         self.ledger.disconnect();
         self.blocks.disconnect();
+        self.admitted.disconnect();
+        self.history.disconnect();
+        self.outcomes.disconnect();
+        self.versions.disconnect();
         self.metric_slot.disconnect();
         self.metric_leader.disconnect();
         self.metric_votor.disconnect();
@@ -645,6 +666,10 @@ impl EventInput {
         self.bank_frozen.drain(|event| mirror.apply_frozen(&event));
         self.ledger.drain(|event| mirror.apply_ledger(&event));
         self.blocks.drain(|event| mirror.apply_block(&event));
+        self.admitted.drain(|event| mirror.apply_admitted(&event));
+        self.history.drain(|event| mirror.apply_history(&event));
+        self.outcomes.drain(|event| mirror.apply_outcome(&event));
+        self.versions.drain(|event| mirror.apply_versions(&event));
 
         let shred_totals = &mut self.shred_totals;
         self.shred_fetch.drain(|event| {
@@ -743,6 +768,10 @@ impl EventInput {
             clock,
             ledger,
             blocks,
+            admitted,
+            history,
+            outcomes,
+            versions,
             metric_slot,
             metric_leader,
             metric_votor,

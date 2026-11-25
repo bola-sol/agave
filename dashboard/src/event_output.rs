@@ -9,11 +9,15 @@ use {
         events::{
             ACCOUNT_PATHS, ADDR_ALPENGLOW, ADDR_BYTES, ADDR_GOSSIP, ADDR_RPC,
             ADDR_SERVE_REPAIR_UDP, ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC,
-            ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, ADDRS, BITMAP_BYTES, BLOCK_FOOTER, BLOCK_MISSING,
-            BLOCK_OPAQUE, BLOCK_STREAM, BlockEvent, EPOCH_STREAM, EpochEvent, LEDGER_SLOT_STREAM,
-            LedgerSlotEvent, NODE_INFO_STREAM, NodeInfoEvent, PATH_BYTES, ROLE_ROOT, ROLE_WORKING,
-            SLOT_CLOCK_STREAM, SLOT_STATUS_STREAM, START_PROGRESS_STREAM, SlotClockEvent,
-            SlotStatusEvent, StartProgressEvent, pack_addr, pack_path, pack_str,
+            ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, ADDRS, ADMITTED_STREAM, AdmittedEvent, BITMAP_BYTES,
+            BLOCK_FOOTER, BLOCK_MISSING, BLOCK_OPAQUE, BLOCK_STREAM, BlockEvent, EPOCH_STREAM,
+            EpochEvent, HISTORY_WORDS, LEDGER_SLOT_STREAM, LedgerSlotEvent,
+            MESSAGE_VERSIONS_STREAM, MessageVersionsEvent, NODE_INFO_STREAM, NodeInfoEvent,
+            OUTCOME_FAILED, OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN, PATH_BYTES, RANKS_PER_EVENT,
+            ROLE_ROOT, ROLE_WORKING, SLOT_CLOCK_STREAM, SLOT_HISTORY_STREAM, SLOT_STATUS_STREAM,
+            START_PROGRESS_STREAM, SlotClockEvent, SlotHistoryEvent, SlotStatusEvent,
+            StartProgressEvent, TX_OUTCOME_STREAM, TxOutcomeEvent, VOTE_REWARD_BYTES, pack_addr,
+            pack_path, pack_str,
         },
         metric_events::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -154,10 +158,26 @@ impl<E: Event + Keyed> Resent<E> {
 
 /// Slots below the highest whose blockstore records are watched.
 const LEDGER_WINDOW: u64 = 64;
+/// How often the rank maps go out whole, besides at turn-on and a new epoch.
+const ADMITTED_EVERY: Duration = Duration::from_secs(30);
+/// How often the slot history goes out whole; roots keep it current in between.
+const HISTORY_EVERY: Duration = Duration::from_secs(30);
+/// Set events sent before a pause, so a set larger than its stream arrives whole.
+const PACE_BATCH: usize = 512;
+const PACE_PAUSE: Duration = Duration::from_millis(50);
 /// Blocks read per tick behind the root.
 const BLOCKS_PER_TICK: u64 = 64;
 
 pub struct EventOutput {
+    outcomes: Publisher<TxOutcomeEvent>,
+    versions: Publisher<MessageVersionsEvent>,
+    /// Frozen banks whose blocks are not yet full, held for their transactions' results.
+    held: std::collections::BTreeMap<solana_clock::Slot, Arc<dyn BankView>>,
+    admitted: Publisher<AdmittedEvent>,
+    /// The epoch, generation and time of the last whole rank maps.
+    admitted_sent: Option<(solana_clock::Epoch, u64, Instant)>,
+    history: Publisher<SlotHistoryEvent>,
+    history_sent: Option<(u64, Instant)>,
     ledger: Publisher<LedgerSlotEvent>,
     /// What has been sent of each watched slot: its first shred, and that it filled.
     ledger_sent: std::collections::BTreeMap<solana_clock::Slot, (bool, bool)>,
@@ -179,6 +199,13 @@ impl EventOutput {
             return Err(io::Error::other("no publishers"));
         };
         Ok(Self {
+            outcomes: stream(event_system, TX_OUTCOME_STREAM, 65_536)?,
+            versions: stream(event_system, MESSAGE_VERSIONS_STREAM, 256)?,
+            held: std::collections::BTreeMap::new(),
+            admitted: stream(event_system, ADMITTED_STREAM, 1024)?,
+            admitted_sent: None,
+            history: stream(event_system, SLOT_HISTORY_STREAM, 256)?,
+            history_sent: None,
             ledger: stream(event_system, LEDGER_SLOT_STREAM, 1024)?,
             ledger_sent: std::collections::BTreeMap::new(),
             blocks: stream(event_system, BLOCK_STREAM, 512)?,
@@ -213,6 +240,9 @@ impl EventOutput {
         let now = Instant::now();
         self.send_ledger(src);
         self.send_blocks(src);
+        self.send_admitted(src, now);
+        self.send_history(src, now);
+        self.send_blocks_read(src);
         if self.progress.enabled() {
             let progress = *start_progress.read().unwrap();
             self.progress.offer(progress_event(progress), now);
@@ -295,6 +325,103 @@ impl EventOutput {
         }
     }
 
+    /// Each frozen block's transactions once it is full, and our blocks' message versions.
+    fn send_blocks_read(&mut self, src: &dyn Source) {
+        let outcomes_on = self.outcomes.is_enabled();
+        let versions_on = self.versions.is_enabled();
+        if !outcomes_on && !versions_on {
+            self.held.clear();
+            return;
+        }
+        let banks = src.banks();
+        let newest = self.held.keys().next_back().copied();
+        for (slot, bank) in banks.frozen {
+            if newest.is_none_or(|newest| slot > newest) {
+                self.held.insert(slot, bank);
+            }
+        }
+        // Bank forks drops a bank the root passes; a block not full by then is not read.
+        self.held = self.held.split_off(&banks.root.slot());
+        let me = src.identity();
+        let full: Vec<solana_clock::Slot> = self
+            .held
+            .keys()
+            .copied()
+            .filter(|slot| src.is_full(*slot))
+            .collect();
+        for slot in full {
+            let Some(bank) = self.held.remove(&slot) else {
+                continue;
+            };
+            let ours = src.slot_leader(slot, bank.as_ref()) == Some(me);
+            if outcomes_on {
+                let outcomes = src
+                    .tx_outcomes(slot, bank.as_ref(), ours, &|_| true)
+                    .unwrap_or_default();
+                for event in outcome_events(slot, ours, &outcomes) {
+                    let _ = self.outcomes.publish(&event);
+                }
+            }
+            if versions_on
+                && ours
+                && let Some(tally) = src.message_versions(slot)
+            {
+                let (pid, tid, timestamp_ns) = header();
+                let _ = self.versions.publish(&MessageVersionsEvent {
+                    pid,
+                    tid,
+                    timestamp_ns,
+                    slot,
+                    legacy: tally.legacy,
+                    v0: tally.v0,
+                    v1: tally.v1,
+                });
+            }
+        }
+    }
+
+    /// The previous, this and the next epoch's rank maps from the working bank.
+    fn send_admitted(&mut self, src: &dyn Source, now: Instant) {
+        if !self.admitted.is_enabled() {
+            self.admitted_sent = None;
+            return;
+        }
+        let bank = src.working_bank();
+        let epoch = bank.epoch();
+        let generation = match self.admitted_sent {
+            Some((sent, _, at)) if sent == epoch && now.duration_since(at) < ADMITTED_EVERY => {
+                return;
+            }
+            Some((_, generation, _)) => generation.saturating_add(1),
+            None => 1,
+        };
+        self.admitted_sent = Some((epoch, generation, now));
+        let events: Vec<AdmittedEvent> = [epoch.saturating_sub(1), epoch, epoch.saturating_add(1)]
+            .into_iter()
+            .filter_map(|epoch| Some((epoch, bank.epoch_stakes(epoch)?)))
+            .flat_map(|(epoch, stakes)| admitted_events(epoch, generation, &stakes))
+            .collect();
+        publish_paced(&mut self.admitted, &events);
+    }
+
+    /// The root bank's slot history, whole.
+    fn send_history(&mut self, src: &dyn Source, now: Instant) {
+        if !self.history.is_enabled() {
+            self.history_sent = None;
+            return;
+        }
+        let generation = match self.history_sent {
+            Some((_, at)) if now.duration_since(at) < HISTORY_EVERY => return,
+            Some((generation, _)) => generation.saturating_add(1),
+            None => 1,
+        };
+        let Some(history) = src.root_bank().get_slot_history() else {
+            return;
+        };
+        self.history_sent = Some((generation, now));
+        publish_paced(&mut self.history, &history_events(&history, generation));
+    }
+
     /// Each rooted slot's block, from the root at turn-on.
     fn send_blocks(&mut self, src: &dyn Source) {
         if !self.blocks.is_enabled() {
@@ -313,6 +440,148 @@ impl EventOutput {
             self.next_block = Some(last.saturating_add(1));
         }
     }
+}
+
+/// A block's outcomes, or one empty event where it had none.
+fn outcome_events(
+    slot: solana_clock::Slot,
+    ours: bool,
+    outcomes: &[crate::collect::TxOutcome],
+) -> Vec<TxOutcomeEvent> {
+    let (pid, tid, timestamp_ns) = header();
+    let count = u32::try_from(outcomes.len()).unwrap_or(u32::MAX);
+    let event = |index: u32| TxOutcomeEvent {
+        pid,
+        tid,
+        timestamp_ns,
+        slot,
+        index,
+        count,
+        ours,
+        has_signature: false,
+        signature: [0u8; 64],
+        payer: [0u8; 32],
+        outcome: OUTCOME_UNKNOWN,
+        priority_fee: 0,
+        base_fee: 0,
+    };
+    if outcomes.is_empty() {
+        return vec![event(0)];
+    }
+    outcomes
+        .iter()
+        .zip(0u32..)
+        .map(|(outcome, index)| TxOutcomeEvent {
+            has_signature: outcome.signature.is_some(),
+            signature: outcome
+                .signature
+                .map_or([0u8; 64], |signature| signature.into()),
+            payer: outcome.payer.to_bytes(),
+            outcome: match outcome.failed {
+                Some(false) => OUTCOME_SUCCEEDED,
+                Some(true) => OUTCOME_FAILED,
+                None => OUTCOME_UNKNOWN,
+            },
+            priority_fee: outcome.priority,
+            base_fee: outcome.base,
+            ..event(index)
+        })
+        .collect()
+}
+
+fn publish_paced<E: Event>(publisher: &mut Publisher<E>, events: &[E]) {
+    for (batch, events) in events.chunks(PACE_BATCH).enumerate() {
+        if batch > 0 {
+            thread::sleep(PACE_PAUSE);
+        }
+        for event in events {
+            let _ = publisher.publish(event);
+        }
+    }
+}
+
+/// An epoch's rank map in parts of `RANKS_PER_EVENT`.
+pub(crate) fn admitted_events(
+    epoch: solana_clock::Epoch,
+    generation: u64,
+    stakes: &crate::source::EpochStakeView,
+) -> Vec<AdmittedEvent> {
+    let (pid, tid, timestamp_ns) = header();
+    let ranks = stakes.ranks.len();
+    let count = u32::try_from(ranks.div_ceil(RANKS_PER_EVENT)).unwrap_or(u32::MAX);
+    (0..ranks)
+        .step_by(RANKS_PER_EVENT)
+        .zip(0u32..)
+        .map(|(first, index)| {
+            let mut event = AdmittedEvent {
+                pid,
+                tid,
+                timestamp_ns,
+                epoch,
+                generation,
+                index,
+                count,
+                total_stake: stakes.total_stake,
+                first_rank: u32::try_from(first).unwrap_or(u32::MAX),
+                len: 0,
+                votes: [0u8; RANKS_PER_EVENT * 32],
+                identities: [0u8; RANKS_PER_EVENT * 32],
+                stakes: [0u64; RANKS_PER_EVENT],
+            };
+            let entries = (first..ranks.min(first.saturating_add(RANKS_PER_EVENT)))
+                .filter_map(|rank| stakes.ranks.entry(rank));
+            for (at, entry) in entries.enumerate() {
+                let start = at.saturating_mul(32);
+                if let Some(slot) = event.votes.get_mut(start..start.saturating_add(32)) {
+                    slot.copy_from_slice(&entry.vote.to_bytes());
+                }
+                if let Some(slot) = event.identities.get_mut(start..start.saturating_add(32)) {
+                    slot.copy_from_slice(&entry.identity.to_bytes());
+                }
+                if let Some(slot) = event.stakes.get_mut(at) {
+                    *slot = entry.stake;
+                }
+                event.len = event.len.saturating_add(1);
+            }
+            event
+        })
+        .collect()
+}
+
+/// The slot history's bitmap in parts of `HISTORY_WORDS`.
+pub(crate) fn history_events(
+    history: &solana_slot_history::SlotHistory,
+    generation: u64,
+) -> Vec<SlotHistoryEvent> {
+    use bv::Bits;
+    let (pid, tid, timestamp_ns) = header();
+    let words = history.bits.block_len();
+    let count = u32::try_from(words.div_ceil(HISTORY_WORDS)).unwrap_or(u32::MAX);
+    (0..words)
+        .step_by(HISTORY_WORDS)
+        .zip(0u32..)
+        .map(|(first, index)| {
+            let last = words.min(first.saturating_add(HISTORY_WORDS));
+            let mut event = SlotHistoryEvent {
+                pid,
+                tid,
+                timestamp_ns,
+                generation,
+                index,
+                count,
+                next_slot: history.next_slot,
+                first_word: u32::try_from(first).unwrap_or(u32::MAX),
+                len: u16::try_from(last.saturating_sub(first)).unwrap_or(0),
+                words: [0u64; HISTORY_WORDS],
+            };
+            for (at, word) in (first..last).enumerate() {
+                if let Some(slot) = event.words.get_mut(at) {
+                    *slot = history.bits.get_block(word);
+                }
+            }
+            event
+        })
+        .collect()
 }
 
 fn block_event(slot: solana_clock::Slot, block: crate::certs::Block) -> BlockEvent {
@@ -507,6 +776,10 @@ pub(crate) fn epoch_event(bank: &dyn BankView, vote_account: &solana_pubkey::Pub
     let schedule = bank.epoch_schedule();
     let cost = bank.cost();
     let ticket_short = bank.vat_ticket_short(vote_account);
+    let vote_reward = bank
+        .account_data(&crate::collect::VOTE_REWARD_ACCOUNT)
+        .filter(|data| data.len() <= VOTE_REWARD_BYTES)
+        .unwrap_or_default();
     EpochEvent {
         pid,
         tid,
@@ -526,6 +799,14 @@ pub(crate) fn epoch_event(bank: &dyn BankView, vote_account: &solana_pubkey::Pub
         vote_account_rent: bank.get_minimum_balance_for_rent_exemption(VoteStateV4::size_of()),
         has_ticket_short: ticket_short.is_some(),
         ticket_short: ticket_short.unwrap_or(0),
+        vote_reward_len: u8::try_from(vote_reward.len()).unwrap_or(0),
+        vote_reward: {
+            let mut packed = [0u8; VOTE_REWARD_BYTES];
+            if let Some(slot) = packed.get_mut(..vote_reward.len()) {
+                slot.copy_from_slice(&vote_reward);
+            }
+            packed
+        },
     }
 }
 
