@@ -69,6 +69,9 @@ pub struct DashboardService {
     filler: Option<JoinHandle<()>>,
     /// Handed to the collector on attach.
     refill: Option<crossbeam_channel::Receiver<Refilled>>,
+    /// What the collector reads, kept for the event streams.
+    source: Option<Arc<dyn Source>>,
+    events: Option<JoinHandle<()>>,
 }
 
 impl DashboardService {
@@ -289,6 +292,8 @@ impl DashboardService {
             recorder,
             filler,
             refill,
+            source: None,
+            events: None,
         })
     }
 
@@ -302,6 +307,7 @@ impl DashboardService {
 
     /// Starts the collector and meters on `src`.
     pub fn attach_source(&mut self, src: Arc<dyn Source>) -> io::Result<()> {
+        self.source = Some(src.clone());
         let info_cache = self.info_cache.clone();
         let failed_total = Arc::new(AtomicU64::new(FAILED_UNREAD));
 
@@ -392,8 +398,24 @@ impl DashboardService {
         Ok(())
     }
 
+    /// Publishes what the collector reads as event streams, for a dashboard in another process.
+    /// Test branch only.
+    pub fn publish_events(
+        &mut self,
+        event_system: &agave_event_system::EventSystem,
+    ) -> io::Result<()> {
+        let src = self
+            .source
+            .clone()
+            .ok_or_else(|| io::Error::other("the collector is not attached"))?;
+        let output = crate::event_output::EventOutput::new(event_system)?;
+        self.events = Some(output.spawn(src, self.startup_progress.clone(), self.exit.clone())?);
+        Ok(())
+    }
+
     pub fn join(mut self) -> thread::Result<()> {
         for handle in [
+            self.events.take(),
             self.collector.take(),
             self.meters.take(),
             self.boot.take(),

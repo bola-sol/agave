@@ -1,5 +1,7 @@
 //! Vote accounts and leader schedules as sets of events, resent in full every 30 seconds.
 //! Members of a set share a `generation`, and `index` and `count` mark when it is complete.
+//! Vote accounts are read from the working bank, and each tick sends those that changed,
+//! last vote included.
 
 use {
     agave_event_system::{
@@ -39,7 +41,7 @@ const FULL_SET_INTERVAL: Duration = Duration::from_secs(30);
 const PACE_BATCH: usize = 512;
 const PACE_PAUSE: Duration = Duration::from_millis(50);
 
-/// One vote account read from the root bank: staked accounts and our own.
+/// One vote account read from the working bank: staked accounts and our own.
 /// The timestamp is monotonic nanoseconds.
 #[event]
 #[derive(Debug, PartialEq, Eq)]
@@ -47,7 +49,7 @@ pub struct VoteAccountEvent {
     pub pid: i32,
     pub tid: i32,
     pub timestamp_ns: u64,
-    /// The root bank the account was read from.
+    /// The bank the account was read from.
     pub slot: Slot,
     pub epoch: Epoch,
     pub generation: u64,
@@ -61,8 +63,12 @@ pub struct VoteAccountEvent {
     /// In lamports.
     pub activated_stake: u64,
     pub commission: u8,
-    /// Credits earned in `epoch`.
-    pub epoch_credits: u64,
+    pub inflation_rewards_commission_bps: u16,
+    /// The vote state's newest epoch credits entry.
+    pub has_credits: bool,
+    pub credits_epoch: Epoch,
+    pub credits: u64,
+    pub prev_credits: u64,
     pub has_bls_key: bool,
     pub has_last_voted_slot: bool,
     pub last_voted_slot: Slot,
@@ -109,6 +115,8 @@ struct AccountKey {
     stake: u64,
     commission: u8,
     has_bls_key: bool,
+    last_voted_slot: Option<Slot>,
+    credits: u64,
 }
 
 impl AccountKey {
@@ -118,6 +126,8 @@ impl AccountKey {
             stake: event.activated_stake,
             commission: event.commission,
             has_bls_key: event.has_bls_key,
+            last_voted_slot: event.has_last_voted_slot.then_some(event.last_voted_slot),
+            credits: event.credits,
         }
     }
 }
@@ -144,6 +154,7 @@ pub(crate) fn vote_account_events(
         .map(|((key, (stake, account)), index)| {
             let view = account.vote_state_view();
             let last_voted_slot = view.last_voted_slot();
+            let credits = view.epoch_credits_iter().last();
             VoteAccountEvent {
                 pid,
                 tid,
@@ -158,10 +169,11 @@ pub(crate) fn vote_account_events(
                 identity: account.node_pubkey().to_bytes(),
                 activated_stake: *stake,
                 commission: view.commission(),
-                epoch_credits: view
-                    .epoch_credits_iter()
-                    .find(|item| item.epoch() == epoch)
-                    .map_or(0, |item| item.credits().saturating_sub(item.prev_credits())),
+                inflation_rewards_commission_bps: view.inflation_rewards_commission(),
+                has_credits: credits.is_some(),
+                credits_epoch: credits.map_or(0, |item| item.epoch()),
+                credits: credits.map_or(0, |item| item.credits()),
+                prev_credits: credits.map_or(0, |item| item.prev_credits()),
                 has_bls_key: view.bls_pubkey_compressed().is_some(),
                 has_last_voted_slot: last_voted_slot.is_some(),
                 last_voted_slot: last_voted_slot.unwrap_or_default(),
@@ -370,7 +382,7 @@ impl StateLoop {
             return;
         }
 
-        let bank = bank_forks.read().unwrap().root_bank();
+        let bank = bank_forks.read().unwrap().working_bank();
         let epoch = bank.epoch();
         let now = Instant::now();
         let due = self.last_epoch != Some(epoch) || self.next_full.is_none_or(|at| now >= at);

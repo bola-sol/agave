@@ -3,11 +3,13 @@
 
 use {
     crate::{
-        collect::{
-            CATCH_UP_SLOTS_PER_SECOND, EpochInfo, ValidatorCounts, is_delinquent, system_time_nanos,
+        collect::EpochInfo,
+        events::{
+            EPOCH_STREAM, EpochEvent, NODE_INFO_STREAM, NodeInfoEvent, SLOT_CLOCK_STREAM,
+            SLOT_STATUS_STREAM, START_PROGRESS_STREAM, SlotClockEvent, SlotStatusEvent,
+            StartProgressEvent,
         },
-        meters::{CHART_HISTORY, Tps, TpsSample},
-        proto::{Debounced, Publisher, TOPIC_SUMMARY},
+        mirror::Mirror,
     },
     agave_event_system::{
         Event,
@@ -28,12 +30,12 @@ use {
     solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_pubkey::Pubkey,
     std::{
-        collections::{BTreeMap, HashMap, HashSet},
+        collections::{BTreeMap, HashMap},
         ffi::OsString,
         fmt::Write as _,
         path::{Path, PathBuf},
-        sync::{Arc, RwLock},
-        time::{Duration, Instant, SystemTime},
+        sync::Arc,
+        time::{Duration, Instant},
     },
 };
 
@@ -70,6 +72,24 @@ impl Stamped for VoteAccountEvent {
         self.timestamp_ns
     }
 }
+
+macro_rules! stamped {
+    ($($event:ty),*) => {$(
+        impl Stamped for $event {
+            fn timestamp_ns(&self) -> u64 {
+                self.timestamp_ns
+            }
+        }
+    )*};
+}
+
+stamped!(
+    NodeInfoEvent,
+    StartProgressEvent,
+    SlotStatusEvent,
+    EpochEvent,
+    SlotClockEvent
+);
 
 impl Stamped for LeaderScheduleEvent {
     fn timestamp_ns(&self) -> u64 {
@@ -259,36 +279,6 @@ impl VoteSet {
     }
 }
 
-/// The in-process tally, except each account is judged against the bank it was read from,
-/// since a set's members are read up to 30 seconds apart.
-pub fn validator_counts<'a>(
-    accounts: impl Iterator<Item = &'a VoteAccountEvent>,
-) -> ValidatorCounts {
-    let mut staked: HashSet<[u8; 32]> = HashSet::new();
-    let mut delinquent: HashSet<[u8; 32]> = HashSet::new();
-    let mut delinquent_stake = 0u64;
-    let mut non_delinquent_stake = 0u64;
-    for account in accounts.filter(|account| account.activated_stake > 0) {
-        let last_vote = account
-            .has_last_voted_slot
-            .then_some(account.last_voted_slot);
-        if is_delinquent(last_vote, account.slot) {
-            delinquent.insert(account.identity);
-            delinquent_stake = delinquent_stake.saturating_add(account.activated_stake);
-        } else {
-            non_delinquent_stake = non_delinquent_stake.saturating_add(account.activated_stake);
-        }
-        staked.insert(account.identity);
-    }
-    ValidatorCounts {
-        total: staked.len(),
-        delinquent: delinquent.len(),
-        rpc_nodes: 0,
-        non_delinquent_stake,
-        delinquent_stake,
-    }
-}
-
 #[derive(Debug)]
 struct PendingSchedule {
     generation: u64,
@@ -439,66 +429,6 @@ impl ScheduleSet {
     }
 }
 
-/// Per-second rates from frozen banks, as the in-process sampler publishes them.
-#[derive(Debug, Default)]
-pub struct Throughput {
-    total: u64,
-    non_vote: u64,
-    failed: u64,
-    newest_slot: Slot,
-    sampled_slot: Slot,
-    since: Option<Instant>,
-    history: Vec<TpsSample>,
-}
-
-impl Throughput {
-    pub fn add(&mut self, event: &BankFrozenEvent) {
-        self.total = self.total.saturating_add(event.transaction_count);
-        self.non_vote = self
-            .non_vote
-            .saturating_add(event.non_vote_transaction_count);
-        self.failed = self.failed.saturating_add(event.failed_transaction_count);
-        self.newest_slot = self.newest_slot.max(event.slot);
-    }
-
-    /// A sample of the counts since the last call, `None` on the first.
-    pub fn sample(&mut self, now: Instant, wall: SystemTime) -> Option<TpsSample> {
-        let since = self.since.replace(now);
-        let (total, non_vote, failed) = (self.total, self.non_vote, self.failed);
-        (self.total, self.non_vote, self.failed) = (0, 0, 0);
-        let advanced = self.newest_slot.saturating_sub(self.sampled_slot);
-        self.sampled_slot = self.newest_slot;
-        let seconds = now.duration_since(since?).as_secs_f64();
-        // As in-process: replay catching up would pin the chart's scale.
-        if seconds <= 0.0 || advanced as f64 / seconds > CATCH_UP_SLOTS_PER_SECOND {
-            return None;
-        }
-        let total = total as f64 / seconds;
-        let non_vote = non_vote as f64 / seconds;
-        let failed = failed as f64 / seconds;
-        Some(TpsSample {
-            slot: self.newest_slot,
-            timestamp_nanos: system_time_nanos(wall),
-            tps: Tps {
-                total,
-                vote: (total - non_vote).max(0.0),
-                non_vote_success: (non_vote - failed).max(0.0),
-                non_vote_failed: failed.min(non_vote),
-            },
-        })
-    }
-
-    pub fn publish(&mut self, sample: TpsSample, publisher: &Publisher) {
-        publisher.publish_ephemeral(TOPIC_SUMMARY, "tps_sample", &sample);
-        self.history.push(sample);
-        if self.history.len() > CHART_HISTORY {
-            let excess = self.history.len().saturating_sub(CHART_HISTORY);
-            self.history.drain(..excess);
-        }
-        publisher.retain_only(TOPIC_SUMMARY, "tps_history", &self.history);
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct SlotProgress {
     pub begun: u64,
@@ -511,48 +441,54 @@ pub struct SlotProgress {
 
 const QUEUE_CHECK: Duration = Duration::from_secs(2);
 
-/// Every subscription and what has been read from them.
+/// Every subscription, feeding the mirror.
 pub struct EventInput {
     dir: PathBuf,
     checked: Option<Instant>,
     started: Instant,
+    mirror: Arc<Mirror>,
     pub slot_events: Stream<SlotEvent>,
     pub bank_frozen: Stream<BankFrozenEvent>,
     pub shred_fetch: Stream<ShredFetchCounters>,
     pub vote_accounts: Stream<VoteAccountEvent>,
     pub schedule: Stream<LeaderScheduleEvent>,
+    pub node: Stream<NodeInfoEvent>,
+    pub progress: Stream<StartProgressEvent>,
+    pub status: Stream<SlotStatusEvent>,
+    pub epoch: Stream<EpochEvent>,
+    pub clock: Stream<SlotClockEvent>,
     pub slots: SlotProgress,
-    pub throughput: Throughput,
     /// Newest totals per path, turbine first.
     pub shred_totals: [Option<ShredFetchCounters>; 2],
     pub votes: VoteSet,
     pub schedules: ScheduleSet,
     pub first_vote_set: Option<Duration>,
     pub first_schedule: Option<Duration>,
-    validator_counts: Debounced<ValidatorCounts>,
-    epochs: Arc<RwLock<Vec<EpochInfo>>>,
 }
 
 impl EventInput {
-    pub fn new(dir: PathBuf, epochs: Arc<RwLock<Vec<EpochInfo>>>) -> Self {
+    pub fn new(dir: PathBuf, mirror: Arc<Mirror>) -> Self {
         Self {
             dir,
             checked: None,
             started: Instant::now(),
+            mirror,
             slot_events: Stream::new(SLOT_EVENT_STREAM),
             bank_frozen: Stream::new(BANK_FROZEN_STREAM),
             shred_fetch: Stream::new(SHRED_FETCH_STREAM),
             vote_accounts: Stream::new(VOTE_ACCOUNT_STREAM),
             schedule: Stream::new(LEADER_SCHEDULE_STREAM),
+            node: Stream::new(NODE_INFO_STREAM),
+            progress: Stream::new(START_PROGRESS_STREAM),
+            status: Stream::new(SLOT_STATUS_STREAM),
+            epoch: Stream::new(EPOCH_STREAM),
+            clock: Stream::new(SLOT_CLOCK_STREAM),
             slots: SlotProgress::default(),
-            throughput: Throughput::default(),
             shred_totals: [None, None],
             votes: VoteSet::default(),
             schedules: ScheduleSet::default(),
             first_vote_set: None,
             first_schedule: None,
-            validator_counts: Debounced::new(TOPIC_SUMMARY, "validator_counts"),
-            epochs,
         }
     }
 
@@ -577,6 +513,11 @@ impl EventInput {
         if self.schedule.connect(dir, &explorer) {
             self.schedules.reset_pending();
         }
+        self.node.connect(dir, &explorer);
+        self.progress.connect(dir, &explorer);
+        self.status.connect(dir, &explorer);
+        self.epoch.connect(dir, &explorer);
+        self.clock.connect(dir, &explorer);
     }
 
     pub fn disconnect(&mut self) {
@@ -585,9 +526,14 @@ impl EventInput {
         self.shred_fetch.disconnect();
         self.vote_accounts.disconnect();
         self.schedule.disconnect();
+        self.node.disconnect();
+        self.progress.disconnect();
+        self.status.disconnect();
+        self.epoch.disconnect();
+        self.clock.disconnect();
     }
 
-    pub fn drain(&mut self, publisher: &Publisher) {
+    pub fn drain(&mut self) {
         let slots = &mut self.slots;
         self.slot_events.drain(|event| match event {
             SlotEvent::Begin { .. } => slots.begun = slots.begun.saturating_add(1),
@@ -604,14 +550,20 @@ impl EventInput {
             SlotEvent::Rooted { slot, .. } => slots.root = slots.root.max(slot),
         });
 
-        let throughput = &mut self.throughput;
-        self.bank_frozen.drain(|event| throughput.add(&event));
+        self.bank_frozen.drain(|_| {});
 
         let shred_totals = &mut self.shred_totals;
         self.shred_fetch.drain(|event| {
             let path = usize::from(event.path == SHRED_FETCH_PATH_REPAIR);
             shred_totals[path] = Some(event);
         });
+
+        let mirror = &self.mirror;
+        self.node.drain(|event| mirror.apply_node(&event));
+        self.progress.drain(|event| mirror.apply_progress(&event));
+        self.status.drain(|event| mirror.apply_status(&event));
+        self.epoch.drain(|event| mirror.apply_epoch(&event));
+        self.clock.drain(|event| mirror.apply_clock(&event));
 
         let votes = &mut self.votes;
         let mut votes_changed = false;
@@ -622,8 +574,7 @@ impl EventInput {
                 self.first_vote_set = Some(self.started.elapsed());
             }
             if let Some(accounts) = self.votes.accounts() {
-                self.validator_counts
-                    .publish(publisher, validator_counts(accounts));
+                self.mirror.apply_votes(accounts);
             }
         }
 
@@ -631,12 +582,12 @@ impl EventInput {
         let mut completed = Vec::new();
         self.schedule
             .drain(|event| completed.extend(schedules.apply(event)));
-        if !completed.is_empty() {
-            if self.first_schedule.is_none() {
-                self.first_schedule = Some(self.started.elapsed());
-            }
-            if let Ok(mut epochs) = self.epochs.write() {
-                *epochs = self.schedules.complete.values().cloned().collect();
+        if !completed.is_empty() && self.first_schedule.is_none() {
+            self.first_schedule = Some(self.started.elapsed());
+        }
+        for epoch in completed {
+            if let Some(info) = self.schedules.complete.get(&epoch) {
+                self.mirror.apply_schedule(info);
             }
         }
     }
@@ -661,35 +612,27 @@ impl EventInput {
                     .unwrap_or_default(),
             );
         };
-        line(
-            self.slot_events.name(),
-            &self.slot_events.stats,
-            self.slot_events.connected(),
-            self.slot_events.rejected(),
-        );
-        line(
-            self.bank_frozen.name(),
-            &self.bank_frozen.stats,
-            self.bank_frozen.connected(),
-            self.bank_frozen.rejected(),
-        );
-        line(
-            self.shred_fetch.name(),
-            &self.shred_fetch.stats,
-            self.shred_fetch.connected(),
-            self.shred_fetch.rejected(),
-        );
-        line(
-            self.vote_accounts.name(),
-            &self.vote_accounts.stats,
-            self.vote_accounts.connected(),
-            self.vote_accounts.rejected(),
-        );
-        line(
-            self.schedule.name(),
-            &self.schedule.stats,
-            self.schedule.connected(),
-            self.schedule.rejected(),
+        macro_rules! lines {
+            ($($stream:ident),*) => {$(
+                line(
+                    self.$stream.name(),
+                    &self.$stream.stats,
+                    self.$stream.connected(),
+                    self.$stream.rejected(),
+                );
+            )*};
+        }
+        lines!(
+            slot_events,
+            bank_frozen,
+            shred_fetch,
+            vote_accounts,
+            schedule,
+            node,
+            progress,
+            status,
+            epoch,
+            clock
         );
         let _ = writeln!(
             out,
@@ -714,13 +657,14 @@ impl EventInput {
         let _ = write!(
             out,
             "events: vote sets completed {}, abandoned {}, first after {:?}; schedules completed \
-             {}, epochs {:?}, first after {:?}",
+             {}, epochs {:?}, first after {:?}; mirror ready {}",
             self.votes.sets_completed,
             self.votes.sets_abandoned,
             self.first_vote_set,
             self.schedules.sets_completed,
             self.schedules.complete.keys().collect::<Vec<_>>(),
             self.first_schedule,
+            self.mirror.ready(),
         );
         out
     }
@@ -748,7 +692,11 @@ mod tests {
             identity: [key; 32],
             activated_stake: stake,
             commission: 0,
-            epoch_credits: 0,
+            inflation_rewards_commission_bps: 0,
+            has_credits: false,
+            credits_epoch: 0,
+            credits: 0,
+            prev_credits: 0,
             has_bls_key: false,
             has_last_voted_slot: true,
             last_voted_slot: 990,
@@ -781,26 +729,6 @@ mod tests {
         change.reason = VOTE_ACCOUNT_CHANGE;
         assert!(set.apply(change));
         assert_eq!(set.accounts().unwrap().next().unwrap().activated_stake, 25);
-    }
-
-    #[test]
-    fn test_counts_judge_each_account_by_its_own_bank() {
-        let mut stale = account(1, 0, 3, 1, 10);
-        stale.last_voted_slot = 800;
-        let mut never = account(1, 1, 3, 2, 5);
-        never.has_last_voted_slot = false;
-        let unstaked = account(1, 2, 3, 3, 0);
-        let fresh = account(1, 2, 3, 4, 20);
-        let counts = validator_counts([&stale, &never, &unstaked, &fresh].into_iter());
-        assert_eq!(
-            (
-                counts.total,
-                counts.delinquent,
-                counts.delinquent_stake,
-                counts.non_delinquent_stake
-            ),
-            (3, 2, 15, 20)
-        );
     }
 
     #[test]
@@ -929,86 +857,5 @@ mod tests {
         }
         assert_eq!(set.complete.keys().copied().collect::<Vec<_>>(), vec![5, 6]);
         assert!(set.pending.is_empty());
-    }
-
-    #[test]
-    fn test_throughput_skips_catch_up_windows() {
-        let mut throughput = Throughput::default();
-        let start = Instant::now();
-        throughput.sample(start, SystemTime::now());
-        let frozen = |throughput: &mut Throughput, slot: Slot| {
-            throughput.add(&BankFrozenEvent {
-                pid: 1,
-                tid: 1,
-                timestamp_ns: 0,
-                slot,
-                bank_id: slot,
-                parent_slot: slot.saturating_sub(1),
-                leader: [0; 32],
-                blockhash: [0; 32],
-                transaction_count: 10,
-                non_vote_transaction_count: 10,
-                failed_transaction_count: 0,
-                transaction_entry_count: 0,
-                block_cost: 0,
-                block_cost_limit: 0,
-                account_cost_limit: 0,
-                total_fee: 0,
-                priority_fee: 0,
-            });
-        };
-        frozen(&mut throughput, 30);
-        assert!(
-            throughput
-                .sample(start + Duration::from_secs(1), SystemTime::now())
-                .is_none()
-        );
-        frozen(&mut throughput, 33);
-        assert!(
-            throughput
-                .sample(start + Duration::from_secs(2), SystemTime::now())
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn test_throughput_rates_per_second() {
-        let mut throughput = Throughput::default();
-        let start = Instant::now();
-        assert!(throughput.sample(start, SystemTime::now()).is_none());
-        for slot in 1..=2 {
-            throughput.add(&BankFrozenEvent {
-                pid: 1,
-                tid: 1,
-                timestamp_ns: 0,
-                slot,
-                bank_id: slot,
-                parent_slot: slot.saturating_sub(1),
-                leader: [0; 32],
-                blockhash: [0; 32],
-                transaction_count: 100,
-                non_vote_transaction_count: 40,
-                failed_transaction_count: 10,
-                transaction_entry_count: 0,
-                block_cost: 0,
-                block_cost_limit: 0,
-                account_cost_limit: 0,
-                total_fee: 0,
-                priority_fee: 0,
-            });
-        }
-        let sample = throughput
-            .sample(start + Duration::from_secs(1), SystemTime::now())
-            .unwrap();
-        assert_eq!(sample.slot, 2);
-        assert_eq!(
-            (
-                sample.tps.total,
-                sample.tps.vote,
-                sample.tps.non_vote_success,
-                sample.tps.non_vote_failed
-            ),
-            (200.0, 120.0, 60.0, 20.0)
-        );
     }
 }
