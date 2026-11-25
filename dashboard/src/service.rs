@@ -58,6 +58,8 @@ pub struct DashboardService {
     commission_bps: Option<u16>,
     history: Arc<RwLock<SlotHistory>>,
     info_cache: Arc<RwLock<ValidatorInfoCache>>,
+    /// When the collector saw the node catch up, for the event streams.
+    caught_up: Arc<AtomicU64>,
     epochs: Arc<RwLock<Vec<EpochInfo>>>,
     replies: Arc<Replies>,
     server: Option<JoinHandle<()>>,
@@ -287,6 +289,7 @@ impl DashboardService {
             commission_bps: config.commission_bps,
             history,
             info_cache,
+            caught_up: Arc::default(),
             epochs,
             replies,
             server: Some(server),
@@ -372,6 +375,7 @@ impl DashboardService {
             let tips = self.tip_payment_program_id.as_ref().map(TipMeter::new);
             let commission_bps = self.commission_bps;
             let refill = self.refill.take();
+            let caught_up = self.caught_up.clone();
             thread::Builder::new()
                 .name("solDashColl".to_string())
                 .spawn(move || {
@@ -385,6 +389,7 @@ impl DashboardService {
                         startup,
                         metrics_tap,
                         failed_total,
+                        caught_up,
                     };
                     let mut collector = Collector::with_source(src, shared, tips, commission_bps);
                     if let Some(refill) = refill {
@@ -414,7 +419,11 @@ impl DashboardService {
             .source
             .clone()
             .ok_or_else(|| io::Error::other("the collector is not attached"))?;
-        let output = crate::event_output::EventOutput::new(event_system)?;
+        let output = crate::event_output::EventOutput::new(
+            event_system,
+            self.info_cache.clone(),
+            self.caught_up.clone(),
+        )?;
         self.events = Some(output.spawn(src, self.exit.clone())?);
         // Bounded so a stalled publisher costs points, not the validator's memory.
         let (sender, receiver) = crossbeam_channel::bounded(16_384);

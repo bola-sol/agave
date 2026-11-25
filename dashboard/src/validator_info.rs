@@ -45,6 +45,22 @@ pub struct ValidatorInfoCache {
 }
 
 impl ValidatorInfoCache {
+    /// Every entry, with the newest slot any was read at.
+    pub fn entries(&self) -> (Slot, Vec<(Pubkey, ValidatorInfo)>) {
+        let slot = self
+            .by_identity
+            .values()
+            .map(|(slot, _)| *slot)
+            .max()
+            .unwrap_or_default();
+        let entries = self
+            .by_identity
+            .iter()
+            .map(|(identity, (_, info))| (*identity, info.clone()))
+            .collect();
+        (slot, entries)
+    }
+
     pub fn get(&self, identity: &Pubkey) -> Option<&ValidatorInfo> {
         self.by_identity.get(identity).map(|(_, info)| info)
     }
@@ -270,6 +286,25 @@ mod tests {
             cache.get(&identity).and_then(|info| info.name.as_deref()),
             Some("Lantern")
         );
+    }
+
+    #[test]
+    fn test_entries_hand_back_every_name_at_the_newest_slot() {
+        let mut cache = ValidatorInfoCache::default();
+        assert_eq!(cache.entries(), (0, Vec::new()));
+        let (first, second) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let named = |name: &str| ValidatorInfo {
+            name: Some(name.into()),
+            icon_url: None,
+        };
+        cache.merge(4, vec![(first, named("Lantern"))]);
+        cache.merge(9, vec![(second, named("Other"))]);
+        let (slot, mut entries) = cache.entries();
+        entries.sort_by_key(|(identity, _)| *identity);
+        let mut expected = vec![(first, named("Lantern")), (second, named("Other"))];
+        expected.sort_by_key(|(identity, _)| *identity);
+        assert_eq!(slot, 9);
+        assert_eq!(entries, expected);
     }
 
     #[test]

@@ -523,6 +523,10 @@ pub trait Source: Send + Sync {
     fn rpc_node_count(&self, peers: &[(PeerRow, u64)]) -> usize;
     /// Whether gossip accepts only globally routable addresses.
     fn global_addresses_only(&self) -> bool;
+    /// Unix milliseconds the node caught up with the cluster, where another process reported it.
+    fn caught_up_millis(&self) -> Option<u64> {
+        None
+    }
     fn banks(&self) -> Banks;
     fn root_bank(&self) -> Arc<dyn BankView>;
     fn working_bank(&self) -> Arc<dyn BankView>;

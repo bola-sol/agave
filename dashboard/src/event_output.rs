@@ -169,6 +169,10 @@ pub struct EventOutput {
     peers_sent: Option<(u64, Instant)>,
     info: Publisher<ValidatorInfoEvent>,
     info_sent: Option<(u64, Instant)>,
+    /// The names the in-process dashboard read before the validator ran, sent as the first set.
+    info_cache: Arc<std::sync::RwLock<crate::validator_info::ValidatorInfoCache>>,
+    /// When the in-process collector saw the node catch up, unix milliseconds, 0 before.
+    caught_up: Arc<std::sync::atomic::AtomicU64>,
     finalization: Publisher<FinalizationEvent>,
     /// Frozen banks already read for finalization and validator info changes; `None` while both
     /// streams are off.
@@ -200,7 +204,11 @@ pub struct EventOutput {
 }
 
 impl EventOutput {
-    pub fn new(event_system: &EventSystem) -> io::Result<Self> {
+    pub fn new(
+        event_system: &EventSystem,
+        info_cache: Arc<std::sync::RwLock<crate::validator_info::ValidatorInfoCache>>,
+        caught_up: Arc<std::sync::atomic::AtomicU64>,
+    ) -> io::Result<Self> {
         let mut clock = publishers::<SlotClockEvent>(event_system, SLOT_CLOCK_STREAM, 256, 2)?;
         let (Some(working), Some(root)) = (clock.pop(), clock.pop()) else {
             return Err(io::Error::other("no publishers"));
@@ -210,6 +218,8 @@ impl EventOutput {
             peers_sent: None,
             info: stream(event_system, VALIDATOR_INFO_STREAM, 8192)?,
             info_sent: None,
+            info_cache,
+            caught_up,
             finalization: stream(event_system, FINALIZATION_STREAM, 1024)?,
             frozen_seen: None,
             info_scan: None,
@@ -261,7 +271,8 @@ impl EventOutput {
         self.send_info(held_src, now);
         self.send_frozen_reads(src);
         if self.node.enabled() {
-            self.node.offer(node_event(src), now);
+            self.node
+                .offer(node_event(src, self.caught_up.load(Ordering::Relaxed)), now);
         }
         let wants_banks = [
             self.status.enabled(),
@@ -417,6 +428,15 @@ impl EventOutput {
             None => 1,
         };
         self.info_sent = Some((generation, now));
+        // The first set is what the in-process dashboard read at start, so names need no scan.
+        if generation == 1 {
+            let (slot, entries) = self.info_cache.read().unwrap().entries();
+            if !entries.is_empty() {
+                let events = info_events(INFO_FULL_SET, generation, slot, &entries);
+                publish_paced(&mut self.info, &events);
+                return;
+            }
+        }
         let (sender, receiver) = crossbeam_channel::bounded(1);
         let src = src.clone();
         if thread::Builder::new()
@@ -881,7 +901,7 @@ fn header() -> (i32, i32, u64) {
     (pid, tid, monotonic_timestamp_ns())
 }
 
-pub(crate) fn node_event(src: &dyn Source) -> NodeInfoEvent {
+pub(crate) fn node_event(src: &dyn Source, caught_up_ms: u64) -> NodeInfoEvent {
     let (pid, tid, timestamp_ns) = header();
     let contact = src.my_contact();
     let mut addrs = [0u8; ADDRS * ADDR_BYTES];
@@ -950,6 +970,7 @@ pub(crate) fn node_event(src: &dyn Source) -> NodeInfoEvent {
             slots(config.incremental_snapshot_archive_interval)
         }),
         global_addresses_only: src.global_addresses_only(),
+        caught_up_ms,
     }
 }
 
