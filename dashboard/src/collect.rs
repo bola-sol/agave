@@ -73,7 +73,9 @@ pub use self::{
     gossip_peers::GossipPeers,
     handoff::LeaderFigures,
 };
-pub(crate) use self::{fee_payers::tx_outcomes, slot_clock::CATCH_UP_SLOTS_PER_SECOND};
+pub(crate) use self::{
+    earnings::VOTE_REWARD_ACCOUNT, fee_payers::tx_outcomes, slot_clock::CATCH_UP_SLOTS_PER_SECOND,
+};
 
 const SLOW_TICK: Duration = Duration::from_secs(5);
 

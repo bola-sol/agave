@@ -9,14 +9,16 @@ use {
         events::{
             ACCOUNT_PATHS, ADDR_ALPENGLOW, ADDR_BYTES, ADDR_GOSSIP, ADDR_RPC,
             ADDR_SERVE_REPAIR_UDP, ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC,
-            ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, BITMAP_BYTES, BLOCK_FOOTER, BLOCK_MISSING, BlockEvent,
-            EpochEvent, LedgerSlotEvent, NodeInfoEvent, PATH_BYTES, ROLE_ROOT, SlotClockEvent,
-            SlotStatusEvent, StartProgressEvent, unpack_addr, unpack_path, unpack_str,
+            ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, AdmittedEvent, BITMAP_BYTES, BLOCK_FOOTER,
+            BLOCK_MISSING, BlockEvent, EpochEvent, LedgerSlotEvent, MessageVersionsEvent,
+            NodeInfoEvent, OUTCOME_FAILED, OUTCOME_SUCCEEDED, PATH_BYTES, ROLE_ROOT,
+            SlotClockEvent, SlotHistoryEvent, SlotStatusEvent, StartProgressEvent, TxOutcomeEvent,
+            unpack_addr, unpack_path, unpack_str,
         },
         snapshot,
         source::{
-            BankView, Banks, Commitment, CostFacts, EpochStakeView, FeeTotals, PeerRow, Ranks,
-            Source, VoteRow,
+            BankView, Banks, Commitment, CostFacts, EpochStakeView, FeeTotals, PeerRow, RankEntry,
+            RankRows, Ranks, Source, VoteRow,
         },
         validator_info::ValidatorInfo,
         versions::TxVersions,
@@ -54,6 +56,63 @@ const LEDGER_KEPT: u64 = 8192;
 const BLOCKS_KEPT: usize = 4096;
 /// Frozen banks held for a collector that has not taken them yet.
 const NOTIFIED_KEPT: usize = 1024;
+/// Epochs of rank maps kept.
+const STAKES_KEPT: usize = 4;
+
+/// Rank maps by epoch, shared by every bank built from one state.
+type Stakes = Arc<BTreeMap<Epoch, EpochStakeView>>;
+
+/// What every rebuilt bank answers from the state it was built from.
+#[derive(Clone, Default)]
+struct Shared {
+    stakes: Stakes,
+    history: Option<Arc<SlotHistory>>,
+}
+
+impl Shared {
+    fn rank_map(&self, schedule: &EpochSchedule, slot: Slot) -> Option<Arc<dyn Ranks>> {
+        self.stakes
+            .get(&schedule.get_epoch(slot))
+            .map(|stakes| stakes.ranks.clone())
+    }
+}
+
+/// A set's parts as they arrive, by index, for one generation.
+struct PendingSet<E> {
+    generation: u64,
+    count: u32,
+    parts: BTreeMap<u32, E>,
+}
+
+impl<E> PendingSet<E> {
+    /// The whole set once its last part arrives.
+    fn add(
+        pending: &mut Option<Self>,
+        generation: u64,
+        index: u32,
+        count: u32,
+        part: E,
+    ) -> Option<Vec<E>> {
+        if pending
+            .as_ref()
+            .is_none_or(|held| held.generation != generation)
+        {
+            *pending = Some(Self {
+                generation,
+                count,
+                parts: BTreeMap::new(),
+            });
+        }
+        let held = pending.as_mut()?;
+        held.parts.insert(index, part);
+        if held.parts.len() != usize::try_from(held.count).ok()? {
+            return None;
+        }
+        pending
+            .take()
+            .map(|held| held.parts.into_values().collect())
+    }
+}
 
 /// The node as `node.info` describes it.
 #[derive(Debug, Clone)]
@@ -145,6 +204,7 @@ struct EpochFacts {
     minimum_vat_balance: u64,
     vote_account_rent: u64,
     ticket_short: Option<u64>,
+    vote_reward: Vec<u8>,
 }
 
 impl From<&EpochEvent> for EpochFacts {
@@ -163,6 +223,11 @@ impl From<&EpochEvent> for EpochFacts {
             minimum_vat_balance: event.minimum_vat_balance,
             vote_account_rent: event.vote_account_rent,
             ticket_short: event.has_ticket_short.then_some(event.ticket_short),
+            vote_reward: event
+                .vote_reward
+                .get(..usize::from(event.vote_reward_len))
+                .unwrap_or_default()
+                .to_vec(),
         }
     }
 }
@@ -174,6 +239,7 @@ pub struct MirrorBank {
     identity: Pubkey,
     vote_account: Pubkey,
     votes: Arc<HashMap<Pubkey, VoteRow>>,
+    shared: Shared,
 }
 
 impl BankView for MirrorBank {
@@ -261,14 +327,14 @@ impl BankView for MirrorBank {
             each(row);
         }
     }
-    fn rank_map(&self, _slot: Slot) -> Option<Arc<dyn Ranks>> {
-        None
+    fn rank_map(&self, slot: Slot) -> Option<Arc<dyn Ranks>> {
+        self.shared.rank_map(&self.epoch.schedule, slot)
     }
-    fn epoch_stakes(&self, _epoch: Epoch) -> Option<EpochStakeView> {
-        None
+    fn epoch_stakes(&self, epoch: Epoch) -> Option<EpochStakeView> {
+        self.shared.stakes.get(&epoch).cloned()
     }
-    fn epoch_stakes_from_slot(&self, _slot: Slot) -> Option<EpochStakeView> {
-        None
+    fn epoch_stakes_from_slot(&self, slot: Slot) -> Option<EpochStakeView> {
+        self.epoch_stakes(self.epoch.schedule.get_epoch(slot))
     }
     fn vat_ticket_short(&self, vote: &Pubkey) -> Option<u64> {
         (*vote == self.vote_account)
@@ -282,10 +348,11 @@ impl BankView for MirrorBank {
         self.epoch.vote_account_rent
     }
     fn get_slot_history(&self) -> Option<SlotHistory> {
-        None
+        self.shared.history.as_deref().cloned()
     }
-    fn account_data(&self, _key: &Pubkey) -> Option<Vec<u8>> {
-        None
+    fn account_data(&self, key: &Pubkey) -> Option<Vec<u8>> {
+        (*key == crate::collect::VOTE_REWARD_ACCOUNT && !self.epoch.vote_reward.is_empty())
+            .then(|| self.epoch.vote_reward.clone())
     }
     fn signature_status_slot(&self, _signature: &Signature) -> Option<Slot> {
         None
@@ -301,6 +368,7 @@ pub struct FrozenBank {
     event: BankFrozenEvent,
     epoch: Arc<EpochFacts>,
     votes: Arc<HashMap<Pubkey, VoteRow>>,
+    shared: Shared,
     /// The parent as it froze, without its own parent.
     parent: Option<Arc<FrozenBank>>,
 }
@@ -385,14 +453,14 @@ impl BankView for FrozenBank {
             each(row);
         }
     }
-    fn rank_map(&self, _slot: Slot) -> Option<Arc<dyn Ranks>> {
-        None
+    fn rank_map(&self, slot: Slot) -> Option<Arc<dyn Ranks>> {
+        self.shared.rank_map(&self.epoch.schedule, slot)
     }
-    fn epoch_stakes(&self, _epoch: Epoch) -> Option<EpochStakeView> {
-        None
+    fn epoch_stakes(&self, epoch: Epoch) -> Option<EpochStakeView> {
+        self.shared.stakes.get(&epoch).cloned()
     }
-    fn epoch_stakes_from_slot(&self, _slot: Slot) -> Option<EpochStakeView> {
-        None
+    fn epoch_stakes_from_slot(&self, slot: Slot) -> Option<EpochStakeView> {
+        self.epoch_stakes(self.epoch.schedule.get_epoch(slot))
     }
     fn vat_ticket_short(&self, _vote: &Pubkey) -> Option<u64> {
         None
@@ -404,10 +472,11 @@ impl BankView for FrozenBank {
         self.epoch.vote_account_rent
     }
     fn get_slot_history(&self) -> Option<SlotHistory> {
-        None
+        self.shared.history.as_deref().cloned()
     }
-    fn account_data(&self, _key: &Pubkey) -> Option<Vec<u8>> {
-        None
+    fn account_data(&self, key: &Pubkey) -> Option<Vec<u8>> {
+        (*key == crate::collect::VOTE_REWARD_ACCOUNT && !self.epoch.vote_reward.is_empty())
+            .then(|| self.epoch.vote_reward.clone())
     }
     fn signature_status_slot(&self, _signature: &Signature) -> Option<Slot> {
         None
@@ -442,6 +511,13 @@ struct State {
     ledger: BTreeMap<Slot, LedgerSlot>,
     rooted: BTreeSet<Slot>,
     blocks: BTreeMap<Slot, BlockEvent>,
+    shared: Shared,
+    /// Each full block's non-vote transactions, and whether it was ours.
+    outcomes: BTreeMap<Slot, (bool, Vec<TxOutcome>)>,
+    pending_outcomes: HashMap<Slot, Option<PendingSet<TxOutcomeEvent>>>,
+    versions: BTreeMap<Slot, TxVersions>,
+    pending_admitted: HashMap<Epoch, Option<PendingSet<AdmittedEvent>>>,
+    pending_history: Option<PendingSet<SlotHistoryEvent>>,
 }
 
 pub struct Mirror {
@@ -457,14 +533,22 @@ impl Mirror {
         }
     }
 
-    /// Whether enough has arrived for the collector to start.
+    /// Whether enough has arrived for the collector to start. It reads some things once, as a
+    /// running validator holds them from the start: the vote accounts, this epoch's schedule and
+    /// rank map, and the slot history.
     pub fn ready(&self) -> bool {
         let state = self.state.read().unwrap();
+        let (Some(epoch), Some(working)) = (state.epoch.as_ref(), state.working.as_ref()) else {
+            return false;
+        };
+        let this_epoch = working.epoch;
         state.node.is_some()
             && state.status.is_some()
-            && state.epoch.is_some()
             && state.root.is_some()
-            && state.working.is_some()
+            && !state.votes.is_empty()
+            && state.schedules.contains_key(&this_epoch)
+            && (!epoch.alpenglow || state.shared.stakes.contains_key(&this_epoch))
+            && state.shared.history.is_some()
     }
 
     pub fn apply_node(&self, event: &NodeInfoEvent) {
@@ -529,6 +613,7 @@ impl Mirror {
             event: event.clone(),
             epoch,
             votes: state.votes.clone(),
+            shared: state.shared.clone(),
             parent,
         });
         state.frozen.insert(event.slot, bank.clone());
@@ -540,7 +625,85 @@ impl Mirror {
     }
 
     pub fn apply_rooted(&self, slot: Slot) {
-        self.state.write().unwrap().rooted.insert(slot);
+        let mut state = self.state.write().unwrap();
+        state.rooted.insert(slot);
+        // A root already in the history, as one read after it, is left alone.
+        if let Some(history) = state.shared.history.as_mut()
+            && slot >= history.next_slot
+        {
+            Arc::make_mut(history).add(slot);
+        }
+    }
+
+    pub fn apply_admitted(&self, event: &AdmittedEvent) {
+        let mut state = self.state.write().unwrap();
+        let pending = state.pending_admitted.entry(event.epoch).or_default();
+        let Some(parts) = PendingSet::add(
+            pending,
+            event.generation,
+            event.index,
+            event.count,
+            event.clone(),
+        ) else {
+            return;
+        };
+        let entries: Vec<RankEntry> = parts
+            .iter()
+            .flat_map(|part| {
+                (0..usize::from(part.len)).filter_map(move |at| {
+                    let key = |bytes: &[u8]| {
+                        let start = at.saturating_mul(32);
+                        let slice = bytes.get(start..start.saturating_add(32))?;
+                        Some(Pubkey::new_from_array(slice.try_into().ok()?))
+                    };
+                    Some(RankEntry {
+                        vote: key(&part.votes)?,
+                        identity: key(&part.identities)?,
+                        stake: *part.stakes.get(at)?,
+                    })
+                })
+            })
+            .collect();
+        let total_stake = parts.first().map_or(0, |part| part.total_stake);
+        let mut stakes = BTreeMap::clone(&state.shared.stakes);
+        stakes.insert(
+            event.epoch,
+            EpochStakeView {
+                total_stake,
+                ranks: Arc::new(RankRows::new(entries)),
+            },
+        );
+        while stakes.len() > STAKES_KEPT {
+            stakes.pop_first();
+        }
+        state.shared.stakes = Arc::new(stakes);
+        state.pending_admitted.remove(&event.epoch);
+    }
+
+    pub fn apply_history(&self, event: &SlotHistoryEvent) {
+        use bv::BitsMut;
+        let mut state = self.state.write().unwrap();
+        let Some(parts) = PendingSet::add(
+            &mut state.pending_history,
+            event.generation,
+            event.index,
+            event.count,
+            event.clone(),
+        ) else {
+            return;
+        };
+        let mut history = SlotHistory::default();
+        for part in &parts {
+            let first = usize::try_from(part.first_word).unwrap_or(usize::MAX);
+            for (at, word) in part.words.iter().take(usize::from(part.len)).enumerate() {
+                let position = first.saturating_add(at);
+                if position < history.bits.block_len() {
+                    history.bits.set_block(position, *word);
+                }
+            }
+        }
+        history.next_slot = parts.first().map_or(0, |part| part.next_slot);
+        state.shared.history = Some(Arc::new(history));
     }
 
     pub fn apply_ledger(&self, event: &LedgerSlotEvent) {
@@ -552,6 +715,53 @@ impl Mirror {
                 full: event.full,
             },
         );
+    }
+
+    pub fn apply_outcome(&self, event: &TxOutcomeEvent) {
+        let mut state = self.state.write().unwrap();
+        let pending = state.pending_outcomes.entry(event.slot).or_default();
+        // An empty block's one event completes it.
+        let count = event.count.max(1);
+        let Some(parts) = PendingSet::add(pending, 0, event.index, count, event.clone()) else {
+            return;
+        };
+        state.pending_outcomes.remove(&event.slot);
+        let outcomes = parts
+            .iter()
+            .filter(|part| part.count > 0)
+            .map(|part| TxOutcome {
+                signature: part.has_signature.then(|| Signature::from(part.signature)),
+                payer: Pubkey::new_from_array(part.payer),
+                failed: match part.outcome {
+                    OUTCOME_SUCCEEDED => Some(false),
+                    OUTCOME_FAILED => Some(true),
+                    _ => None,
+                },
+                priority: part.priority_fee,
+                base: part.base_fee,
+            })
+            .collect();
+        state.outcomes.insert(event.slot, (event.ours, outcomes));
+        while state.outcomes.len() > BLOCKS_KEPT {
+            state.outcomes.pop_first();
+        }
+        let floor = event.slot.saturating_sub(LEDGER_KEPT);
+        state.pending_outcomes.retain(|slot, _| *slot >= floor);
+    }
+
+    pub fn apply_versions(&self, event: &MessageVersionsEvent) {
+        let mut state = self.state.write().unwrap();
+        state.versions.insert(
+            event.slot,
+            TxVersions {
+                legacy: event.legacy,
+                v0: event.v0,
+                v1: event.v1,
+            },
+        );
+        while state.versions.len() > BLOCKS_KEPT {
+            state.versions.pop_first();
+        }
     }
 
     pub fn apply_block(&self, event: &BlockEvent) {
@@ -633,6 +843,7 @@ impl Mirror {
             identity: node.map_or_else(Pubkey::default, |node| node.identity),
             vote_account: node.map_or_else(Pubkey::default, |node| node.vote_account),
             votes: state.votes.clone(),
+            shared: state.shared.clone(),
         })
     }
 
@@ -697,6 +908,8 @@ fn empty_epoch() -> EpochEvent {
         vote_account_rent: 0,
         has_ticket_short: false,
         ticket_short: 0,
+        vote_reward_len: 0,
+        vote_reward: [0u8; crate::events::VOTE_REWARD_BYTES],
     }
 }
 
@@ -831,11 +1044,17 @@ impl Source for Mirror {
         state.ledger.get(&slot).and_then(|ledger| ledger.parent)
     }
     fn is_root(&self, slot: Slot) -> bool {
-        self.state.read().unwrap().rooted.contains(&slot)
+        let state = self.state.read().unwrap();
+        state.rooted.contains(&slot)
+            || state.shared.history.as_ref().is_some_and(|history| {
+                matches!(history.check(slot), solana_slot_history::Check::Found)
+            })
     }
+    /// A block reads as full once its transactions have arrived too, which follow its fill.
     fn is_full(&self, slot: Slot) -> bool {
         let state = self.state.read().unwrap();
         state.ledger.get(&slot).is_some_and(|ledger| ledger.full)
+            && state.outcomes.contains_key(&slot)
     }
     fn lowest_slot(&self) -> Slot {
         let state = self.state.read().unwrap();
@@ -848,17 +1067,26 @@ impl Source for Mirror {
             .as_ref()
             .map_or_else(PathBuf::new, |node| node.ledger_path.clone())
     }
-    fn message_versions(&self, _slot: Slot) -> Option<TxVersions> {
-        None
+    fn message_versions(&self, slot: Slot) -> Option<TxVersions> {
+        self.state.read().unwrap().versions.get(&slot).copied()
     }
     fn tx_outcomes(
         &self,
-        _slot: Slot,
+        slot: Slot,
         _bank: &dyn BankView,
-        _ours: bool,
-        _followed: &dyn Fn(&Pubkey) -> bool,
+        ours: bool,
+        followed: &dyn Fn(&Pubkey) -> bool,
     ) -> Option<Vec<TxOutcome>> {
-        None
+        let state = self.state.read().unwrap();
+        let (_, outcomes) = state.outcomes.get(&slot)?;
+        // Another leader's block counts only the payers followed, as in process.
+        Some(
+            outcomes
+                .iter()
+                .filter(|outcome| ours || followed(&outcome.payer))
+                .copied()
+                .collect(),
+        )
     }
     fn block(&self, slot: Slot, root: Slot) -> Block {
         if slot > root {
@@ -995,7 +1223,8 @@ mod tests {
             &identity,
             &vote_account,
         ));
-        assert!(mirror.ready());
+        // Not ready without the vote accounts, schedule and slot history.
+        assert!(!mirror.ready());
 
         assert_eq!(mirror.identity(), identity);
         assert_eq!(mirror.vote_account(), vote_account);
@@ -1044,6 +1273,50 @@ mod tests {
                 ours.minimum_vote_account_balance_for_vat()
             );
         }
+    }
+
+    #[test]
+    fn test_rank_maps_and_slot_history_come_back_whole() {
+        use crate::event_output::{admitted_events, history_events};
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
+        let entries: Vec<RankEntry> = (0..70u64)
+            .map(|stake| RankEntry {
+                vote: Pubkey::new_unique(),
+                identity: Pubkey::new_unique(),
+                stake: stake.saturating_add(1),
+            })
+            .collect();
+        let view = EpochStakeView {
+            total_stake: 9_999,
+            ranks: Arc::new(RankRows::new(entries.clone())),
+        };
+        let mut events = admitted_events(0, 1, &view);
+        assert_eq!(events.len(), 3);
+        // Out of order, and a stale generation's part left over.
+        events.reverse();
+        mirror.apply_admitted(&admitted_events(0, 0, &view)[0]);
+        for event in &events {
+            mirror.apply_admitted(event);
+        }
+        let bank = mirror.working_bank();
+        let ranks = bank.rank_map(5).unwrap();
+        assert_eq!(ranks.len(), 70);
+        assert_eq!(ranks.entry(69), entries.last().copied());
+        assert_eq!(ranks.rank_of(&entries[3].vote), Some(3));
+        assert_eq!(bank.epoch_stakes(0).unwrap().total_stake, 9_999);
+
+        let mut history = SlotHistory::default();
+        for slot in [1, 2, 5, 9, 4_000] {
+            history.add(slot);
+        }
+        for event in history_events(&history, 1) {
+            mirror.apply_history(&event);
+        }
+        mirror.apply_rooted(4_000);
+        mirror.apply_rooted(4_002);
+        let held = mirror.root_bank().get_slot_history().unwrap();
+        history.add(4_002);
+        assert_eq!(held, history);
     }
 
     #[test]
