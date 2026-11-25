@@ -149,9 +149,9 @@ impl<E: Event + Keyed> Resent<E> {
 /// Slots below the highest whose blockstore records are watched.
 const LEDGER_WINDOW: u64 = 64;
 /// How often the rank maps go out whole, besides at turn-on and a new epoch.
-const ADMITTED_EVERY: Duration = Duration::from_secs(30);
+const ADMITTED_EVERY: Duration = Duration::from_secs(5);
 /// How often the slot history goes out whole; roots keep it current in between.
-const HISTORY_EVERY: Duration = Duration::from_secs(30);
+const HISTORY_EVERY: Duration = Duration::from_secs(5);
 /// How often the gossip table goes out whole.
 const PEERS_EVERY: Duration = Duration::from_secs(15);
 /// How often every validator info entry goes out; changes go out as banks freeze.
