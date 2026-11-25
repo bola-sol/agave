@@ -769,9 +769,10 @@ impl Mirror {
                 })
             })
             .collect();
-        // Timings first, so the publisher never pairs a new phase with the old timings.
+        // The phase and its timings under one lock, so the publisher reads them as a pair.
         let mut reported = self.reported.write().unwrap();
         reported.readings = true;
+        reported.progress = Some(progress);
         reported.timings = Some(ReportedTimings {
             phase: phase_name(event.phase).unwrap_or("initializing"),
             phase_elapsed_nanos: event.phase_elapsed_ns,
@@ -805,7 +806,7 @@ impl Mirror {
                         .info
                         .get(&identity)
                         .and_then(|(_, info)| info.name.clone()),
-                    version: part.has_version.then(|| unpack_str(&part.version)),
+                    version: part.seen.then(|| unpack_str(&part.version)),
                     stake: part.activated_stake,
                     seen: part.seen,
                 }
@@ -1621,7 +1622,6 @@ mod tests {
             identity: Pubkey::new_unique().to_bytes(),
             activated_stake: stake,
             seen,
-            has_version: seen,
             version,
         }
     }

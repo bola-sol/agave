@@ -21,7 +21,7 @@ use {
     std::{
         collections::HashMap,
         sync::{Arc, RwLock},
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime},
     },
 };
 
@@ -162,6 +162,8 @@ pub struct Reported {
     /// Whether any reading of the validator's phase has arrived; before one, the phase shown is
     /// only the default.
     pub readings: bool,
+    /// The phase `timings` describe.
+    pub progress: Option<ValidatorStartProgress>,
 }
 
 pub type SharedReported = Arc<RwLock<Reported>>;
@@ -243,6 +245,7 @@ impl StartupPublisher {
             .as_ref()
             .map(|reported| reported.read().unwrap().clone())
             .unwrap_or_default();
+        let progress = reported.progress.unwrap_or(progress);
         if let Some(origin) = reported.timings.as_ref().and_then(|t| t.replay_origin) {
             self.replay_origin = Some(origin);
         }
@@ -266,7 +269,11 @@ impl StartupPublisher {
             stake_percent: phase.stake_percent,
             stake_in_gossip: stake_in_gossip.filter(|_| waiting),
             phase_elapsed_nanos: if self.reported.is_none() || reported.readings {
-                self.elapsed(phase.name, Instant::now())
+                let now = Instant::now();
+                let process_since = crate::host_stats::process_started()
+                    .and_then(|started| SystemTime::now().duration_since(started).ok())
+                    .and_then(|age| now.checked_sub(age));
+                self.elapsed_from(phase.name, now, process_since)
             } else {
                 0
             },
@@ -291,7 +298,13 @@ impl StartupPublisher {
     }
 
     /// Whole seconds, so the debounce does not send four messages a second.
+    #[cfg(test)]
     fn elapsed(&mut self, phase: &str, now: Instant) -> u64 {
+        self.elapsed_from(phase, now, None)
+    }
+
+    /// `process_since` is when the validator's process started, where this process reads another.
+    fn elapsed_from(&mut self, phase: &str, now: Instant, process_since: Option<Instant>) -> u64 {
         match &mut self.current {
             Some((current, since)) if current == phase => whole_seconds(now, *since),
             other => {
@@ -313,11 +326,15 @@ impl StartupPublisher {
                         }),
                     }
                 }
-                // Read from another process, the first phase seen began unseen unless the validator
-                // was only starting; inside the validator every phase is seen from its start.
-                self.witnessed = !first || phase == "initializing" || self.reported.is_none();
-                self.current = Some((phase.to_string(), now));
-                0
+                // Read from another process, the first phase seen began unseen, except initializing,
+                // which began with the validator's process; inside the validator every phase is seen.
+                let since = match process_since {
+                    Some(since) if first && phase == "initializing" => since,
+                    _ => now,
+                };
+                self.witnessed = !first || self.reported.is_none() || since != now;
+                self.current = Some((phase.to_string(), since));
+                whole_seconds(now, since)
             }
         }
     }
@@ -433,6 +450,7 @@ mod tests {
             }),
             gossip: None,
             readings: true,
+            progress: None,
         }))
     }
 
@@ -446,6 +464,34 @@ mod tests {
         publisher.elapsed("running", base + Duration::from_secs(7));
         let taken: Vec<_> = publisher.taken.iter().map(|t| t.phase.as_str()).collect();
         assert_eq!(taken, ["starting_services"]);
+    }
+
+    #[test]
+    fn test_initializing_first_seen_is_timed_from_the_process_start() {
+        let mut publisher = StartupPublisher::default();
+        publisher.report_from(SharedReported::default());
+        let base = Instant::now();
+        let later = base + Duration::from_secs(30);
+        assert_eq!(
+            publisher.elapsed_from("initializing", later, Some(base)),
+            Duration::from_secs(30).as_nanos() as u64
+        );
+        publisher.elapsed_from(
+            "searching_for_rpc_service",
+            later + Duration::from_secs(2),
+            None,
+        );
+        assert_eq!(publisher.taken.len(), 1);
+        assert_eq!(
+            publisher.taken[0].elapsed_nanos,
+            Duration::from_secs(32).as_nanos() as u64
+        );
+
+        let mut unknown_start = StartupPublisher::default();
+        unknown_start.report_from(SharedReported::default());
+        unknown_start.elapsed_from("initializing", base, None);
+        unknown_start.elapsed_from("searching_for_rpc_service", later, None);
+        assert!(unknown_start.taken.is_empty());
     }
 
     #[test]

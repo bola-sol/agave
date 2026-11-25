@@ -165,9 +165,16 @@ fn main() -> ExitCode {
         {
             admin_read = Some(now);
             if let Some(progress) = admin_socket::start_progress(&ledger) {
+                // First, so the first phase can be timed from the validator's start.
+                if admin_pid.is_none() {
+                    admin_pid = admin_socket::pid(&ledger);
+                    // The validator's memory, threads and start time while it starts.
+                    if let Some(pid) = admin_pid {
+                        agave_dashboard::host_stats::read_process(pid);
+                    }
+                }
                 *start_progress.write().unwrap() = progress;
                 mirror.reported().write().unwrap().readings = true;
-                admin_pid = admin_socket::pid(&ledger).or(admin_pid);
             }
         }
         if watch.gone(mirror.validator_pid().or(admin_pid), now) {
@@ -223,7 +230,7 @@ const WATCH_EVERY: Duration = Duration::from_secs(1);
 /// How often the admin socket is asked the start phase.
 const ADMIN_POLL: Duration = Duration::from_millis(250);
 
-/// Follows the process id the node info carries.
+/// Follows the validator's process id, from its node info, start progress or admin socket.
 #[derive(Default)]
 struct ValidatorWatch {
     pid: Option<u32>,
@@ -234,7 +241,7 @@ struct ValidatorWatch {
 }
 
 impl ValidatorWatch {
-    /// True once the watched validator's process has exited, or another validator's node info
+    /// True once the watched validator's process has exited, or another validator's process id
     /// has arrived.
     fn gone(&mut self, pid: Option<u32>, now: Instant) -> bool {
         if self
