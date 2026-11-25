@@ -734,7 +734,7 @@ pub struct Validator {
     pub blockstore: Arc<Blockstore>,
     /// Keep the event directory alive even when no admin RPC metadata or event
     /// producers retain a handle yet.
-    _event_system: EventSystem,
+    event_system: EventSystem,
     pub block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
     pub leader_schedule_cache: Arc<LeaderScheduleCache>,
     pub highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
@@ -1988,7 +1988,7 @@ impl Validator {
             cluster_info,
             bank_forks,
             blockstore,
-            _event_system: event_system,
+            event_system,
             block_commitment_cache,
             leader_schedule_cache,
             highest_finalized,
@@ -2016,6 +2016,11 @@ impl Validator {
     }
 
     /// Monitor registered signal handlers and the validator's exit flag
+    /// The event system the validator's streams are published on.
+    pub fn event_system(&self) -> &EventSystem {
+        &self.event_system
+    }
+
     pub fn listen_for_signals(&self) -> Result<()> {
         info!("Validator::listen_for_signals() has started");
         loop {

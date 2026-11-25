@@ -8,6 +8,8 @@ pub mod collect;
 pub mod config;
 pub mod context;
 pub mod event_input;
+pub mod event_output;
+pub mod events;
 #[cfg(test)]
 pub(crate) mod fixture;
 pub mod geoip;
@@ -15,6 +17,7 @@ pub mod history;
 pub mod host_stats;
 pub mod meters;
 pub mod metrics_tap;
+pub mod mirror;
 pub mod net_ifaces;
 pub mod net_stats;
 pub mod produced;
