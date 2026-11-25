@@ -422,21 +422,22 @@ impl EventOutput {
             }
             return;
         }
-        let generation = match self.info_sent {
+        let mut generation = match self.info_sent {
             Some((_, at)) if now.duration_since(at) < INFO_EVERY => return,
             Some((generation, _)) => generation.saturating_add(1),
             None => 1,
         };
-        self.info_sent = Some((generation, now));
-        // The first set is what the in-process dashboard read at start, so names need no scan.
+        // The first set is what the in-process dashboard holds, so names need not wait for the
+        // scan, which follows as the next set in case the cache was not filled by one.
         if generation == 1 {
             let (slot, entries) = self.info_cache.read().unwrap().entries();
             if !entries.is_empty() {
                 let events = info_events(INFO_FULL_SET, generation, slot, &entries);
                 publish_paced(&mut self.info, &events);
-                return;
+                generation = generation.saturating_add(1);
             }
         }
+        self.info_sent = Some((generation, now));
         let (sender, receiver) = crossbeam_channel::bounded(1);
         let src = src.clone();
         if thread::Builder::new()
