@@ -89,10 +89,10 @@ impl SlotEvent {
     }
 }
 
-/// A bank replay froze, with the counts of this block alone.
+/// A bank replay froze, with the counts of this block alone and the fork's running totals.
 /// The timestamp is monotonic nanoseconds.
 #[event]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BankFrozenEvent {
     pub pid: i32,
     pub tid: i32,
@@ -115,6 +115,10 @@ pub struct BankFrozenEvent {
     /// Base and priority fees, in lamports.
     pub total_fee: u64,
     pub priority_fee: u64,
+    pub block_height: u64,
+    /// The fork's running totals, as the bank keeps them.
+    pub transaction_count_total: u64,
+    pub non_vote_transaction_count_total: u64,
 }
 
 impl BankFrozenEvent {
@@ -152,6 +156,9 @@ impl BankFrozenEvent {
             account_cost_limit,
             total_fee: fee_details.total_transaction_fee(),
             priority_fee: fee_details.total_priority_fee(),
+            block_height: bank.block_height(),
+            transaction_count_total: bank.transaction_count(),
+            non_vote_transaction_count_total: bank.non_vote_transaction_count_since_restart(),
         }
     }
 }

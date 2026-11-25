@@ -5,10 +5,18 @@ use {
     crate::{
         collect::EpochInfo,
         events::{
-            EPOCH_STREAM, EpochEvent, NODE_INFO_STREAM, NodeInfoEvent, SLOT_CLOCK_STREAM,
+            BLOCK_STREAM, BlockEvent, EPOCH_STREAM, EpochEvent, LEDGER_SLOT_STREAM,
+            LedgerSlotEvent, NODE_INFO_STREAM, NodeInfoEvent, SLOT_CLOCK_STREAM,
             SLOT_STATUS_STREAM, START_PROGRESS_STREAM, SlotClockEvent, SlotStatusEvent,
             StartProgressEvent,
         },
+        metric_events::{
+            METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
+            METRIC_ONCE_STREAM, METRIC_SLOT_STREAM, METRIC_TPU_STREAM, METRIC_VOTOR_STREAM,
+            MetricAccounts, MetricEvent, MetricGossip, MetricLeader, MetricNet, MetricOnce,
+            MetricSlot, MetricTpu, MetricVotor,
+        },
+        metrics_tap::MetricsTap,
         mirror::Mirror,
     },
     agave_event_system::{
@@ -88,7 +96,30 @@ stamped!(
     StartProgressEvent,
     SlotStatusEvent,
     EpochEvent,
-    SlotClockEvent
+    SlotClockEvent,
+    LedgerSlotEvent,
+    BlockEvent
+);
+
+macro_rules! stamped_metric {
+    ($($event:ty),*) => {$(
+        impl Stamped for $event {
+            fn timestamp_ns(&self) -> u64 {
+                MetricEvent::timestamp_ns(self)
+            }
+        }
+    )*};
+}
+
+stamped_metric!(
+    MetricSlot,
+    MetricLeader,
+    MetricVotor,
+    MetricTpu,
+    MetricNet,
+    MetricAccounts,
+    MetricGossip,
+    MetricOnce
 );
 
 impl Stamped for LeaderScheduleEvent {
@@ -441,12 +472,24 @@ pub struct SlotProgress {
 
 const QUEUE_CHECK: Duration = Duration::from_secs(2);
 
+/// A metric event as its datapoint, for one closure over every row.
+trait MetricPoint {
+    fn point(&self) -> (solana_metrics::datapoint::DataPoint, u64);
+}
+
+impl<E: MetricEvent> MetricPoint for E {
+    fn point(&self) -> (solana_metrics::datapoint::DataPoint, u64) {
+        self.to_point()
+    }
+}
+
 /// Every subscription, feeding the mirror.
 pub struct EventInput {
     dir: PathBuf,
     checked: Option<Instant>,
     started: Instant,
     mirror: Arc<Mirror>,
+    tap: Arc<MetricsTap>,
     pub slot_events: Stream<SlotEvent>,
     pub bank_frozen: Stream<BankFrozenEvent>,
     pub shred_fetch: Stream<ShredFetchCounters>,
@@ -457,6 +500,16 @@ pub struct EventInput {
     pub status: Stream<SlotStatusEvent>,
     pub epoch: Stream<EpochEvent>,
     pub clock: Stream<SlotClockEvent>,
+    pub ledger: Stream<LedgerSlotEvent>,
+    pub blocks: Stream<BlockEvent>,
+    pub metric_slot: Stream<MetricSlot>,
+    pub metric_leader: Stream<MetricLeader>,
+    pub metric_votor: Stream<MetricVotor>,
+    pub metric_tpu: Stream<MetricTpu>,
+    pub metric_net: Stream<MetricNet>,
+    pub metric_accounts: Stream<MetricAccounts>,
+    pub metric_gossip: Stream<MetricGossip>,
+    pub metric_once: Stream<MetricOnce>,
     pub slots: SlotProgress,
     /// Newest totals per path, turbine first.
     pub shred_totals: [Option<ShredFetchCounters>; 2],
@@ -467,12 +520,13 @@ pub struct EventInput {
 }
 
 impl EventInput {
-    pub fn new(dir: PathBuf, mirror: Arc<Mirror>) -> Self {
+    pub fn new(dir: PathBuf, mirror: Arc<Mirror>, tap: Arc<MetricsTap>) -> Self {
         Self {
             dir,
             checked: None,
             started: Instant::now(),
             mirror,
+            tap,
             slot_events: Stream::new(SLOT_EVENT_STREAM),
             bank_frozen: Stream::new(BANK_FROZEN_STREAM),
             shred_fetch: Stream::new(SHRED_FETCH_STREAM),
@@ -483,6 +537,16 @@ impl EventInput {
             status: Stream::new(SLOT_STATUS_STREAM),
             epoch: Stream::new(EPOCH_STREAM),
             clock: Stream::new(SLOT_CLOCK_STREAM),
+            ledger: Stream::new(LEDGER_SLOT_STREAM),
+            blocks: Stream::new(BLOCK_STREAM),
+            metric_slot: Stream::new(METRIC_SLOT_STREAM),
+            metric_leader: Stream::new(METRIC_LEADER_STREAM),
+            metric_votor: Stream::new(METRIC_VOTOR_STREAM),
+            metric_tpu: Stream::new(METRIC_TPU_STREAM),
+            metric_net: Stream::new(METRIC_NET_STREAM),
+            metric_accounts: Stream::new(METRIC_ACCOUNTS_STREAM),
+            metric_gossip: Stream::new(METRIC_GOSSIP_STREAM),
+            metric_once: Stream::new(METRIC_ONCE_STREAM),
             slots: SlotProgress::default(),
             shred_totals: [None, None],
             votes: VoteSet::default(),
@@ -518,6 +582,16 @@ impl EventInput {
         self.status.connect(dir, &explorer);
         self.epoch.connect(dir, &explorer);
         self.clock.connect(dir, &explorer);
+        self.ledger.connect(dir, &explorer);
+        self.blocks.connect(dir, &explorer);
+        self.metric_slot.connect(dir, &explorer);
+        self.metric_leader.connect(dir, &explorer);
+        self.metric_votor.connect(dir, &explorer);
+        self.metric_tpu.connect(dir, &explorer);
+        self.metric_net.connect(dir, &explorer);
+        self.metric_accounts.connect(dir, &explorer);
+        self.metric_gossip.connect(dir, &explorer);
+        self.metric_once.connect(dir, &explorer);
     }
 
     pub fn disconnect(&mut self) {
@@ -531,10 +605,21 @@ impl EventInput {
         self.status.disconnect();
         self.epoch.disconnect();
         self.clock.disconnect();
+        self.ledger.disconnect();
+        self.blocks.disconnect();
+        self.metric_slot.disconnect();
+        self.metric_leader.disconnect();
+        self.metric_votor.disconnect();
+        self.metric_tpu.disconnect();
+        self.metric_net.disconnect();
+        self.metric_accounts.disconnect();
+        self.metric_gossip.disconnect();
+        self.metric_once.disconnect();
     }
 
     pub fn drain(&mut self) {
         let slots = &mut self.slots;
+        let mut rooted = Vec::new();
         self.slot_events.drain(|event| match event {
             SlotEvent::Begin { .. } => slots.begun = slots.begun.saturating_add(1),
             SlotEvent::ExecutionFinished {
@@ -547,10 +632,19 @@ impl EventInput {
                 slots.newest_finished = slots.newest_finished.max(slot);
             }
             SlotEvent::Removed { .. } => slots.removed = slots.removed.saturating_add(1),
-            SlotEvent::Rooted { slot, .. } => slots.root = slots.root.max(slot),
+            SlotEvent::Rooted { slot, .. } => {
+                slots.root = slots.root.max(slot);
+                rooted.push(slot);
+            }
         });
+        for slot in rooted {
+            self.mirror.apply_rooted(slot);
+        }
 
-        self.bank_frozen.drain(|_| {});
+        let mirror = &self.mirror;
+        self.bank_frozen.drain(|event| mirror.apply_frozen(&event));
+        self.ledger.drain(|event| mirror.apply_ledger(&event));
+        self.blocks.drain(|event| mirror.apply_block(&event));
 
         let shred_totals = &mut self.shred_totals;
         self.shred_fetch.drain(|event| {
@@ -564,6 +658,20 @@ impl EventInput {
         self.status.drain(|event| mirror.apply_status(&event));
         self.epoch.drain(|event| mirror.apply_epoch(&event));
         self.clock.drain(|event| mirror.apply_clock(&event));
+
+        let tap = &self.tap;
+        let observe = |event: &dyn MetricPoint| {
+            let (point, observed_ms) = event.point();
+            tap.observe_external(&point, observed_ms);
+        };
+        self.metric_slot.drain(|event| observe(&event));
+        self.metric_leader.drain(|event| observe(&event));
+        self.metric_votor.drain(|event| observe(&event));
+        self.metric_tpu.drain(|event| observe(&event));
+        self.metric_net.drain(|event| observe(&event));
+        self.metric_accounts.drain(|event| observe(&event));
+        self.metric_gossip.drain(|event| observe(&event));
+        self.metric_once.drain(|event| observe(&event));
 
         let votes = &mut self.votes;
         let mut votes_changed = false;
@@ -632,7 +740,17 @@ impl EventInput {
             progress,
             status,
             epoch,
-            clock
+            clock,
+            ledger,
+            blocks,
+            metric_slot,
+            metric_leader,
+            metric_votor,
+            metric_tpu,
+            metric_net,
+            metric_accounts,
+            metric_gossip,
+            metric_once
         );
         let _ = writeln!(
             out,

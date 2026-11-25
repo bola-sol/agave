@@ -9,11 +9,19 @@ use {
         events::{
             ACCOUNT_PATHS, ADDR_ALPENGLOW, ADDR_BYTES, ADDR_GOSSIP, ADDR_RPC,
             ADDR_SERVE_REPAIR_UDP, ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC,
-            ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, ADDRS, EPOCH_STREAM, EpochEvent, NODE_INFO_STREAM,
-            NodeInfoEvent, PATH_BYTES, ROLE_ROOT, ROLE_WORKING, SLOT_CLOCK_STREAM,
-            SLOT_STATUS_STREAM, START_PROGRESS_STREAM, SlotClockEvent, SlotStatusEvent,
-            StartProgressEvent, pack_addr, pack_path, pack_str,
+            ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, ADDRS, BITMAP_BYTES, BLOCK_FOOTER, BLOCK_MISSING,
+            BLOCK_OPAQUE, BLOCK_STREAM, BlockEvent, EPOCH_STREAM, EpochEvent, LEDGER_SLOT_STREAM,
+            LedgerSlotEvent, NODE_INFO_STREAM, NodeInfoEvent, PATH_BYTES, ROLE_ROOT, ROLE_WORKING,
+            SLOT_CLOCK_STREAM, SLOT_STATUS_STREAM, START_PROGRESS_STREAM, SlotClockEvent,
+            SlotStatusEvent, StartProgressEvent, pack_addr, pack_path, pack_str,
         },
+        metric_events::{
+            METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
+            METRIC_ONCE_STREAM, METRIC_SLOT_STREAM, METRIC_TPU_STREAM, METRIC_VOTOR_STREAM,
+            MetricAccounts, MetricEvent, MetricGossip, MetricLeader, MetricNet, MetricOnce,
+            MetricSlot, MetricTpu, MetricVotor,
+        },
+        metrics_tap::MetricsTap,
         source::{BankView, Source},
     },
     agave_event_system::{
@@ -24,6 +32,7 @@ use {
     },
     agave_snapshots::SnapshotInterval,
     solana_core::validator::ValidatorStartProgress,
+    solana_metrics::datapoint::DataPoint,
     solana_vote_interface::state::VoteStateV4,
     std::{
         io,
@@ -143,7 +152,18 @@ impl<E: Event + Keyed> Resent<E> {
     }
 }
 
+/// Slots below the highest whose blockstore records are watched.
+const LEDGER_WINDOW: u64 = 64;
+/// Blocks read per tick behind the root.
+const BLOCKS_PER_TICK: u64 = 64;
+
 pub struct EventOutput {
+    ledger: Publisher<LedgerSlotEvent>,
+    /// What has been sent of each watched slot: its first shred, and that it filled.
+    ledger_sent: std::collections::BTreeMap<solana_clock::Slot, (bool, bool)>,
+    blocks: Publisher<BlockEvent>,
+    /// The next rooted slot whose block goes out.
+    next_block: Option<solana_clock::Slot>,
     node: Resent<NodeInfoEvent>,
     progress: Resent<StartProgressEvent>,
     status: Resent<SlotStatusEvent>,
@@ -159,6 +179,10 @@ impl EventOutput {
             return Err(io::Error::other("no publishers"));
         };
         Ok(Self {
+            ledger: stream(event_system, LEDGER_SLOT_STREAM, 1024)?,
+            ledger_sent: std::collections::BTreeMap::new(),
+            blocks: stream(event_system, BLOCK_STREAM, 512)?,
+            next_block: None,
             node: Resent::new(stream(event_system, NODE_INFO_STREAM, 16)?),
             progress: Resent::new(stream(event_system, START_PROGRESS_STREAM, 64)?),
             status: Resent::new(stream(event_system, SLOT_STATUS_STREAM, 256)?),
@@ -187,6 +211,8 @@ impl EventOutput {
 
     fn tick(&mut self, src: &dyn Source, start_progress: &StartProgress) {
         let now = Instant::now();
+        self.send_ledger(src);
+        self.send_blocks(src);
         if self.progress.enabled() {
             let progress = *start_progress.read().unwrap();
             self.progress.offer(progress_event(progress), now);
@@ -227,6 +253,116 @@ impl EventOutput {
             );
         }
     }
+}
+
+impl EventOutput {
+    /// Each watched slot once its first shred arrives, and again once it fills.
+    fn send_ledger(&mut self, src: &dyn Source) {
+        if !self.ledger.is_enabled() {
+            self.ledger_sent.clear();
+            return;
+        }
+        let highest = src
+            .highest_slot()
+            .max(src.cluster_tip().unwrap_or_default());
+        let from = highest.saturating_sub(LEDGER_WINDOW);
+        self.ledger_sent = self.ledger_sent.split_off(&from);
+        for slot in from..=highest {
+            let (first_sent, full_sent) = self.ledger_sent.get(&slot).copied().unwrap_or_default();
+            if full_sent {
+                continue;
+            }
+            let Some(first_shred_ms) = src.first_shred_time(slot) else {
+                continue;
+            };
+            let full = src.is_full(slot);
+            if first_sent && !full {
+                continue;
+            }
+            let parent = src.parent_of(slot);
+            let (pid, tid, timestamp_ns) = header();
+            let _ = self.ledger.publish(&LedgerSlotEvent {
+                pid,
+                tid,
+                timestamp_ns,
+                slot,
+                has_parent: parent.is_some(),
+                parent_slot: parent.unwrap_or_default(),
+                first_shred_ms,
+                full,
+            });
+            self.ledger_sent.insert(slot, (true, full));
+        }
+    }
+
+    /// Each rooted slot's block, from the root at turn-on.
+    fn send_blocks(&mut self, src: &dyn Source) {
+        if !self.blocks.is_enabled() {
+            self.next_block = None;
+            return;
+        }
+        let root = src.commitment().root.max(src.root_bank().slot());
+        let next = *self.next_block.get_or_insert(root);
+        let last = root.min(next.saturating_add(BLOCKS_PER_TICK).saturating_sub(1));
+        for slot in next..=last {
+            let _ = self
+                .blocks
+                .publish(&block_event(slot, src.block(slot, root)));
+        }
+        if last >= next {
+            self.next_block = Some(last.saturating_add(1));
+        }
+    }
+}
+
+fn block_event(slot: solana_clock::Slot, block: crate::certs::Block) -> BlockEvent {
+    let (pid, tid, timestamp_ns) = header();
+    let mut event = BlockEvent {
+        pid,
+        tid,
+        timestamp_ns,
+        slot,
+        kind: BLOCK_OPAQUE,
+        close_nanos: 0,
+        has_notar: false,
+        notar_len: 0,
+        notar: [0u8; BITMAP_BYTES],
+        has_skip: false,
+        skip_len: 0,
+        skip: [0u8; BITMAP_BYTES],
+        has_fast: false,
+        fast: false,
+    };
+    let pack = |bitmap: &[u8], into: &mut [u8; BITMAP_BYTES]| -> Option<u16> {
+        into.get_mut(..bitmap.len())?.copy_from_slice(bitmap);
+        u16::try_from(bitmap.len()).ok()
+    };
+    match block {
+        crate::certs::Block::Missing => event.kind = BLOCK_MISSING,
+        crate::certs::Block::Pending | crate::certs::Block::Opaque => {}
+        crate::certs::Block::Footer(footer) => {
+            let notar = match &footer.notar_bitmap {
+                Some(bitmap) => pack(bitmap, &mut event.notar).map(Some),
+                None => Some(None),
+            };
+            let skip = match &footer.skip_bitmap {
+                Some(bitmap) => pack(bitmap, &mut event.skip).map(Some),
+                None => Some(None),
+            };
+            // A bitmap too long for the event leaves the block unread, as an unreadable one does.
+            if let (Some(notar), Some(skip)) = (notar, skip) {
+                event.kind = BLOCK_FOOTER;
+                event.close_nanos = footer.close_nanos;
+                event.has_notar = notar.is_some();
+                event.notar_len = notar.unwrap_or(0);
+                event.has_skip = skip.is_some();
+                event.skip_len = skip.unwrap_or(0);
+                event.has_fast = footer.fast.is_some();
+                event.fast = footer.fast.unwrap_or(false);
+            }
+        }
+    }
+    event
 }
 
 fn header() -> (i32, i32, u64) {
@@ -430,5 +566,96 @@ pub(crate) fn clock_event(
         priority_fees: fees.priority,
         identity_balance: bank.get_balance(identity),
         vote_balance: bank.get_balance(vote_account),
+    }
+}
+
+/// Publishes the datapoints the tap forwards, each on its row's stream.
+pub struct MetricOutput {
+    slot: Publisher<MetricSlot>,
+    leader: Publisher<MetricLeader>,
+    votor: Publisher<MetricVotor>,
+    tpu: Publisher<MetricTpu>,
+    net: Publisher<MetricNet>,
+    accounts: Publisher<MetricAccounts>,
+    gossip: Publisher<MetricGossip>,
+    once: Publisher<MetricOnce>,
+}
+
+impl MetricOutput {
+    pub fn new(event_system: &EventSystem) -> io::Result<Self> {
+        Ok(Self {
+            slot: stream(event_system, METRIC_SLOT_STREAM, 4096)?,
+            // Workers report every 20 ms each.
+            leader: stream(event_system, METRIC_LEADER_STREAM, 8192)?,
+            // Votor reports every vote account at once.
+            votor: stream(event_system, METRIC_VOTOR_STREAM, 8192)?,
+            tpu: stream(event_system, METRIC_TPU_STREAM, 1024)?,
+            net: stream(event_system, METRIC_NET_STREAM, 1024)?,
+            accounts: stream(event_system, METRIC_ACCOUNTS_STREAM, 2048)?,
+            gossip: stream(event_system, METRIC_GOSSIP_STREAM, 256)?,
+            once: stream(event_system, METRIC_ONCE_STREAM, 16)?,
+        })
+    }
+
+    /// Runs on its own thread until `exit`, turning the tap's forwarding on while any stream is.
+    pub fn spawn(
+        mut self,
+        tap: Arc<MetricsTap>,
+        points: crossbeam_channel::Receiver<(DataPoint, u64)>,
+        exit: Arc<AtomicBool>,
+    ) -> io::Result<JoinHandle<()>> {
+        thread::Builder::new()
+            .name("solEvtMetric".to_string())
+            .spawn(move || {
+                let mut checked = Instant::now();
+                tap.set_forwarding(self.enabled());
+                while !exit.load(Ordering::Relaxed) {
+                    match points.recv_timeout(TICK) {
+                        Ok((point, observed_ms)) => self.publish(&point, observed_ms),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                    if checked.elapsed() >= TICK {
+                        checked = Instant::now();
+                        tap.set_forwarding(self.enabled());
+                    }
+                }
+                tap.set_forwarding(false);
+            })
+    }
+
+    fn enabled(&mut self) -> bool {
+        // Every stream is asked, so each one's turn-on is seen.
+        [
+            self.slot.is_enabled(),
+            self.leader.is_enabled(),
+            self.votor.is_enabled(),
+            self.tpu.is_enabled(),
+            self.net.is_enabled(),
+            self.accounts.is_enabled(),
+            self.gossip.is_enabled(),
+            self.once.is_enabled(),
+        ]
+        .contains(&true)
+    }
+
+    fn publish(&mut self, point: &DataPoint, observed_ms: u64) {
+        if let Some(event) = MetricSlot::from_point(point, observed_ms) {
+            let _ = self.slot.publish(&event);
+        } else if let Some(event) = MetricLeader::from_point(point, observed_ms) {
+            let _ = self.leader.publish(&event);
+        } else if let Some(event) = MetricVotor::from_point(point, observed_ms) {
+            let _ = self.votor.publish(&event);
+        } else if let Some(event) = MetricTpu::from_point(point, observed_ms) {
+            let _ = self.tpu.publish(&event);
+        } else if let Some(event) = MetricNet::from_point(point, observed_ms) {
+            let _ = self.net.publish(&event);
+        } else if let Some(event) = MetricAccounts::from_point(point, observed_ms) {
+            let _ = self.accounts.publish(&event);
+        } else if let Some(event) = MetricGossip::from_point(point, observed_ms) {
+            let _ = self.gossip.publish(&event);
+        } else if let Some(event) = MetricOnce::from_point(point, observed_ms) {
+            let _ = self.once.publish(&event);
+        }
     }
 }

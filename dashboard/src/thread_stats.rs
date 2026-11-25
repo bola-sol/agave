@@ -1,5 +1,5 @@
-//! Where each of the validator's threads spent the last second, from
-//! `/proc/self/task`.
+//! Where each of the validator's threads spent the last second, from its `/proc` task
+//! entries.
 
 use {
     serde::Serialize,
@@ -36,7 +36,7 @@ pub struct ThreadGroup {
 pub fn read(known: Option<&HashMap<u64, ThreadReading>>) -> io::Result<Vec<ThreadReading>> {
     let mut threads = Vec::new();
     let mut buf = [0u8; 128];
-    for entry in std::fs::read_dir("/proc/self/task")?.flatten() {
+    for entry in std::fs::read_dir(format!("{}/task", crate::host_stats::proc_dir()))?.flatten() {
         let Some(tid) = entry
             .file_name()
             .to_str()
@@ -85,7 +85,11 @@ pub fn read(_known: Option<&HashMap<u64, ThreadReading>>) -> io::Result<Vec<Thre
 
 #[cfg(target_os = "linux")]
 pub fn cores_allowed(tid: u64) -> Option<String> {
-    let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).ok()?;
+    let status = std::fs::read_to_string(format!(
+        "{}/task/{tid}/status",
+        crate::host_stats::proc_dir()
+    ))
+    .ok()?;
     parse_cpus_allowed(&status)
 }
 
