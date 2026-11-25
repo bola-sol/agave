@@ -2257,7 +2257,8 @@ impl Collector {
             self.trailed_cluster = true;
             return;
         }
-        if !self.trailed_cluster {
+        // Read from another process, the node's own time is waited for, so both pages agree.
+        if !self.trailed_cluster || self.src.reports_caught_up() {
             return;
         }
         self.latch_caught_up(timestamp());
