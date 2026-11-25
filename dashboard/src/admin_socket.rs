@@ -39,8 +39,9 @@ fn call(ledger: &Path, method: &str) -> Option<serde_json::Value> {
             return None;
         }
         reply.extend_from_slice(buffer.get(..read)?);
-        if let Some(result) = result_of(&reply) {
-            return Some(result);
+        // A whole reply ends the read, an error included.
+        if let Some(mut whole) = whole_reply(&reply) {
+            return whole.get_mut("result").map(serde_json::Value::take);
         }
         if reply.len() > MOST_BYTES {
             return None;
@@ -48,14 +49,12 @@ fn call(ledger: &Path, method: &str) -> Option<serde_json::Value> {
     }
 }
 
-/// The reply's `result` once the bytes hold a whole JSON object.
-fn result_of(reply: &[u8]) -> Option<serde_json::Value> {
-    let mut parsed = serde_json::Deserializer::from_slice(reply).into_iter::<serde_json::Value>();
-    parsed
+/// The reply once the bytes hold a whole JSON object.
+fn whole_reply(reply: &[u8]) -> Option<serde_json::Value> {
+    serde_json::Deserializer::from_slice(reply)
+        .into_iter::<serde_json::Value>()
         .next()?
-        .ok()?
-        .get_mut("result")
-        .map(serde_json::Value::take)
+        .ok()
 }
 
 #[cfg(test)]
@@ -64,11 +63,13 @@ mod tests {
 
     #[test]
     fn test_a_reply_is_read_once_whole() {
-        assert_eq!(result_of(br#"{"jsonrpc":"2.0","res"#), None);
+        assert_eq!(whole_reply(br#"{"jsonrpc":"2.0","res"#), None);
         assert_eq!(
-            result_of(b"{\"jsonrpc\":\"2.0\",\"result\":42,\"id\":1}\n"),
+            whole_reply(b"{\"jsonrpc\":\"2.0\",\"result\":42,\"id\":1}\n")
+                .and_then(|reply| reply.get("result").cloned()),
             Some(serde_json::json!(42))
         );
+        assert!(whole_reply(br#"{"jsonrpc":"2.0","error":{"code":-32601},"id":1}"#).is_some());
     }
 
     #[test]
