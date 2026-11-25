@@ -155,7 +155,7 @@ const HISTORY_EVERY: Duration = Duration::from_secs(30);
 /// How often the gossip table goes out whole.
 const PEERS_EVERY: Duration = Duration::from_secs(15);
 /// How often every validator info entry goes out; changes go out as banks freeze.
-const INFO_EVERY: Duration = Duration::from_secs(600);
+const INFO_EVERY: Duration = Duration::from_secs(60);
 /// How often points sent once an hour, a run or an epoch go again, for a subscriber that missed them.
 const LATCHED_EVERY: Duration = Duration::from_secs(60);
 /// Set events sent before a pause, so a set larger than its stream arrives whole.
@@ -169,7 +169,7 @@ pub struct EventOutput {
     peers_sent: Option<(u64, Instant)>,
     info: Publisher<ValidatorInfoEvent>,
     info_sent: Option<(u64, Instant)>,
-    /// The names the in-process dashboard read before the validator ran, sent as the first set.
+    /// The names the in-process dashboard holds, sent whole every `INFO_EVERY`.
     info_cache: Arc<std::sync::RwLock<crate::validator_info::ValidatorInfoCache>>,
     /// When the in-process collector saw the node catch up, unix milliseconds, 0 before.
     caught_up: Arc<std::sync::atomic::AtomicU64>,
@@ -177,8 +177,6 @@ pub struct EventOutput {
     /// Frozen banks already read for finalization and validator info changes; `None` while both
     /// streams are off.
     frozen_seen: Option<std::collections::BTreeSet<solana_clock::Slot>>,
-    /// The full validator info scan, run off this thread.
-    info_scan: Option<crossbeam_channel::Receiver<InfoScan>>,
     outcomes: Publisher<TxOutcomeEvent>,
     versions: Publisher<MessageVersionsEvent>,
     /// Frozen banks whose blocks are not yet full, held for their transactions' results.
@@ -222,7 +220,6 @@ impl EventOutput {
             caught_up,
             finalization: stream(event_system, FINALIZATION_STREAM, 1024)?,
             frozen_seen: None,
-            info_scan: None,
             outcomes: stream(event_system, TX_OUTCOME_STREAM, 65_536)?,
             versions: stream(event_system, MESSAGE_VERSIONS_STREAM, 256)?,
             held: std::collections::BTreeMap::new(),
@@ -268,7 +265,7 @@ impl EventOutput {
         self.send_history(src, now);
         self.send_blocks_read(src);
         self.send_peers(src, now);
-        self.send_info(held_src, now);
+        self.send_info(now);
         self.send_frozen_reads(src);
         if self.node.enabled() {
             self.node
@@ -403,52 +400,26 @@ impl EventOutput {
 
     /// Every validator info entry, at turn-on and every ten minutes. The scan can take minutes on
     /// a real cluster, so it runs on a thread of its own and goes out when it finishes.
-    fn send_info(&mut self, src: &Arc<dyn Source>, now: Instant) {
-        // A scan in flight is kept, so turning the stream off and on starts no second one.
+    /// Every name the in-process dashboard holds, which its own scan at attach filled and frozen
+    /// banks keep current, so a subscriber that joins late waits at most `INFO_EVERY`.
+    fn send_info(&mut self, now: Instant) {
         if !self.info.is_enabled() {
             self.info_sent = None;
             return;
         }
-        if let Some(scan) = &self.info_scan {
-            match scan.try_recv() {
-                Ok((slot, entries)) => {
-                    self.info_scan = None;
-                    let generation = self.info_sent.map_or(0, |(generation, _)| generation);
-                    let events = info_events(INFO_FULL_SET, generation, slot, &entries);
-                    publish_paced(&mut self.info, &events);
-                }
-                Err(crossbeam_channel::TryRecvError::Empty) => {}
-                Err(crossbeam_channel::TryRecvError::Disconnected) => self.info_scan = None,
-            }
-            return;
-        }
-        let mut generation = match self.info_sent {
+        let generation = match self.info_sent {
             Some((_, at)) if now.duration_since(at) < INFO_EVERY => return,
             Some((generation, _)) => generation.saturating_add(1),
             None => 1,
         };
-        // The first set is what the in-process dashboard holds, so names need not wait for the
-        // scan, which follows as the next set in case the cache was not filled by one.
-        if generation == 1 {
-            let (slot, entries) = self.info_cache.read().unwrap().entries();
-            if !entries.is_empty() {
-                let events = info_events(INFO_FULL_SET, generation, slot, &entries);
-                publish_paced(&mut self.info, &events);
-                generation = generation.saturating_add(1);
-            }
+        let (slot, entries) = self.info_cache.read().unwrap().entries();
+        // Tried again next tick until the dashboard's scan has read some.
+        if entries.is_empty() {
+            return;
         }
+        let events = info_events(INFO_FULL_SET, generation, slot, &entries);
+        publish_paced(&mut self.info, &events);
         self.info_sent = Some((generation, now));
-        let (sender, receiver) = crossbeam_channel::bounded(1);
-        let src = src.clone();
-        if thread::Builder::new()
-            .name("solEvtInfo".to_string())
-            .spawn(move || {
-                let _ = sender.send(src.validator_info_all());
-            })
-            .is_ok()
-        {
-            self.info_scan = Some(receiver);
-        }
     }
 
     /// Each new frozen bank's finalization reading and the validator info entries it changed.
@@ -698,12 +669,6 @@ pub(crate) fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEven
     }
     Some(event)
 }
-
-/// The full validator info scan's result: the slot read at and every entry.
-type InfoScan = (
-    solana_clock::Slot,
-    Vec<(solana_pubkey::Pubkey, crate::validator_info::ValidatorInfo)>,
-);
 
 /// A block's outcomes, or one empty event where it had none.
 fn outcome_events(
