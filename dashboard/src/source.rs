@@ -523,6 +523,8 @@ pub trait Source: Send + Sync {
     fn snapshot_slots(&self, keys: &[Pubkey]) -> Vec<(Option<Slot>, Option<Slot>)>;
     /// Peers advertising an RPC address gossip would accept, ourselves excluded.
     fn rpc_node_count(&self, peers: &[(PeerRow, u64)]) -> usize;
+    /// Whether gossip accepts only globally routable addresses.
+    fn global_addresses_only(&self) -> bool;
     fn banks(&self) -> Banks;
     fn root_bank(&self) -> Arc<dyn BankView>;
     fn working_bank(&self) -> Arc<dyn BankView>;
@@ -641,6 +643,12 @@ impl Source for Direct {
     }
     fn rpc_node_count(&self, peers: &[(PeerRow, u64)]) -> usize {
         crate::collect::count_rpc_nodes(&self.ctx.cluster_info, peers)
+    }
+    fn global_addresses_only(&self) -> bool {
+        matches!(
+            self.ctx.cluster_info.socket_addr_space(),
+            solana_net_utils::SocketAddrSpace::Global
+        )
     }
     fn banks(&self) -> Banks {
         // Held only to clone the handles out: replay takes this lock to advance.

@@ -146,6 +146,7 @@ fn main() -> ExitCode {
         input.drain();
         // The collector starts once the node, its banks and the epoch have arrived.
         if !attached && mirror.ready() {
+            mirror.drop_backlog();
             match service.attach_source(mirror.clone()) {
                 Ok(()) => {
                     attached = true;
