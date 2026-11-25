@@ -2303,6 +2303,43 @@ mod tests {
     }
 
     #[test]
+    fn test_only_an_unreadable_block_near_the_root_is_held() {
+        use crate::event_output::Settle;
+        let now = std::time::Instant::now();
+        let mut settle = Settle::default();
+        assert!(settle.holds(24, 31, &Block::Opaque, now));
+        let mut settle = Settle::default();
+        assert!(!settle.holds(4, 31, &Block::Opaque, now));
+        assert!(!settle.holds(24, 31, &Block::Missing, now));
+        assert!(!settle.holds(24, 31, &footer(1), now));
+    }
+
+    #[test]
+    fn test_old_unreadable_slots_of_ours_are_read_in_one_go() {
+        use crate::{event_output::OwnBlocks, events::BLOCK_OPAQUE};
+        let (mirror, me) = own_mirror();
+        mirror.set_own_blocks_connected(false, false);
+        let harness = fixture();
+        let direct = Direct::new(harness.ctx.clone(), None);
+        mirror.apply_status(&SlotStatusEvent {
+            lowest_slot: 8,
+            ..status_event(&direct)
+        });
+        // 4 to 7 read as skipped under the ledger's first slot, 8 to 11 unreadable, 24 to 27 held.
+        for slot in (4..=7).chain(24..=27) {
+            mirror.apply_block(&crate::event_output::block_event(slot, Block::Missing));
+        }
+        let bank = mirror.root_bank();
+        let mut own = OwnBlocks::new(&mirror, bank.as_ref(), (0, me)).unwrap();
+        assert!(own.read_to(&mirror, 31, std::time::Instant::now()));
+        let expected: Vec<(Slot, u8)> = (4..=11)
+            .map(|slot| (slot, BLOCK_OPAQUE))
+            .chain((24..=27).map(|slot| (slot, BLOCK_MISSING)))
+            .collect();
+        assert_eq!(own.read_kinds(), expected);
+    }
+
+    #[test]
     fn test_a_cleaned_slot_is_unreadable_not_skipped() {
         use crate::event_output::held_block;
         assert!(matches!(held_block(4, 5, Block::Missing), Block::Opaque));
