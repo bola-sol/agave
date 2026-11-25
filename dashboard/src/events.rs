@@ -18,6 +18,10 @@ pub const BLOCK_STREAM: StreamName = agave_event_system::stream_name!("ledger.re
 pub const ADMITTED_STREAM: StreamName = agave_event_system::stream_name!("bank.admitted");
 pub const SLOT_HISTORY_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_history");
 pub const TX_OUTCOME_STREAM: StreamName = agave_event_system::stream_name!("ledger.tx_outcome");
+pub const GOSSIP_PEER_STREAM: StreamName = agave_event_system::stream_name!("gossip.peer");
+pub const VALIDATOR_INFO_STREAM: StreamName =
+    agave_event_system::stream_name!("bank.validator_info");
+pub const FINALIZATION_STREAM: StreamName = agave_event_system::stream_name!("bank.finalization");
 pub const MESSAGE_VERSIONS_STREAM: StreamName =
     agave_event_system::stream_name!("ledger.message_versions");
 
@@ -67,6 +71,8 @@ pub struct NodeInfoEvent {
     /// Slots between archives; 0 is disabled.
     pub full_snapshot_interval: u64,
     pub incremental_snapshot_interval: u64,
+    /// Gossip accepts only globally routable addresses, which the RPC node count follows.
+    pub global_addresses_only: bool,
 }
 
 /// `ValidatorStartProgress`, with its fields where it has them.
@@ -294,6 +300,80 @@ pub struct MessageVersionsEvent {
     pub legacy: u64,
     pub v0: u64,
     pub v1: u64,
+}
+
+/// One gossip peer, as a member of a set every few seconds.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GossipPeerEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub generation: u64,
+    pub index: u32,
+    pub count: u32,
+    pub pubkey: [u8; 32],
+    pub client: [u8; 24],
+    pub version: [u8; 48],
+    pub wallclock: u64,
+    pub outset: u64,
+    pub shred_version: u16,
+    /// As `NodeInfoEvent::addrs`.
+    pub addrs: [u8; ADDRS * ADDR_BYTES],
+    /// Unix milliseconds this node last took something new from the peer.
+    pub heard_ms: u64,
+    pub has_full_snapshot: bool,
+    pub full_snapshot: Slot,
+    pub has_incremental_snapshot: bool,
+    pub incremental_snapshot: Slot,
+}
+
+/// Bytes of a validator's name and icon address an info event holds.
+pub const NAME_BYTES: usize = 128;
+pub const ICON_BYTES: usize = 256;
+
+pub const INFO_FULL_SET: u8 = 0;
+pub const INFO_CHANGE: u8 = 1;
+
+/// One validator info entry: the whole set at turn-on and every few minutes, and each entry a
+/// frozen bank changed.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatorInfoEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    /// `INFO_FULL_SET` or `INFO_CHANGE`.
+    pub reason: u8,
+    pub generation: u64,
+    pub index: u32,
+    pub count: u32,
+    /// The bank the entry was read from.
+    pub slot: Slot,
+    pub identity: [u8; 32],
+    pub has_name: bool,
+    pub name: [u8; NAME_BYTES],
+    pub has_icon: bool,
+    pub icon: [u8; ICON_BYTES],
+}
+
+/// Ranks a finalization event's bitmaps hold.
+pub const FINALIZATION_RANKS: usize = 4096;
+
+/// Which ranks' last votes a frozen bank held, and which were within reach of the newest: what
+/// the finalization share reads of each bank.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizationEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub slot: Slot,
+    /// The newest last vote among the ranked accounts.
+    pub front: Slot,
+    pub ranks: u16,
+    pub seen: [u8; FINALIZATION_RANKS / 8],
+    pub carried: [u8; FINALIZATION_RANKS / 8],
 }
 
 pub fn pack_str<const N: usize>(value: &str) -> [u8; N] {

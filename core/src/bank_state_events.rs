@@ -1,4 +1,5 @@
-//! Vote accounts and leader schedules as sets of events, resent in full every 30 seconds.
+//! Vote accounts and leader schedules (the previous, this and the next epoch's) as sets of
+//! events, resent in full every 30 seconds.
 //! Members of a set share a `generation`, and `index` and `count` mark when it is complete.
 //! Vote accounts are read from the working bank, and each tick sends those that changed,
 //! last vote included.
@@ -414,7 +415,7 @@ impl StateLoop {
             self.schedule_generation = self.schedule_generation.saturating_add(1);
             let generation = self.schedule_generation;
             let epoch_schedule = bank.epoch_schedule();
-            for epoch in [epoch, epoch.saturating_add(1)] {
+            for epoch in [epoch.saturating_sub(1), epoch, epoch.saturating_add(1)] {
                 let Some(schedule) = leader_schedule_cache.get_epoch_leader_schedule(epoch) else {
                     continue;
                 };

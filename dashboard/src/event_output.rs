@@ -11,13 +11,15 @@ use {
             ADDR_SERVE_REPAIR_UDP, ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC,
             ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, ADDRS, ADMITTED_STREAM, AdmittedEvent, BITMAP_BYTES,
             BLOCK_FOOTER, BLOCK_MISSING, BLOCK_OPAQUE, BLOCK_STREAM, BlockEvent, EPOCH_STREAM,
-            EpochEvent, HISTORY_WORDS, LEDGER_SLOT_STREAM, LedgerSlotEvent,
-            MESSAGE_VERSIONS_STREAM, MessageVersionsEvent, NODE_INFO_STREAM, NodeInfoEvent,
-            OUTCOME_FAILED, OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN, PATH_BYTES, RANKS_PER_EVENT,
-            ROLE_ROOT, ROLE_WORKING, SLOT_CLOCK_STREAM, SLOT_HISTORY_STREAM, SLOT_STATUS_STREAM,
+            EpochEvent, FINALIZATION_RANKS, FINALIZATION_STREAM, FinalizationEvent,
+            GOSSIP_PEER_STREAM, GossipPeerEvent, HISTORY_WORDS, ICON_BYTES, INFO_CHANGE,
+            INFO_FULL_SET, LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM,
+            MessageVersionsEvent, NAME_BYTES, NODE_INFO_STREAM, NodeInfoEvent, OUTCOME_FAILED,
+            OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN, PATH_BYTES, RANKS_PER_EVENT, ROLE_ROOT,
+            ROLE_WORKING, SLOT_CLOCK_STREAM, SLOT_HISTORY_STREAM, SLOT_STATUS_STREAM,
             START_PROGRESS_STREAM, SlotClockEvent, SlotHistoryEvent, SlotStatusEvent,
-            StartProgressEvent, TX_OUTCOME_STREAM, TxOutcomeEvent, VOTE_REWARD_BYTES, pack_addr,
-            pack_path, pack_str,
+            StartProgressEvent, TX_OUTCOME_STREAM, TxOutcomeEvent, VALIDATOR_INFO_STREAM,
+            VOTE_REWARD_BYTES, ValidatorInfoEvent, pack_addr, pack_path, pack_str,
         },
         metric_events::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -162,6 +164,10 @@ const LEDGER_WINDOW: u64 = 64;
 const ADMITTED_EVERY: Duration = Duration::from_secs(30);
 /// How often the slot history goes out whole; roots keep it current in between.
 const HISTORY_EVERY: Duration = Duration::from_secs(30);
+/// How often the gossip table goes out whole.
+const PEERS_EVERY: Duration = Duration::from_secs(15);
+/// How often every validator info entry goes out; changes go out as banks freeze.
+const INFO_EVERY: Duration = Duration::from_secs(600);
 /// Set events sent before a pause, so a set larger than its stream arrives whole.
 const PACE_BATCH: usize = 512;
 const PACE_PAUSE: Duration = Duration::from_millis(50);
@@ -169,6 +175,13 @@ const PACE_PAUSE: Duration = Duration::from_millis(50);
 const BLOCKS_PER_TICK: u64 = 64;
 
 pub struct EventOutput {
+    peers: Publisher<GossipPeerEvent>,
+    peers_sent: Option<(u64, Instant)>,
+    info: Publisher<ValidatorInfoEvent>,
+    info_sent: Option<(u64, Instant)>,
+    finalization: Publisher<FinalizationEvent>,
+    /// The newest frozen bank read for finalization and validator info changes.
+    frozen_read_to: Option<solana_clock::Slot>,
     outcomes: Publisher<TxOutcomeEvent>,
     versions: Publisher<MessageVersionsEvent>,
     /// Frozen banks whose blocks are not yet full, held for their transactions' results.
@@ -199,6 +212,12 @@ impl EventOutput {
             return Err(io::Error::other("no publishers"));
         };
         Ok(Self {
+            peers: stream(event_system, GOSSIP_PEER_STREAM, 16_384)?,
+            peers_sent: None,
+            info: stream(event_system, VALIDATOR_INFO_STREAM, 8192)?,
+            info_sent: None,
+            finalization: stream(event_system, FINALIZATION_STREAM, 1024)?,
+            frozen_read_to: None,
             outcomes: stream(event_system, TX_OUTCOME_STREAM, 65_536)?,
             versions: stream(event_system, MESSAGE_VERSIONS_STREAM, 256)?,
             held: std::collections::BTreeMap::new(),
@@ -243,6 +262,9 @@ impl EventOutput {
         self.send_admitted(src, now);
         self.send_history(src, now);
         self.send_blocks_read(src);
+        self.send_peers(src, now);
+        self.send_info(src, now);
+        self.send_frozen_reads(src);
         if self.progress.enabled() {
             let progress = *start_progress.read().unwrap();
             self.progress.offer(progress_event(progress), now);
@@ -323,6 +345,99 @@ impl EventOutput {
             });
             self.ledger_sent.insert(slot, (true, full));
         }
+    }
+
+    /// The gossip table whole, with each peer's advertised snapshots.
+    fn send_peers(&mut self, src: &dyn Source, now: Instant) {
+        if !self.peers.is_enabled() {
+            self.peers_sent = None;
+            return;
+        }
+        let generation = match self.peers_sent {
+            Some((_, at)) if now.duration_since(at) < PEERS_EVERY => return,
+            Some((generation, _)) => generation.saturating_add(1),
+            None => 1,
+        };
+        self.peers_sent = Some((generation, now));
+        let peers = src.all_peers();
+        let keys: Vec<solana_pubkey::Pubkey> = peers.iter().map(|(peer, _)| peer.pubkey).collect();
+        let snapshots = src.snapshot_slots(&keys);
+        let (pid, tid, timestamp_ns) = header();
+        let count = u32::try_from(peers.len()).unwrap_or(u32::MAX);
+        let events: Vec<GossipPeerEvent> = peers
+            .iter()
+            .zip(snapshots)
+            .zip(0u32..)
+            .map(
+                |(((peer, heard_ms), (full, incremental)), index)| GossipPeerEvent {
+                    pid,
+                    tid,
+                    timestamp_ns,
+                    generation,
+                    index,
+                    count,
+                    pubkey: peer.pubkey.to_bytes(),
+                    client: pack_str(&peer.client),
+                    version: pack_str(&peer.version),
+                    wallclock: peer.wallclock,
+                    outset: peer.outset,
+                    shred_version: peer.shred_version,
+                    addrs: pack_addrs(peer),
+                    heard_ms: *heard_ms,
+                    has_full_snapshot: full.is_some(),
+                    full_snapshot: full.unwrap_or(0),
+                    has_incremental_snapshot: incremental.is_some(),
+                    incremental_snapshot: incremental.unwrap_or(0),
+                },
+            )
+            .collect();
+        publish_paced(&mut self.peers, &events);
+    }
+
+    /// Every validator info entry, at turn-on and every few minutes.
+    fn send_info(&mut self, src: &dyn Source, now: Instant) {
+        if !self.info.is_enabled() {
+            self.info_sent = None;
+            return;
+        }
+        let generation = match self.info_sent {
+            Some((_, at)) if now.duration_since(at) < INFO_EVERY => return,
+            Some((generation, _)) => generation.saturating_add(1),
+            None => 1,
+        };
+        self.info_sent = Some((generation, now));
+        let (slot, entries) = src.validator_info_all();
+        let events = info_events(INFO_FULL_SET, generation, slot, &entries);
+        publish_paced(&mut self.info, &events);
+    }
+
+    /// Each new frozen bank's finalization reading and the validator info entries it changed.
+    fn send_frozen_reads(&mut self, src: &dyn Source) {
+        let finalization_on = self.finalization.is_enabled();
+        let info_on = self.info.is_enabled();
+        if !finalization_on && !info_on {
+            self.frozen_read_to = None;
+            return;
+        }
+        let banks = src.banks();
+        let read_to = *self.frozen_read_to.get_or_insert(banks.highest_slot);
+        let mut newest = read_to;
+        for (slot, bank) in banks.frozen.iter().filter(|(slot, _)| *slot > read_to) {
+            newest = newest.max(*slot);
+            if finalization_on && let Some(event) = finalization_event(bank.as_ref()) {
+                let _ = self.finalization.publish(&event);
+            }
+            if info_on {
+                let changed = bank.validator_info_changed();
+                if !changed.is_empty() {
+                    let generation = self.info_sent.map_or(0, |(generation, _)| generation);
+                    for event in info_events(INFO_CHANGE, generation, *slot, &changed) {
+                        let _ = self.info.publish(&event);
+                    }
+                }
+            }
+        }
+        self.frozen_read_to = Some(newest);
     }
 
     /// Each frozen block's transactions once it is full, and our blocks' message versions.
@@ -440,6 +555,98 @@ impl EventOutput {
             self.next_block = Some(last.saturating_add(1));
         }
     }
+}
+
+fn pack_addrs(peer: &crate::source::PeerRow) -> [u8; ADDRS * ADDR_BYTES] {
+    let mut addrs = [0u8; ADDRS * ADDR_BYTES];
+    for (at, addr) in [
+        (ADDR_GOSSIP, peer.gossip),
+        (ADDR_RPC, peer.rpc),
+        (ADDR_TVU_UDP, peer.tvu_udp),
+        (ADDR_TPU_QUIC, peer.tpu_quic),
+        (ADDR_TPU_FORWARDS_QUIC, peer.tpu_forwards_quic),
+        (ADDR_TPU_VOTE_UDP, peer.tpu_vote_udp),
+        (ADDR_TPU_VOTE_QUIC, peer.tpu_vote_quic),
+        (ADDR_SERVE_REPAIR_UDP, peer.serve_repair_udp),
+        (ADDR_ALPENGLOW, peer.alpenglow),
+    ] {
+        let start = at.saturating_mul(ADDR_BYTES);
+        if let Some(slot) = addrs.get_mut(start..start.saturating_add(ADDR_BYTES)) {
+            slot.copy_from_slice(&pack_addr(addr));
+        }
+    }
+    addrs
+}
+
+pub(crate) fn info_events(
+    reason: u8,
+    generation: u64,
+    slot: solana_clock::Slot,
+    entries: &[(solana_pubkey::Pubkey, crate::validator_info::ValidatorInfo)],
+) -> Vec<ValidatorInfoEvent> {
+    let (pid, tid, timestamp_ns) = header();
+    let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    entries
+        .iter()
+        .zip(0u32..)
+        .map(|((identity, info), index)| ValidatorInfoEvent {
+            pid,
+            tid,
+            timestamp_ns,
+            reason,
+            generation,
+            index,
+            count,
+            slot,
+            identity: identity.to_bytes(),
+            has_name: info.name.is_some(),
+            name: pack_str::<NAME_BYTES>(info.name.as_deref().unwrap_or_default()),
+            has_icon: info.icon_url.is_some(),
+            icon: pack_str::<ICON_BYTES>(info.icon_url.as_deref().unwrap_or_default()),
+        })
+        .collect()
+}
+
+/// What the finalization share reads of a frozen bank: its ranked accounts' last votes against
+/// the newest.
+pub(crate) fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEvent> {
+    if !bank.is_alpenglow() {
+        return None;
+    }
+    let ranks = bank.rank_map(bank.slot())?;
+    let mut votes: Vec<(usize, solana_clock::Slot)> = Vec::new();
+    bank.for_each_vote_row(&mut |row| {
+        if let (Some(rank), Some(last)) = (ranks.rank_of(&row.vote), row.last_voted_slot) {
+            votes.push((usize::from(rank), last));
+        }
+    });
+    let front = votes.iter().map(|(_, slot)| *slot).max()?;
+    let (pid, tid, timestamp_ns) = header();
+    let mut event = FinalizationEvent {
+        pid,
+        tid,
+        timestamp_ns,
+        slot: bank.slot(),
+        front,
+        ranks: u16::try_from(ranks.len().min(FINALIZATION_RANKS)).unwrap_or(0),
+        seen: [0u8; FINALIZATION_RANKS / 8],
+        carried: [0u8; FINALIZATION_RANKS / 8],
+    };
+    for (rank, slot) in votes {
+        let (byte, bit) = (rank / 8, rank % 8);
+        let mask = 1u8
+            .checked_shl(u32::try_from(bit).unwrap_or(0))
+            .unwrap_or(0);
+        if let Some(seen) = event.seen.get_mut(byte) {
+            *seen |= mask;
+        }
+        if front.saturating_sub(slot) <= crate::collect::NEAR_SLOTS
+            && let Some(carried) = event.carried.get_mut(byte)
+        {
+            *carried |= mask;
+        }
+    }
+    Some(event)
 }
 
 /// A block's outcomes, or one empty event where it had none.
@@ -707,6 +914,7 @@ pub(crate) fn node_event(src: &dyn Source) -> NodeInfoEvent {
         incremental_snapshot_interval: snapshots.as_ref().map_or(0, |config| {
             slots(config.incremental_snapshot_archive_interval)
         }),
+        global_addresses_only: src.global_addresses_only(),
     }
 }
 

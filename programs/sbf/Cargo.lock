@@ -150,6 +150,7 @@ dependencies = [
  "solana-ledger",
  "solana-message",
  "solana-metrics",
+ "solana-net-utils",
  "solana-program-runtime",
  "solana-pubkey 4.4.0",
  "solana-rpc",
