@@ -149,6 +149,7 @@ struct Node {
     account_paths: Vec<PathBuf>,
     snapshot_config: Option<SnapshotConfig>,
     global_addresses_only: bool,
+    caught_up_ms: u64,
 }
 
 /// A peer's addresses as `NodeInfoEvent::addrs` and `GossipPeerEvent::addrs` hold them.
@@ -223,6 +224,7 @@ impl From<&NodeInfoEvent> for Node {
                 .collect(),
             snapshot_config,
             global_addresses_only: event.global_addresses_only,
+            caught_up_ms: event.caught_up_ms,
         }
     }
 }
@@ -1346,6 +1348,14 @@ impl Source for Mirror {
             })
             .count()
     }
+    fn caught_up_millis(&self) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        state
+            .node
+            .as_ref()
+            .map(|node| node.caught_up_ms)
+            .filter(|millis| *millis > 0)
+    }
     fn global_addresses_only(&self) -> bool {
         let state = self.state.read().unwrap();
         state
@@ -1709,7 +1719,10 @@ mod tests {
         let direct = Direct::new(harness.ctx.clone(), None);
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let (identity, vote_account) = (direct.identity(), direct.vote_account());
-        mirror.apply_node(&node_event(&direct));
+        mirror.apply_node(&node_event(&direct, 0));
+        assert_eq!(mirror.caught_up_millis(), None);
+        mirror.apply_node(&node_event(&direct, 1_234));
+        assert_eq!(mirror.caught_up_millis(), Some(1_234));
         mirror.apply_status(&status_event(&direct));
         let working = direct.working_bank();
         mirror.apply_epoch(&epoch_event(working.as_ref(), &vote_account));

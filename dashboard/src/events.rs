@@ -71,6 +71,8 @@ pub struct NodeInfoEvent {
     pub incremental_snapshot_interval: u64,
     /// Gossip accepts only globally routable addresses, which the RPC node count follows.
     pub global_addresses_only: bool,
+    /// Unix milliseconds the node caught up with the cluster, 0 before.
+    pub caught_up_ms: u64,
 }
 
 /// Where the node stands: commitment, the highest slot, the tip and the ledger's floor.

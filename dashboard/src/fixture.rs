@@ -205,6 +205,7 @@ impl Fixture {
             startup,
             metrics_tap: Arc::new(MetricsTap::default()),
             failed_total: self.failed_total.clone(),
+            caught_up: Arc::default(),
         };
         Collector::new(self.ctx.clone(), shared, None, None, frozen_banks)
     }
