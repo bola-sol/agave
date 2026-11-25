@@ -16,7 +16,7 @@ use {
         str::FromStr,
         sync::{
             Arc, Mutex, MutexGuard, PoisonError,
-            atomic::{AtomicU8, AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         },
         time::UNIX_EPOCH,
     },
@@ -285,6 +285,11 @@ pub struct MetricsTap {
     xdp: Mutex<Option<XdpConfig>>,
 
     stake_in_gossip: Mutex<Option<StakeInGossip>>,
+
+    /// Test branch only: where points go for the metric event streams.
+    forward: Mutex<Option<crossbeam_channel::Sender<(DataPoint, u64)>>>,
+    forwarding: AtomicBool,
+    forward_drops: AtomicU64,
 }
 
 /// Where one of our leader slots' time went, merged from the reports that each carry part of it.
@@ -996,7 +1001,8 @@ impl MetricsTap {
         let tap = Arc::new(Self::default());
         let observer = tap.clone();
         if !solana_metrics::set_datapoint_observer(Box::new(move |point| {
-            observer.observe(point);
+            observer.observe_at(point, timestamp());
+            observer.forward(point);
         })) {
             log::warn!("dashboard: something else is already watching metrics points");
         }
@@ -1008,7 +1014,43 @@ impl MetricsTap {
         self.observe(point);
     }
 
+    #[cfg(test)]
     fn observe(&self, point: &DataPoint) {
+        self.observe_at(point, timestamp());
+    }
+
+    /// A point another process observed at `observed_ms`, unix milliseconds.
+    pub fn observe_external(&self, point: &DataPoint, observed_ms: u64) {
+        self.observe_at(point, observed_ms);
+    }
+
+    /// Hands every point a metric stream carries to `sender` while forwarding is on.
+    pub fn forward_to(&self, sender: crossbeam_channel::Sender<(DataPoint, u64)>) {
+        *locked(&self.forward) = Some(sender);
+    }
+
+    pub fn set_forwarding(&self, on: bool) {
+        self.forwarding.store(on, Ordering::Relaxed);
+    }
+
+    /// Points the forwarding queue had no room for.
+    pub fn forward_drops(&self) -> u64 {
+        self.forward_drops.load(Ordering::Relaxed)
+    }
+
+    fn forward(&self, point: &DataPoint) {
+        if !self.forwarding.load(Ordering::Relaxed) || !crate::metric_events::carried(point.name) {
+            return;
+        }
+        let sent = locked(&self.forward)
+            .as_ref()
+            .is_some_and(|sender| sender.try_send((point.clone(), timestamp())).is_ok());
+        if !sent {
+            self.forward_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn observe_at(&self, point: &DataPoint, now_millis: u64) {
         match point.name {
             ACCOUNTS_DB_TIMINGS => {
                 add_to(&self.accounts, point);
@@ -1035,8 +1077,8 @@ impl MetricsTap {
                 self.add_sent(&self.repair_sent_bytes, &self.repair_sent_millis, point)
             }
             SCHEDULER_SLOT_COUNTS => self.remember_slot(point),
-            REPLAY_SLOT_STATS => self.remember_replay(point),
-            VOTE_TRACKING => self.remember_vote_track(point),
+            REPLAY_SLOT_STATS => self.remember_replay(point, now_millis),
+            VOTE_TRACKING => self.remember_vote_track(point, now_millis),
             VOTE_ARRIVAL => self.remember_vote_arrival(point),
             LEADER_START | LEADER_BANK | BROADCAST_TRANSMIT | BROADCAST_PROCESS => {
                 self.remember_leader_timing(point)
@@ -1046,7 +1088,7 @@ impl MetricsTap {
             }
             SHRED_FULL => self.remember_fill(point),
             BUNDLE_SLOT_STATS => self.remember_bundles(point),
-            WORKER_TIMING => self.remember_worker_timing(point, timestamp()),
+            WORKER_TIMING => self.remember_worker_timing(point, now_millis),
             VOTE_SLOT_TIMING => self.remember_vote_timing(point),
             XDP_NETWORK_CONFIG => self.remember_xdp(point),
             RETRANSMIT_STAGE => self.add_retransmit(point),
@@ -1206,7 +1248,7 @@ impl MetricsTap {
         arrivals.by_vote.insert(vote, arrival);
     }
 
-    fn remember_vote_track(&self, point: &DataPoint) {
+    fn remember_vote_track(&self, point: &DataPoint, now_millis: u64) {
         let field = |wanted| number_named(point, wanted);
         let Some(slot) = field(SLOT) else {
             return;
@@ -1237,6 +1279,7 @@ impl MetricsTap {
                 first_shred_us,
                 field("finalized"),
                 vote.notarize_us,
+                now_millis,
             );
         }
         let mut tracks = locked(&self.vote_tracks);
@@ -1252,12 +1295,12 @@ impl MetricsTap {
         first_shred_us: u64,
         finalized_us: Option<u64>,
         notarize_us: Option<u64>,
+        now_millis: u64,
     ) {
         let Some(full_millis) = self.shred_fill(slot).map(|fill| fill.full_millis) else {
             return;
         };
         let last_shred_us = first_shred_us.saturating_add(full_millis.saturating_mul(1_000));
-        let now_millis = timestamp();
         let finalized = finalized_us.and_then(|at| at.checked_sub(last_shred_us));
         let vote = notarize_us.and_then(|at| at.checked_sub(last_shred_us));
         if let Some(micros) = finalized {
@@ -1357,7 +1400,7 @@ impl MetricsTap {
             .collect()
     }
 
-    fn remember_replay(&self, point: &DataPoint) {
+    fn remember_replay(&self, point: &DataPoint, now_millis: u64) {
         let mut slot = ReplaySlotTimes::default();
         let mut seen = false;
         for (name, value) in &point.fields {
@@ -1415,7 +1458,7 @@ impl MetricsTap {
             return;
         }
 
-        slot.observed_millis = timestamp();
+        slot.observed_millis = now_millis;
         let mut slots = locked(&self.replay_slots);
         // A slot replayed twice keeps the later report. Bounded from the lowest
         // slot, which is the oldest during ordinary running.
@@ -4217,5 +4260,63 @@ mod tests {
         assert_eq!(a.since(&b).push[1], 6);
         assert_eq!(a.since(&b).rejected[3], 0, "saturates rather than wrapping");
         assert_eq!(a.plus(&b).push[1], 14);
+    }
+}
+
+#[cfg(test)]
+mod carried_tests {
+    use super::*;
+
+    #[test]
+    fn test_every_point_the_tap_reads_has_a_metric_stream() {
+        let read = [
+            ACCOUNTS_DB_TIMINGS,
+            ACCOUNTS_INDEX,
+            ACCOUNTS_WRITE_CACHE,
+            BLOCKSTORE_CFS,
+            SHREDS_TURBINE,
+            SHREDS_REPAIR,
+            GOSSIP_RECEIVER,
+            GOSSIP_SENDER,
+            REPAIR_SENDER,
+            TPU_VOTE_RECEIVER,
+            VOTOR_SERVER,
+            WORKER_ERROR_METRICS,
+            ACCOUNTS_LOADS,
+            ACCOUNTS_STORES,
+            ACCOUNTS_FLUSH,
+            PROGRAM_CACHE,
+            QUIC_TPU,
+            QUIC_TPU_FORWARDS,
+            QUIC_TPU_VOTE,
+            TPU_VERIFIER,
+            WORKER_TIMING,
+            VOTE_SLOT_TIMING,
+            WORKER_COUNTS,
+            SCHEDULER_SLOT_COUNTS,
+            XDP_NETWORK_CONFIG,
+            RETRANSMIT_STAGE,
+            RETRANSMIT_SLOT_STATS,
+            REPLAY_SLOT_STATS,
+            SHRED_FULL,
+            COST_TRACKER,
+            WFSM_GOSSIP,
+            GOSSIP_ENTRIES,
+            GOSSIP_ENTRY_FAILS,
+            VOTE_TRACKING,
+            VOTE_ARRIVAL,
+            LEADER_START,
+            LEADER_BANK,
+            BROADCAST_TRANSMIT,
+            BROADCAST_PROCESS,
+            SCHEDULER_SLOT_TIMING,
+        ];
+        for name in read.into_iter().chain(GOSSIP_STATS) {
+            assert!(crate::metric_events::carried(name), "{name}");
+        }
+        // The bundle stage's points are jito's; this branch is agave.
+        for name in [BUNDLE_STAGE, BUNDLE_SLOT_STATS] {
+            assert!(!crate::metric_events::carried(name), "{name}");
+        }
     }
 }
