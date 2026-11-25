@@ -186,6 +186,31 @@ pub(super) struct EarningsWalk {
     shown: Option<EpochEarnings>,
 }
 
+impl EarningsWalk {
+    /// Reads up to `BLOCKS_PER_TICK` more of our blocks up to `root`; whether all are read.
+    fn advance(&mut self, root: Slot, mut read: impl FnMut(Slot) -> BlockRead) -> bool {
+        let mut count = 0usize;
+        while let Some(slot) = self.leader_slots.get(self.next).copied() {
+            if slot > root || count == BLOCKS_PER_TICK {
+                break;
+            }
+            match read(slot) {
+                BlockRead::Pending => break,
+                BlockRead::Unread => self.unread = self.unread.saturating_add(1),
+                BlockRead::Counted { got, full } => {
+                    self.bonus = self.bonus.saturating_add(got);
+                    self.bonus_lost = self.bonus_lost.saturating_add(full.saturating_sub(got));
+                }
+            }
+            self.next = self.next.saturating_add(1);
+            count = count.saturating_add(1);
+        }
+        self.leader_slots
+            .get(self.next)
+            .is_none_or(|slot| *slot > root)
+    }
+}
+
 impl Collector {
     pub(super) fn collect_earnings(&mut self, root_bank: &dyn BankView) {
         let earnings = self.read_earnings(root_bank);
@@ -208,30 +233,17 @@ impl Collector {
         let rates = self.earnings.rates?;
         let inflation = rates.inflation;
         let root = bank.slot();
+        let src = self.src.as_ref();
+        // Another process's blocks were read before cleanup; a cleaned one comes unreadable.
+        let held_from = if src.direct().is_some() {
+            src.lowest_slot()
+        } else {
+            0
+        };
         let walk = &mut self.earnings;
-        let mut read = 0usize;
-        let mut held_from = None;
-        while let Some(slot) = walk.leader_slots.get(walk.next).copied() {
-            if slot > root || read == BLOCKS_PER_TICK {
-                break;
-            }
-            let held_from = *held_from.get_or_insert_with(|| self.src.lowest_slot());
-            match read_bonus(self.src.as_ref(), bank, slot, &inflation, held_from) {
-                BlockRead::Pending => break,
-                BlockRead::Unread => walk.unread = walk.unread.saturating_add(1),
-                BlockRead::Counted { got, full } => {
-                    walk.bonus = walk.bonus.saturating_add(got);
-                    walk.bonus_lost = walk.bonus_lost.saturating_add(full.saturating_sub(got));
-                }
-            }
-            walk.next = walk.next.saturating_add(1);
-            read = read.saturating_add(1);
-        }
-        if walk
-            .leader_slots
-            .get(walk.next)
-            .is_some_and(|slot| *slot <= root)
-        {
+        if !walk.advance(root, |slot| {
+            read_bonus(src, bank, slot, &inflation, held_from)
+        }) {
             return walk.shown;
         }
 
@@ -321,6 +333,28 @@ mod tests {
         let read = |held_from| read_bonus(&src, bank.as_ref(), 12, &inflation, held_from);
         assert!(matches!(read(0), BlockRead::Counted { got: 0, .. }));
         assert!(matches!(read(13), BlockRead::Unread));
+    }
+
+    #[test]
+    fn test_the_walk_stops_at_a_pending_block_and_resumes_from_it() {
+        let mut walk = EarningsWalk {
+            leader_slots: vec![4, 5, 6, 40],
+            ..EarningsWalk::default()
+        };
+        let first = |slot: Slot| match slot {
+            4 => BlockRead::Counted { got: 3, full: 5 },
+            5 => BlockRead::Pending,
+            _ => BlockRead::Counted { got: 1, full: 1 },
+        };
+        assert!(!walk.advance(20, first));
+        assert_eq!((walk.next, walk.bonus, walk.bonus_lost), (1, 3, 2));
+        // Slot 40 is past the root.
+        let then = |slot: Slot| match slot {
+            5 => BlockRead::Unread,
+            _ => BlockRead::Counted { got: 1, full: 1 },
+        };
+        assert!(walk.advance(20, then));
+        assert_eq!((walk.next, walk.bonus, walk.unread), (3, 4, 1));
     }
 
     #[test]

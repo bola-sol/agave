@@ -262,7 +262,7 @@ pub struct OwnBlockEvent {
     pub generation: u64,
     pub index: u32,
     pub count: u32,
-    /// The root the set was read up to.
+    /// The root the set was read up to, for diagnosis.
     pub covered_to: Slot,
     pub slot: Slot,
     pub kind: u8,
