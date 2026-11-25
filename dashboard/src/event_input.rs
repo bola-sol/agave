@@ -20,7 +20,7 @@ use {
             MetricSlot, MetricTpu, MetricVotor,
         },
         metrics_tap::MetricsTap,
-        mirror::Mirror,
+        mirror::{Mirror, SetStream},
     },
     agave_event_system::{
         Event,
@@ -609,17 +609,21 @@ impl EventInput {
         self.ledger.connect(dir, &explorer);
         self.blocks.connect(dir, &explorer);
         self.versions.connect(dir, &explorer);
-        let resubscribed = [
-            self.admitted.connect(dir, &explorer),
-            self.history.connect(dir, &explorer),
-            self.outcomes.connect(dir, &explorer),
-            self.peers.connect(dir, &explorer),
-            self.info.connect(dir, &explorer),
-        ];
-        if resubscribed.contains(&true) {
-            self.mirror.reset_sets();
+        for (resubscribed, stream) in [
+            (self.admitted.connect(dir, &explorer), SetStream::Admitted),
+            (self.history.connect(dir, &explorer), SetStream::History),
+            (self.outcomes.connect(dir, &explorer), SetStream::Outcomes),
+            (self.peers.connect(dir, &explorer), SetStream::Peers),
+            (self.info.connect(dir, &explorer), SetStream::Info),
+        ] {
+            if resubscribed {
+                self.mirror.reset_set(stream);
+            }
         }
-        self.finalization.connect(dir, &explorer);
+        // A new queue, or none, means no reading is owed for the banks in flight.
+        if self.finalization.connect(dir, &explorer) || !self.finalization.connected() {
+            self.mirror.reset_finalization();
+        }
         self.metric_slot.connect(dir, &explorer);
         self.metric_leader.connect(dir, &explorer);
         self.metric_votor.connect(dir, &explorer);
@@ -690,8 +694,9 @@ impl EventInput {
         self.blocks.drain(|event| mirror.apply_block(&event));
         self.admitted.drain(|event| mirror.apply_admitted(&event));
         self.history.drain(|event| mirror.apply_history(&event));
-        self.outcomes.drain(|event| mirror.apply_outcome(&event));
+        // Versions first: a block reads as full once its outcomes are applied.
         self.versions.drain(|event| mirror.apply_versions(&event));
+        self.outcomes.drain(|event| mirror.apply_outcome(&event));
         self.peers.drain(|event| mirror.apply_peer(&event));
         self.info.drain(|event| mirror.apply_info(&event));
         self.finalization
@@ -843,6 +848,39 @@ impl EventInput {
             self.mirror.ready(),
         );
         out
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// A staked vote account as a full set's only member.
+    pub(crate) fn vote_account(key: u8) -> VoteAccountEvent {
+        VoteAccountEvent {
+            pid: 1,
+            tid: 1,
+            timestamp_ns: 0,
+            slot: 1_000,
+            epoch: 3,
+            generation: 1,
+            index: 0,
+            count: 1,
+            reason: solana_core::bank_state_events::VOTE_ACCOUNT_FULL_SET,
+            vote_account: [key; 32],
+            identity: [key; 32],
+            activated_stake: 1,
+            commission: 0,
+            inflation_rewards_commission_bps: 0,
+            has_credits: false,
+            credits_epoch: 0,
+            credits: 0,
+            prev_credits: 0,
+            has_bls_key: false,
+            has_last_voted_slot: true,
+            last_voted_slot: 990,
+            pending_delegator_rewards: 0,
+        }
     }
 }
 

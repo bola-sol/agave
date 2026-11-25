@@ -60,7 +60,11 @@ const NOTIFIED_KEPT: usize = 1024;
 /// Epochs of rank maps kept.
 const STAKES_KEPT: usize = 4;
 /// How long a frozen bank waits for its finalization reading before the collector takes it.
-const FINALIZATION_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+const FINALIZATION_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(1)
+};
 
 /// Rank maps by epoch, shared by every bank built from one state.
 type Stakes = Arc<BTreeMap<Epoch, EpochStakeView>>;
@@ -78,6 +82,16 @@ impl Shared {
             .get(&schedule.get_epoch(slot))
             .map(|stakes| stakes.ranks.clone())
     }
+}
+
+/// The streams whose events arrive as sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetStream {
+    Peers,
+    Info,
+    History,
+    Admitted,
+    Outcomes,
 }
 
 /// A set's parts as they arrive, by index, for one generation.
@@ -650,14 +664,22 @@ impl Mirror {
             && state.shared.history.is_some()
     }
 
-    /// Drops partial sets after a resubscribe, since a new queue numbers generations afresh.
-    pub fn reset_sets(&self) {
+    /// Drops one stream's partial sets after it resubscribes, since a new queue numbers
+    /// generations afresh.
+    pub fn reset_set(&self, stream: SetStream) {
         let mut state = self.state.write().unwrap();
-        state.pending_peers = None;
-        state.pending_info = None;
-        state.pending_history = None;
-        state.pending_admitted.clear();
-        state.pending_outcomes.clear();
+        match stream {
+            SetStream::Peers => state.pending_peers = None,
+            SetStream::Info => state.pending_info = None,
+            SetStream::History => state.pending_history = None,
+            SetStream::Admitted => state.pending_admitted.clear(),
+            SetStream::Outcomes => state.pending_outcomes.clear(),
+        }
+    }
+
+    /// Stops frozen banks waiting for finalization readings, as when that stream is off.
+    pub fn reset_finalization(&self) {
+        self.state.write().unwrap().finalization_seen = false;
     }
 
     /// Drops the banks frozen while the collector waited to start, which it never watched.
@@ -808,6 +830,14 @@ impl Mirror {
         };
         for part in &parts {
             let (identity, info) = info_of(part);
+            // A change read from a newer bank while the scan ran stays.
+            if state
+                .info
+                .get(&identity)
+                .is_some_and(|(slot, _)| *slot > part.slot)
+            {
+                continue;
+            }
             if state.info.get(&identity).map(|(_, held)| held) != Some(&info) {
                 state.info_changes.push((identity, info.clone()));
             }
@@ -1621,10 +1651,19 @@ mod tests {
     #[test]
     fn test_a_frozen_bank_waits_for_its_reading_and_counts_nothing_without_it() {
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
-        mirror.apply_votes(std::iter::empty());
-        // Before any reading has arrived, banks go straight through.
+        let rows_of = |bank: &Arc<dyn BankView>| {
+            let mut rows = 0;
+            bank.for_each_vote_row(&mut |_| rows += 1);
+            rows
+        };
+        let mut account = crate::event_input::tests_support::vote_account(1);
+        account.has_last_voted_slot = true;
+        mirror.apply_votes(std::iter::once(&account));
+        // Before any reading has arrived, banks go straight through and count the vote accounts.
         mirror.apply_frozen(&frozen(1));
-        assert_eq!(mirror.take_frozen().unwrap().len(), 1);
+        let taken = mirror.take_frozen().unwrap();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(rows_of(&taken[0]), 1);
 
         mirror.apply_finalization(&reading(2));
         mirror.apply_frozen(&frozen(2));
@@ -1641,9 +1680,36 @@ mod tests {
             taken.iter().map(|bank| bank.slot()).collect::<Vec<_>>(),
             vec![3]
         );
-        let mut rows = 0;
-        taken[0].for_each_vote_row(&mut |_| rows += 1);
-        assert_eq!(rows, 0, "a bank without its reading counts nobody");
+        assert_eq!(
+            rows_of(&taken[0]),
+            0,
+            "a bank without its reading counts nobody"
+        );
+
+        // With the stream off again, banks stop waiting and count the vote accounts.
+        mirror.reset_finalization();
+        mirror.apply_frozen(&frozen(4));
+        let taken = mirror.take_frozen().unwrap();
+        assert_eq!(rows_of(&taken[0]), 1);
+    }
+
+    #[test]
+    fn test_a_full_info_set_leaves_a_newer_change_alone() {
+        use crate::event_output::info_events;
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
+        let key = Pubkey::new_unique();
+        let named = |name: &str| ValidatorInfo {
+            name: Some(name.to_string()),
+            icon_url: None,
+        };
+        for event in info_events(crate::events::INFO_CHANGE, 1, 20, &[(key, named("new"))]) {
+            mirror.apply_info(&event);
+        }
+        for event in info_events(INFO_FULL_SET, 1, 10, &[(key, named("old"))]) {
+            mirror.apply_info(&event);
+        }
+        let (_, entries) = mirror.validator_info_all();
+        assert_eq!(entries, vec![(key, named("new"))]);
     }
 
     #[test]
