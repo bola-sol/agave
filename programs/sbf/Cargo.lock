@@ -126,6 +126,7 @@ dependencies = [
  "agave-snapshots",
  "agave-votor-messages",
  "bincode",
+ "bv",
  "crossbeam-channel",
  "flate2",
  "log",

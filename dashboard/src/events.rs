@@ -15,6 +15,11 @@ pub const EPOCH_STREAM: StreamName = agave_event_system::stream_name!("bank.epoc
 pub const SLOT_CLOCK_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_clock");
 pub const LEDGER_SLOT_STREAM: StreamName = agave_event_system::stream_name!("ledger.first_shred");
 pub const BLOCK_STREAM: StreamName = agave_event_system::stream_name!("ledger.reward_cert");
+pub const ADMITTED_STREAM: StreamName = agave_event_system::stream_name!("bank.admitted");
+pub const SLOT_HISTORY_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_history");
+pub const TX_OUTCOME_STREAM: StreamName = agave_event_system::stream_name!("ledger.tx_outcome");
+pub const MESSAGE_VERSIONS_STREAM: StreamName =
+    agave_event_system::stream_name!("ledger.message_versions");
 
 /// Path bytes a node info event holds; a longer path is left empty.
 pub const PATH_BYTES: usize = 192;
@@ -119,6 +124,56 @@ pub struct EpochEvent {
     pub vote_account_rent: u64,
     pub has_ticket_short: bool,
     pub ticket_short: u64,
+    /// The vote reward account's data, where it fits.
+    pub vote_reward_len: u8,
+    pub vote_reward: [u8; VOTE_REWARD_BYTES],
+}
+
+/// Bytes of the vote reward account an epoch event holds.
+pub const VOTE_REWARD_BYTES: usize = 64;
+
+/// Ranks per admitted set event.
+pub const RANKS_PER_EVENT: usize = 32;
+
+/// One part of an epoch's rank map, the admitted set in rank order. An epoch's parts share a
+/// `generation`, and `index` and `count` mark when it is complete.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub epoch: Epoch,
+    pub generation: u64,
+    pub index: u32,
+    pub count: u32,
+    /// The epoch's stake as the rewards read it.
+    pub total_stake: u64,
+    pub first_rank: u32,
+    pub len: u8,
+    /// `RANKS_PER_EVENT` vote accounts, identities and stakes, `len` of them used.
+    pub votes: [u8; RANKS_PER_EVENT * 32],
+    pub identities: [u8; RANKS_PER_EVENT * 32],
+    pub stakes: [u64; RANKS_PER_EVENT],
+}
+
+/// Words of the slot history per event.
+pub const HISTORY_WORDS: usize = 256;
+
+/// One part of the root bank's slot history bitmap, sent whole at turn-on and every few minutes.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotHistoryEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub generation: u64,
+    pub index: u32,
+    pub count: u32,
+    pub next_slot: Slot,
+    pub first_word: u32,
+    pub len: u16,
+    pub words: [u64; HISTORY_WORDS],
 }
 
 pub const ROLE_ROOT: u8 = 0;
@@ -200,6 +255,45 @@ pub struct BlockEvent {
     pub skip: [u8; BITMAP_BYTES],
     pub has_fast: bool,
     pub fast: bool,
+}
+
+pub const OUTCOME_SUCCEEDED: u8 = 0;
+pub const OUTCOME_FAILED: u8 = 1;
+/// The status cache held no result.
+pub const OUTCOME_UNKNOWN: u8 = 2;
+
+/// One non-vote transaction of a full block. A block's share a `count`; a block with none sends
+/// one event with `count` 0.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxOutcomeEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub slot: Slot,
+    pub index: u32,
+    pub count: u32,
+    /// Our own block, whose fees are read too.
+    pub ours: bool,
+    pub has_signature: bool,
+    pub signature: [u8; 64],
+    pub payer: [u8; 32],
+    pub outcome: u8,
+    pub priority_fee: u64,
+    pub base_fee: u64,
+}
+
+/// The message versions of one of our full blocks' transactions.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageVersionsEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub slot: Slot,
+    pub legacy: u64,
+    pub v0: u64,
+    pub v1: u64,
 }
 
 pub fn pack_str<const N: usize>(value: &str) -> [u8; N] {

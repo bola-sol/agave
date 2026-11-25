@@ -14,7 +14,7 @@ use {
 
 /// Where the runtime keeps each epoch's inflation: `vote_reward_account` under the alpenglow
 /// feature id.
-const VOTE_REWARD_ACCOUNT: Pubkey =
+pub(crate) const VOTE_REWARD_ACCOUNT: Pubkey =
     Pubkey::from_str_const("3vJzniWALu2qGFJ1ZY6JD3Y2ZmA5zWqmVdDX7yBXHgu7");
 
 const BLOCKS_PER_TICK: usize = 64;
