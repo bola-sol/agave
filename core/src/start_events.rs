@@ -479,9 +479,10 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
-        let stop = events.stop.clone();
+        let mut events = events;
+        let thread = events.thread_hdl.take().unwrap();
         drop(events);
-        assert!(stop.load(Ordering::Relaxed));
+        thread.join().unwrap();
     }
 
     #[test]
