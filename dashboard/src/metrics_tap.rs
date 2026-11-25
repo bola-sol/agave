@@ -290,6 +290,16 @@ pub struct MetricsTap {
     forward: std::sync::OnceLock<crossbeam_channel::Sender<(DataPoint, u64)>>,
     forwarding: AtomicBool,
     forward_drops: AtomicU64,
+    /// Test branch only: points sent once a run or once an epoch, kept to resend.
+    latched: Mutex<Latched>,
+}
+
+/// The newest point of each one-shot row, and every vote arrival point of the newest epoch.
+#[derive(Debug, Default)]
+struct Latched {
+    once: Vec<(DataPoint, u64)>,
+    arrival_epoch: Option<u64>,
+    arrivals: Vec<(DataPoint, u64)>,
 }
 
 /// Where one of our leader slots' time went, merged from the reports that each carry part of it.
@@ -1039,14 +1049,57 @@ impl MetricsTap {
         self.forward_drops.load(Ordering::Relaxed)
     }
 
+    /// Points sent once a run or once an epoch, with when each was observed.
+    pub fn latched_points(&self) -> Vec<(DataPoint, u64)> {
+        let latched = locked(&self.latched);
+        latched
+            .once
+            .iter()
+            .chain(&latched.arrivals)
+            .cloned()
+            .collect()
+    }
+
+    fn latch(&self, point: &DataPoint, now_millis: u64) {
+        match point.name {
+            XDP_NETWORK_CONFIG | WFSM_GOSSIP => {
+                let mut latched = locked(&self.latched);
+                latched.once.retain(|(held, _)| held.name != point.name);
+                latched.once.push((point.clone(), now_millis));
+            }
+            VOTE_ARRIVAL => {
+                let Some(epoch) = number_named(point, "epoch") else {
+                    return;
+                };
+                let mut latched = locked(&self.latched);
+                match latched.arrival_epoch {
+                    Some(held) if epoch < held => return,
+                    Some(held) if epoch == held => (),
+                    _ => {
+                        latched.arrival_epoch = Some(epoch);
+                        latched.arrivals.clear();
+                    }
+                }
+                latched.arrivals.push((point.clone(), now_millis));
+            }
+            _ => (),
+        }
+    }
+
     fn forward(&self, point: &DataPoint) {
+        // No event system was handed a sender.
+        if self.forward.get().is_none() {
+            return;
+        }
+        let now_millis = timestamp();
+        self.latch(point, now_millis);
         if !self.forwarding.load(Ordering::Relaxed) || !crate::metric_events::carried(point.name) {
             return;
         }
         let sent = self
             .forward
             .get()
-            .is_some_and(|sender| sender.try_send((point.clone(), timestamp())).is_ok());
+            .is_some_and(|sender| sender.try_send((point.clone(), now_millis)).is_ok());
         if !sent {
             self.forward_drops.fetch_add(1, Ordering::Relaxed);
         }
@@ -2530,6 +2583,42 @@ mod tests {
         bam.tags.push((SCHEDULER_ID, "10000".to_string()));
         tap.observe(&bam);
         assert_eq!(tap.leader_timing(9), None);
+    }
+
+    #[test]
+    fn test_latched_points_keep_the_newest_once_points_and_the_newest_epochs_arrivals() {
+        let tap = MetricsTap::default();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        tap.forward_to(sender);
+        tap.forward(&named(WFSM_GOSSIP, &[("online_stake", "5i")]));
+        tap.forward(&named(WFSM_GOSSIP, &[("online_stake", "9i")]));
+        tap.forward(&named(XDP_NETWORK_CONFIG, &[]));
+        let arrival = |epoch| arrival_point(&Pubkey::new_unique(), &[("epoch", epoch)]);
+        tap.forward(&arrival("6i"));
+        tap.forward(&arrival("7i"));
+        tap.forward(&arrival("7i"));
+        tap.forward(&arrival("6i"));
+        tap.forward(&named(VOTE_TRACKING, &[]));
+
+        let latched = tap.latched_points();
+        let names: Vec<_> = latched.iter().map(|(point, _)| point.name).collect();
+        assert_eq!(
+            names,
+            [WFSM_GOSSIP, XDP_NETWORK_CONFIG, VOTE_ARRIVAL, VOTE_ARRIVAL]
+        );
+        assert_eq!(number_named(&latched[0].0, "online_stake"), Some(9));
+        assert!(
+            latched[2..]
+                .iter()
+                .all(|(point, _)| number_named(point, "epoch") == Some(7))
+        );
+    }
+
+    #[test]
+    fn test_nothing_is_latched_without_an_event_system() {
+        let tap = MetricsTap::default();
+        tap.forward(&named(XDP_NETWORK_CONFIG, &[]));
+        assert!(tap.latched_points().is_empty());
     }
 
     #[test]
