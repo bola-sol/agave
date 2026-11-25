@@ -6,10 +6,12 @@ use {
         collect::EpochInfo,
         events::{
             ADMITTED_STREAM, AdmittedEvent, BLOCK_STREAM, BlockEvent, EPOCH_STREAM, EpochEvent,
+            FINALIZATION_STREAM, FinalizationEvent, GOSSIP_PEER_STREAM, GossipPeerEvent,
             LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM, MessageVersionsEvent,
             NODE_INFO_STREAM, NodeInfoEvent, SLOT_CLOCK_STREAM, SLOT_HISTORY_STREAM,
             SLOT_STATUS_STREAM, START_PROGRESS_STREAM, SlotClockEvent, SlotHistoryEvent,
             SlotStatusEvent, StartProgressEvent, TX_OUTCOME_STREAM, TxOutcomeEvent,
+            VALIDATOR_INFO_STREAM, ValidatorInfoEvent,
         },
         metric_events::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -103,7 +105,10 @@ stamped!(
     AdmittedEvent,
     SlotHistoryEvent,
     TxOutcomeEvent,
-    MessageVersionsEvent
+    MessageVersionsEvent,
+    GossipPeerEvent,
+    ValidatorInfoEvent,
+    FinalizationEvent
 );
 
 macro_rules! stamped_metric {
@@ -449,8 +454,8 @@ impl ScheduleSet {
         self.sets_completed = self.sets_completed.saturating_add(1);
         let changed = self.complete.get(&epoch) != Some(&info);
         self.complete.insert(epoch, info);
-        // Keep this epoch and the next, and no partial set older than them.
-        while self.complete.len() > 2 {
+        // Keep the previous, this and the next epoch, and no partial set older than them.
+        while self.complete.len() > 3 {
             self.complete.pop_first();
         }
         if let Some(oldest) = self.complete.keys().next().copied() {
@@ -511,6 +516,9 @@ pub struct EventInput {
     pub history: Stream<SlotHistoryEvent>,
     pub outcomes: Stream<TxOutcomeEvent>,
     pub versions: Stream<MessageVersionsEvent>,
+    pub peers: Stream<GossipPeerEvent>,
+    pub info: Stream<ValidatorInfoEvent>,
+    pub finalization: Stream<FinalizationEvent>,
     pub metric_slot: Stream<MetricSlot>,
     pub metric_leader: Stream<MetricLeader>,
     pub metric_votor: Stream<MetricVotor>,
@@ -552,6 +560,9 @@ impl EventInput {
             history: Stream::new(SLOT_HISTORY_STREAM),
             outcomes: Stream::new(TX_OUTCOME_STREAM),
             versions: Stream::new(MESSAGE_VERSIONS_STREAM),
+            peers: Stream::new(GOSSIP_PEER_STREAM),
+            info: Stream::new(VALIDATOR_INFO_STREAM),
+            finalization: Stream::new(FINALIZATION_STREAM),
             metric_slot: Stream::new(METRIC_SLOT_STREAM),
             metric_leader: Stream::new(METRIC_LEADER_STREAM),
             metric_votor: Stream::new(METRIC_VOTOR_STREAM),
@@ -601,6 +612,9 @@ impl EventInput {
         self.history.connect(dir, &explorer);
         self.outcomes.connect(dir, &explorer);
         self.versions.connect(dir, &explorer);
+        self.peers.connect(dir, &explorer);
+        self.info.connect(dir, &explorer);
+        self.finalization.connect(dir, &explorer);
         self.metric_slot.connect(dir, &explorer);
         self.metric_leader.connect(dir, &explorer);
         self.metric_votor.connect(dir, &explorer);
@@ -628,6 +642,9 @@ impl EventInput {
         self.history.disconnect();
         self.outcomes.disconnect();
         self.versions.disconnect();
+        self.peers.disconnect();
+        self.info.disconnect();
+        self.finalization.disconnect();
         self.metric_slot.disconnect();
         self.metric_leader.disconnect();
         self.metric_votor.disconnect();
@@ -670,6 +687,10 @@ impl EventInput {
         self.history.drain(|event| mirror.apply_history(&event));
         self.outcomes.drain(|event| mirror.apply_outcome(&event));
         self.versions.drain(|event| mirror.apply_versions(&event));
+        self.peers.drain(|event| mirror.apply_peer(&event));
+        self.info.drain(|event| mirror.apply_info(&event));
+        self.finalization
+            .drain(|event| mirror.apply_finalization(&event));
 
         let shred_totals = &mut self.shred_totals;
         self.shred_fetch.drain(|event| {
@@ -772,6 +793,9 @@ impl EventInput {
             history,
             outcomes,
             versions,
+            peers,
+            info,
+            finalization,
             metric_slot,
             metric_leader,
             metric_votor,
@@ -1002,7 +1026,10 @@ mod tests {
             set.apply(leader_event(epoch, 1));
             set.apply(turns_event(epoch, 1, 0, 4));
         }
-        assert_eq!(set.complete.keys().copied().collect::<Vec<_>>(), vec![5, 6]);
+        assert_eq!(
+            set.complete.keys().copied().collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
         assert!(set.pending.is_empty());
     }
 }

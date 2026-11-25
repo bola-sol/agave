@@ -10,10 +10,11 @@ use {
             ACCOUNT_PATHS, ADDR_ALPENGLOW, ADDR_BYTES, ADDR_GOSSIP, ADDR_RPC,
             ADDR_SERVE_REPAIR_UDP, ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC,
             ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, AdmittedEvent, BITMAP_BYTES, BLOCK_FOOTER,
-            BLOCK_MISSING, BlockEvent, EpochEvent, LedgerSlotEvent, MessageVersionsEvent,
-            NodeInfoEvent, OUTCOME_FAILED, OUTCOME_SUCCEEDED, PATH_BYTES, ROLE_ROOT,
-            SlotClockEvent, SlotHistoryEvent, SlotStatusEvent, StartProgressEvent, TxOutcomeEvent,
-            unpack_addr, unpack_path, unpack_str,
+            BLOCK_MISSING, BlockEvent, EpochEvent, FinalizationEvent, GossipPeerEvent,
+            INFO_FULL_SET, LedgerSlotEvent, MessageVersionsEvent, NodeInfoEvent, OUTCOME_FAILED,
+            OUTCOME_SUCCEEDED, PATH_BYTES, ROLE_ROOT, SlotClockEvent, SlotHistoryEvent,
+            SlotStatusEvent, StartProgressEvent, TxOutcomeEvent, ValidatorInfoEvent, unpack_addr,
+            unpack_path, unpack_str,
         },
         snapshot,
         source::{
@@ -58,6 +59,8 @@ const BLOCKS_KEPT: usize = 4096;
 const NOTIFIED_KEPT: usize = 1024;
 /// Epochs of rank maps kept.
 const STAKES_KEPT: usize = 4;
+/// How long a frozen bank waits for its finalization reading before the collector takes it.
+const FINALIZATION_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Rank maps by epoch, shared by every bank built from one state.
 type Stakes = Arc<BTreeMap<Epoch, EpochStakeView>>;
@@ -125,6 +128,15 @@ struct Node {
     ledger_path: PathBuf,
     account_paths: Vec<PathBuf>,
     snapshot_config: Option<SnapshotConfig>,
+    global_addresses_only: bool,
+}
+
+/// A peer's addresses as `NodeInfoEvent::addrs` and `GossipPeerEvent::addrs` hold them.
+fn addr_at(addrs: &[u8], at: usize) -> Option<SocketAddr> {
+    let start = at.saturating_mul(ADDR_BYTES);
+    addrs
+        .get(start..start.saturating_add(ADDR_BYTES))
+        .and_then(unpack_addr)
 }
 
 impl From<&NodeInfoEvent> for Node {
@@ -190,8 +202,42 @@ impl From<&NodeInfoEvent> for Node {
                 .filter_map(|packed| unpack_path(packed))
                 .collect(),
             snapshot_config,
+            global_addresses_only: event.global_addresses_only,
         }
     }
+}
+
+impl From<&GossipPeerEvent> for PeerRow {
+    fn from(event: &GossipPeerEvent) -> Self {
+        let addr = |at: usize| addr_at(&event.addrs, at);
+        Self {
+            pubkey: Pubkey::new_from_array(event.pubkey),
+            client: unpack_str(&event.client),
+            version: unpack_str(&event.version),
+            wallclock: event.wallclock,
+            outset: event.outset,
+            shred_version: event.shred_version,
+            gossip: addr(ADDR_GOSSIP),
+            rpc: addr(ADDR_RPC),
+            tvu_udp: addr(ADDR_TVU_UDP),
+            tpu_quic: addr(ADDR_TPU_QUIC),
+            tpu_forwards_quic: addr(ADDR_TPU_FORWARDS_QUIC),
+            tpu_vote_udp: addr(ADDR_TPU_VOTE_UDP),
+            tpu_vote_quic: addr(ADDR_TPU_VOTE_QUIC),
+            serve_repair_udp: addr(ADDR_SERVE_REPAIR_UDP),
+            alpenglow: addr(ADDR_ALPENGLOW),
+        }
+    }
+}
+
+fn info_of(event: &ValidatorInfoEvent) -> (Pubkey, ValidatorInfo) {
+    (
+        Pubkey::new_from_array(event.identity),
+        ValidatorInfo {
+            name: event.has_name.then(|| unpack_str(&event.name)),
+            icon_url: event.has_icon.then(|| unpack_str(&event.icon)),
+        },
+    )
 }
 
 /// What every bank of one epoch shares.
@@ -371,6 +417,10 @@ pub struct FrozenBank {
     shared: Shared,
     /// The parent as it froze, without its own parent.
     parent: Option<Arc<FrozenBank>>,
+    /// What the finalization share reads of this bank, where it arrived.
+    finalization: Option<Arc<FinalizationEvent>>,
+    /// Validator info entries handed to the collector with this bank.
+    info_changes: Vec<(Pubkey, ValidatorInfo)>,
 }
 
 impl BankView for FrozenBank {
@@ -448,9 +498,45 @@ impl BankView for FrozenBank {
     fn vote_row(&self, vote: &Pubkey) -> Option<VoteRow> {
         self.votes.get(vote).cloned()
     }
+    /// From its finalization reading where it arrived: each ranked account's last vote set at
+    /// the newest or just out of reach of it, which is all the share reads.
     fn for_each_vote_row(&self, each: &mut dyn FnMut(&VoteRow)) {
-        for row in self.votes.values() {
-            each(row);
+        let ranks = self.rank_map(self.event.slot);
+        let (Some(reading), Some(ranks)) = (self.finalization.as_ref(), ranks) else {
+            for row in self.votes.values() {
+                each(row);
+            }
+            return;
+        };
+        let bit = |bits: &[u8], rank: usize| {
+            bits.get(rank / 8)
+                .is_some_and(|byte| byte & 1u8.checked_shl((rank % 8) as u32).unwrap_or(0) != 0)
+        };
+        let behind = reading
+            .front
+            .saturating_sub(crate::collect::NEAR_SLOTS.saturating_add(1));
+        for rank in 0..usize::from(reading.ranks) {
+            let Some(entry) = ranks.entry(rank) else {
+                continue;
+            };
+            if !bit(&reading.seen, rank) {
+                continue;
+            }
+            each(&VoteRow {
+                vote: entry.vote,
+                identity: entry.identity,
+                stake: entry.stake,
+                commission: 0,
+                inflation_rewards_commission_bps: 0,
+                last_voted_slot: Some(if bit(&reading.carried, rank) {
+                    reading.front
+                } else {
+                    behind
+                }),
+                last_epoch_credits: None,
+                pending_delegator_rewards: 0,
+                has_bls_key: true,
+            });
         }
     }
     fn rank_map(&self, slot: Slot) -> Option<Arc<dyn Ranks>> {
@@ -482,7 +568,7 @@ impl BankView for FrozenBank {
         None
     }
     fn validator_info_changed(&self) -> Vec<(Pubkey, ValidatorInfo)> {
-        Vec::new()
+        self.info_changes.clone()
     }
 }
 
@@ -506,8 +592,20 @@ struct State {
     schedules: BTreeMap<Epoch, Arc<Vec<Pubkey>>>,
     /// Frozen banks above the root.
     frozen: BTreeMap<Slot, Arc<FrozenBank>>,
-    /// Frozen banks the collector has not taken yet.
-    notified: Vec<Arc<dyn BankView>>,
+    /// Frozen banks the collector has not taken yet, with when they arrived.
+    notified: Vec<(Arc<FrozenBank>, std::time::Instant)>,
+    finalization: BTreeMap<Slot, Arc<FinalizationEvent>>,
+    /// Whether any finalization reading has arrived, so a bank waits for its own.
+    finalization_seen: bool,
+    peers: Vec<(PeerRow, u64)>,
+    peer_at: HashMap<Pubkey, usize>,
+    peer_snapshots: HashMap<Pubkey, (Option<Slot>, Option<Slot>)>,
+    pending_peers: Option<PendingSet<GossipPeerEvent>>,
+    /// Each validator's info, with the slot it was read at.
+    info: HashMap<Pubkey, (Slot, ValidatorInfo)>,
+    pending_info: Option<PendingSet<ValidatorInfoEvent>>,
+    /// Entries not yet handed to the collector.
+    info_changes: Vec<(Pubkey, ValidatorInfo)>,
     ledger: BTreeMap<Slot, LedgerSlot>,
     rooted: BTreeSet<Slot>,
     blocks: BTreeMap<Slot, BlockEvent>,
@@ -549,6 +647,11 @@ impl Mirror {
             && state.schedules.contains_key(&this_epoch)
             && (!epoch.alpenglow || state.shared.stakes.contains_key(&this_epoch))
             && state.shared.history.is_some()
+    }
+
+    /// Drops the banks frozen while the collector waited to start, which it never watched.
+    pub fn drop_backlog(&self) {
+        self.state.write().unwrap().notified.clear();
     }
 
     pub fn apply_node(&self, event: &NodeInfoEvent) {
@@ -606,6 +709,7 @@ impl Mirror {
         let parent = state.frozen.get(&event.parent_slot).map(|parent| {
             Arc::new(FrozenBank {
                 parent: None,
+                info_changes: Vec::new(),
                 ..FrozenBank::clone(parent)
             })
         });
@@ -615,12 +719,87 @@ impl Mirror {
             votes: state.votes.clone(),
             shared: state.shared.clone(),
             parent,
+            finalization: None,
+            info_changes: Vec::new(),
         });
         state.frozen.insert(event.slot, bank.clone());
-        state.notified.push(bank);
+        state.notified.push((bank, std::time::Instant::now()));
         if state.notified.len() > NOTIFIED_KEPT {
             let excess = state.notified.len().saturating_sub(NOTIFIED_KEPT);
             state.notified.drain(..excess);
+        }
+    }
+
+    pub fn apply_finalization(&self, event: &FinalizationEvent) {
+        let mut state = self.state.write().unwrap();
+        state.finalization_seen = true;
+        state
+            .finalization
+            .insert(event.slot, Arc::new(event.clone()));
+        while state.finalization.len() > NOTIFIED_KEPT {
+            state.finalization.pop_first();
+        }
+    }
+
+    pub fn apply_peer(&self, event: &GossipPeerEvent) {
+        let mut state = self.state.write().unwrap();
+        let Some(parts) = PendingSet::add(
+            &mut state.pending_peers,
+            event.generation,
+            event.index,
+            event.count,
+            event.clone(),
+        ) else {
+            return;
+        };
+        state.peers = parts
+            .iter()
+            .map(|part| (PeerRow::from(part), part.heard_ms))
+            .collect();
+        state.peer_at = state
+            .peers
+            .iter()
+            .enumerate()
+            .map(|(at, (peer, _))| (peer.pubkey, at))
+            .collect();
+        state.peer_snapshots = parts
+            .iter()
+            .map(|part| {
+                (
+                    Pubkey::new_from_array(part.pubkey),
+                    (
+                        part.has_full_snapshot.then_some(part.full_snapshot),
+                        part.has_incremental_snapshot
+                            .then_some(part.incremental_snapshot),
+                    ),
+                )
+            })
+            .collect();
+    }
+
+    pub fn apply_info(&self, event: &ValidatorInfoEvent) {
+        let mut state = self.state.write().unwrap();
+        if event.reason != INFO_FULL_SET {
+            let (identity, info) = info_of(event);
+            state.info.insert(identity, (event.slot, info.clone()));
+            state.info_changes.push((identity, info));
+            return;
+        }
+        let Some(parts) = PendingSet::add(
+            &mut state.pending_info,
+            event.generation,
+            event.index,
+            event.count,
+            event.clone(),
+        ) else {
+            return;
+        };
+        for part in &parts {
+            let (identity, info) = info_of(part);
+            if state.info.get(&identity).map(|(_, held)| held) != Some(&info) {
+                state.info_changes.push((identity, info.clone()));
+            }
+            state.info.insert(identity, (part.slot, info));
         }
     }
 
@@ -847,6 +1026,18 @@ impl Mirror {
         })
     }
 
+    /// Bank forks' highest slot is never below a bank it holds, and frozen banks arrive ahead of
+    /// the status that reports it.
+    fn highest_of(state: &State) -> Slot {
+        let reported = state
+            .status
+            .as_ref()
+            .map_or(0, |status| status.highest_slot);
+        let frozen = state.frozen.keys().next_back().copied().unwrap_or(0);
+        let working = state.working.as_ref().map_or(0, |clock| clock.slot);
+        reported.max(frozen).max(working)
+    }
+
     /// The turn leader of `slot`, where its epoch's schedule has arrived.
     fn leader_of(state: &State, schedule: &EpochSchedule, slot: Slot) -> Option<Pubkey> {
         let (epoch, index) = schedule.get_epoch_and_slot_index(slot);
@@ -970,31 +1161,49 @@ impl Source for Mirror {
         )
     }
     fn all_peers(&self) -> Vec<(PeerRow, u64)> {
-        Vec::new()
+        self.state.read().unwrap().peers.clone()
     }
     fn peer_gossip(&self, key: &Pubkey) -> Option<SocketAddr> {
+        let state = self.state.read().unwrap();
+        if let Some(node) = state.node.as_ref().filter(|node| node.identity == *key) {
+            return node.contact.gossip;
+        }
+        let at = *state.peer_at.get(key)?;
+        state.peers.get(at).and_then(|(peer, _)| peer.gossip)
+    }
+    fn snapshot_slots(&self, keys: &[Pubkey]) -> Vec<(Option<Slot>, Option<Slot>)> {
+        let state = self.state.read().unwrap();
+        keys.iter()
+            .map(|key| state.peer_snapshots.get(key).copied().unwrap_or_default())
+            .collect()
+    }
+    fn rpc_node_count(&self, peers: &[(PeerRow, u64)]) -> usize {
+        let me = self.identity();
+        let space = if self.global_addresses_only() {
+            solana_net_utils::SocketAddrSpace::Global
+        } else {
+            solana_net_utils::SocketAddrSpace::Unspecified
+        };
+        peers
+            .iter()
+            .filter(|(peer, _)| {
+                peer.pubkey != me && peer.rpc.is_some_and(|addr| space.check(&addr))
+            })
+            .count()
+    }
+    fn global_addresses_only(&self) -> bool {
         let state = self.state.read().unwrap();
         state
             .node
             .as_ref()
-            .filter(|node| node.identity == *key)
-            .and_then(|node| node.contact.gossip)
-    }
-    fn snapshot_slots(&self, keys: &[Pubkey]) -> Vec<(Option<Slot>, Option<Slot>)> {
-        vec![(None, None); keys.len()]
-    }
-    fn rpc_node_count(&self, _peers: &[(PeerRow, u64)]) -> usize {
-        0
+            .is_some_and(|node| node.global_addresses_only)
     }
     fn banks(&self) -> Banks {
         let state = self.state.read().unwrap();
         Banks {
             root: self.bank(&state, state.root.as_ref()),
             working: self.bank(&state, state.working.as_ref()),
-            highest_slot: state
-                .status
-                .as_ref()
-                .map_or(0, |status| status.highest_slot),
+            highest_slot: Self::highest_of(&state),
             frozen: state
                 .frozen
                 .iter()
@@ -1011,14 +1220,35 @@ impl Source for Mirror {
         self.bank(&state, state.working.as_ref())
     }
     fn highest_slot(&self) -> Slot {
-        let state = self.state.read().unwrap();
-        state
-            .status
-            .as_ref()
-            .map_or(0, |status| status.highest_slot)
+        Self::highest_of(&self.state.read().unwrap())
     }
+    /// A bank waits briefly for its finalization reading, which follows its freeze.
     fn take_frozen(&self) -> Option<Vec<Arc<dyn BankView>>> {
-        Some(std::mem::take(&mut self.state.write().unwrap().notified))
+        let mut state = self.state.write().unwrap();
+        let now = std::time::Instant::now();
+        let waiting = state.finalization_seen;
+        let (ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut state.notified)
+            .into_iter()
+            .partition(|(bank, arrived)| {
+                !waiting
+                    || state.finalization.contains_key(&bank.event.slot)
+                    || now.duration_since(*arrived) >= FINALIZATION_WAIT
+            });
+        state.notified = held;
+        let mut changes = std::mem::take(&mut state.info_changes);
+        let banks = ready
+            .into_iter()
+            .map(|(bank, _)| {
+                Arc::new(FrozenBank {
+                    finalization: state.finalization.get(&bank.event.slot).cloned(),
+                    info_changes: std::mem::take(&mut changes),
+                    ..FrozenBank::clone(&bank)
+                }) as Arc<dyn BankView>
+            })
+            .collect::<Vec<_>>();
+        // With no bank to carry them, the changes wait for the next.
+        state.info_changes = changes;
+        Some(banks)
     }
     fn commitment(&self) -> Commitment {
         let state = self.state.read().unwrap();
@@ -1183,7 +1413,21 @@ impl Source for Mirror {
             .map_or_else(Vec::new, |node| node.account_paths.clone())
     }
     fn validator_info_all(&self) -> (Slot, Vec<(Pubkey, ValidatorInfo)>) {
-        (0, Vec::new())
+        let mut state = self.state.write().unwrap();
+        // Handed over whole here, so not again as changes.
+        state.info_changes.clear();
+        let slot = state
+            .info
+            .values()
+            .map(|(slot, _)| *slot)
+            .max()
+            .unwrap_or(0);
+        let entries = state
+            .info
+            .iter()
+            .map(|(identity, (_, info))| (*identity, info.clone()))
+            .collect();
+        (slot, entries)
     }
 }
 

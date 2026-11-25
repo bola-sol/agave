@@ -16,7 +16,7 @@ use {
 };
 
 /// A last vote this close to the newest one in the bank counts as carried.
-const NEAR_SLOTS: u64 = 3;
+pub(crate) const NEAR_SLOTS: u64 = 3;
 
 const MINUTE_MILLIS: u64 = 60_000;
 
