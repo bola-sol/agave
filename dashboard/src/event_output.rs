@@ -14,11 +14,11 @@ use {
             GOSSIP_PEER_STREAM, GossipPeerEvent, HISTORY_WORDS, ICON_BYTES, INFO_CHANGE,
             INFO_FULL_SET, LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM,
             MessageVersionsEvent, NAME_BYTES, NODE_INFO_STREAM, NodeInfoEvent, OUTCOME_FAILED,
-            OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN, PATH_BYTES, RANKS_PER_EVENT, ROLE_ROOT,
-            ROLE_WORKING, SLOT_CLOCK_STREAM, SLOT_HISTORY_STREAM, SLOT_STATUS_STREAM,
-            SlotClockEvent, SlotHistoryEvent, SlotStatusEvent, TX_OUTCOME_STREAM, TxOutcomeEvent,
-            VALIDATOR_INFO_STREAM, VOTE_REWARD_BYTES, ValidatorInfoEvent, pack_addr, pack_path,
-            pack_str,
+            OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN, OWN_BLOCK_STREAM, OwnBlockEvent, OwnSetPlace,
+            PATH_BYTES, RANKS_PER_EVENT, ROLE_ROOT, ROLE_WORKING, SLOT_CLOCK_STREAM,
+            SLOT_HISTORY_STREAM, SLOT_STATUS_STREAM, SlotClockEvent, SlotHistoryEvent,
+            SlotStatusEvent, TX_OUTCOME_STREAM, TxOutcomeEvent, VALIDATOR_INFO_STREAM,
+            VOTE_REWARD_BYTES, ValidatorInfoEvent, pack_addr, pack_path, pack_str,
         },
         metric_events::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -154,6 +154,8 @@ const ADMITTED_EVERY: Duration = Duration::from_secs(5);
 const HISTORY_EVERY: Duration = Duration::from_secs(5);
 /// How often the gossip table goes out whole.
 const PEERS_EVERY: Duration = Duration::from_secs(15);
+/// How often our blocks this epoch go out whole, besides at turn-on and a new epoch or identity.
+const OWN_EVERY: Duration = Duration::from_secs(10);
 /// How often every validator info entry goes out; changes go out as banks freeze.
 const INFO_EVERY: Duration = Duration::from_secs(60);
 /// How often points sent once an hour, a run or an epoch go again, for a subscriber that missed them.
@@ -161,6 +163,9 @@ const LATCHED_EVERY: Duration = Duration::from_secs(60);
 /// Set events sent before a pause, so a set larger than its stream arrives whole.
 const PACE_BATCH: usize = 512;
 const PACE_PAUSE: Duration = Duration::from_millis(50);
+/// Slots under the root within which an unreadable block is read again next tick, as a leader's
+/// own block can be rooted before its last shreds are stored.
+const SETTLE_SLOTS: u64 = 32;
 /// Blocks read per tick behind the root.
 const BLOCKS_PER_TICK: u64 = 64;
 
@@ -194,6 +199,10 @@ pub struct EventOutput {
     blocks: Publisher<BlockEvent>,
     /// The next rooted slot whose block goes out.
     next_block: Option<solana_clock::Slot>,
+    own_blocks: Publisher<OwnBlockEvent>,
+    /// Our blocks this epoch read so far; `None` while the stream is off.
+    own: Option<OwnBlocks>,
+    own_generation: u64,
     node: Resent<NodeInfoEvent>,
     status: Resent<SlotStatusEvent>,
     epoch: Resent<EpochEvent>,
@@ -232,6 +241,9 @@ impl EventOutput {
             ledger_sent: std::collections::BTreeMap::new(),
             blocks: stream(event_system, BLOCK_STREAM, 512)?,
             next_block: None,
+            own_blocks: stream(event_system, OWN_BLOCK_STREAM, 1024)?,
+            own: None,
+            own_generation: 0,
             node: Resent::new(stream(event_system, NODE_INFO_STREAM, 16)?),
             status: Resent::new(stream(event_system, SLOT_STATUS_STREAM, 256)?),
             epoch: Resent::new(stream(event_system, EPOCH_STREAM, 16)?),
@@ -259,8 +271,11 @@ impl EventOutput {
     fn tick(&mut self, held_src: &Arc<dyn Source>) {
         let src = held_src.as_ref();
         let now = Instant::now();
+        // One root for the blocks and the root clock, so no root goes out ahead of its block.
+        let root_bank = src.root_bank();
         self.send_ledger(src);
-        self.send_blocks(src);
+        self.send_blocks(src, root_bank.as_ref());
+        self.send_own_blocks(src, root_bank.as_ref(), now);
         self.send_admitted(src, now);
         self.send_history(src, now);
         self.send_blocks_read(src);
@@ -297,9 +312,8 @@ impl EventOutput {
             );
         }
         if wants_banks[2] {
-            let root = src.root_bank();
             self.root.offer(
-                clock_event(ROLE_ROOT, root.as_ref(), &identity, &vote_account),
+                clock_event(ROLE_ROOT, root_bank.as_ref(), &identity, &vote_account),
                 now,
             );
         }
@@ -557,23 +571,151 @@ impl EventOutput {
     }
 
     /// Each rooted slot's block, from the root at turn-on.
-    fn send_blocks(&mut self, src: &dyn Source) {
+    fn send_blocks(&mut self, src: &dyn Source, root_bank: &dyn BankView) {
         if !self.blocks.is_enabled() {
             self.next_block = None;
             return;
         }
-        let root = src.commitment().root.max(src.root_bank().slot());
-        let next = *self.next_block.get_or_insert(root);
+        let root = src.commitment().root.max(root_bank.slot());
+        let mut next = *self.next_block.get_or_insert(root);
         let last = root.min(next.saturating_add(BLOCKS_PER_TICK).saturating_sub(1));
-        for slot in next..=last {
-            let _ = self
-                .blocks
-                .publish(&block_event(slot, src.block(slot, root)));
+        while next <= last {
+            let block = src.block(next, root);
+            if !settled(next, root, &block) {
+                break;
+            }
+            let _ = self.blocks.publish(&block_event(next, block));
+            next = next.saturating_add(1);
         }
-        if last >= next {
-            self.next_block = Some(last.saturating_add(1));
-        }
+        self.next_block = Some(next);
     }
+
+    /// Our blocks this epoch up to the root, whole once read: at turn-on, at a new epoch or
+    /// identity, and every `OWN_EVERY`.
+    fn send_own_blocks(&mut self, src: &dyn Source, root_bank: &dyn BankView, now: Instant) {
+        if !self.own_blocks.is_enabled() {
+            self.own = None;
+            return;
+        }
+        let key = (root_bank.epoch(), src.identity());
+        if self.own.as_ref().is_none_or(|own| own.key != key) {
+            self.own = OwnBlocks::new(src, root_bank, key);
+        }
+        let Some(own) = self.own.as_mut() else {
+            return;
+        };
+        let root = root_bank.slot();
+        if !own.read_to(src, root)
+            || own
+                .sent
+                .is_some_and(|at| now.duration_since(at) < OWN_EVERY)
+        {
+            return;
+        }
+        self.own_generation = self.own_generation.saturating_add(1);
+        own.sent = Some(now);
+        // Two batches at 724 slots; past about 2,000 the pauses would fill a tick.
+        publish_paced(
+            &mut self.own_blocks,
+            &own_block_events(key, self.own_generation, root, &own.events),
+        );
+    }
+}
+
+/// Our blocks of one epoch, read a tick's worth at a time.
+pub(crate) struct OwnBlocks {
+    key: (solana_clock::Epoch, solana_pubkey::Pubkey),
+    leader_slots: Vec<solana_clock::Slot>,
+    next: usize,
+    events: Vec<BlockEvent>,
+    sent: Option<Instant>,
+}
+
+impl OwnBlocks {
+    pub(crate) fn new(
+        src: &dyn Source,
+        bank: &dyn BankView,
+        key: (solana_clock::Epoch, solana_pubkey::Pubkey),
+    ) -> Option<Self> {
+        let (epoch, me) = key;
+        Some(Self {
+            key,
+            leader_slots: crate::collect::leader_slots_in_epoch(src, bank, epoch, &me)?,
+            next: 0,
+            events: Vec::new(),
+            sent: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_slots(&self) -> Vec<solana_clock::Slot> {
+        self.events.iter().map(|event| event.slot).collect()
+    }
+
+    /// Reads up to `BLOCKS_PER_TICK` more of our slots up to `root`; whether all are read.
+    pub(crate) fn read_to(&mut self, src: &dyn Source, root: solana_clock::Slot) -> bool {
+        let mut read = 0u64;
+        while let Some(slot) = self.leader_slots.get(self.next).copied() {
+            if slot > root || read == BLOCKS_PER_TICK {
+                break;
+            }
+            let block = src.block(slot, root);
+            if !settled(slot, root, &block) {
+                break;
+            }
+            self.events.push(block_event(slot, block));
+            self.next = self.next.saturating_add(1);
+            read = read.saturating_add(1);
+        }
+        self.leader_slots
+            .get(self.next)
+            .is_none_or(|slot| *slot > root)
+    }
+}
+
+/// Whether a block read up to `root` is final.
+fn settled(
+    slot: solana_clock::Slot,
+    root: solana_clock::Slot,
+    block: &crate::certs::Block,
+) -> bool {
+    !matches!(
+        block,
+        crate::certs::Block::Opaque | crate::certs::Block::Pending
+    ) || slot.saturating_add(SETTLE_SLOTS) <= root
+}
+
+/// Our blocks as one set; with none, one event with `count` 0.
+pub(crate) fn own_block_events(
+    (epoch, identity): (solana_clock::Epoch, solana_pubkey::Pubkey),
+    generation: u64,
+    covered_to: solana_clock::Slot,
+    blocks: &[BlockEvent],
+) -> Vec<OwnBlockEvent> {
+    let count = u32::try_from(blocks.len()).unwrap_or(u32::MAX);
+    let (pid, tid, timestamp_ns) = header();
+    let place = |index| OwnSetPlace {
+        pid,
+        tid,
+        timestamp_ns,
+        epoch,
+        identity: identity.to_bytes(),
+        generation,
+        index,
+        count,
+        covered_to,
+    };
+    if blocks.is_empty() {
+        return vec![OwnBlockEvent::new(
+            place(0),
+            &block_event(0, crate::certs::Block::Opaque),
+        )];
+    }
+    blocks
+        .iter()
+        .zip(0u32..)
+        .map(|(block, index)| OwnBlockEvent::new(place(index), block))
+        .collect()
 }
 
 fn pack_addrs(peer: &crate::source::PeerRow) -> [u8; ADDRS * ADDR_BYTES] {
@@ -810,7 +952,7 @@ pub(crate) fn history_events(
         .collect()
 }
 
-fn block_event(slot: solana_clock::Slot, block: crate::certs::Block) -> BlockEvent {
+pub(crate) fn block_event(slot: solana_clock::Slot, block: crate::certs::Block) -> BlockEvent {
     let (pid, tid, timestamp_ns) = header();
     let mut event = BlockEvent {
         pid,

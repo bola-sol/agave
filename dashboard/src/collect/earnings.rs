@@ -182,6 +182,8 @@ pub(super) struct EarningsWalk {
     bonus: u64,
     bonus_lost: u64,
     unread: u32,
+    /// The figures last published, kept while a block is still to arrive.
+    shown: Option<EpochEarnings>,
 }
 
 impl Collector {
@@ -192,7 +194,8 @@ impl Collector {
             .publish(&self.publisher, earnings);
     }
 
-    /// `None` until every block of ours the root has passed is read.
+    /// `None` until every block of ours the root has passed is read, then the last figures while
+    /// one is still to arrive.
     fn read_earnings(&mut self, bank: &dyn BankView) -> Option<EpochEarnings> {
         if !bank.is_alpenglow() {
             return None;
@@ -229,7 +232,7 @@ impl Collector {
             .get(walk.next)
             .is_some_and(|slot| *slot <= root)
         {
-            return None;
+            return walk.shown;
         }
 
         let row = bank.vote_row(&self.src.vote_account())?;
@@ -237,7 +240,7 @@ impl Collector {
         let start = bank.epoch_schedule().get_first_slot_in_epoch(epoch);
         let passed = root.saturating_sub(start).saturating_add(1);
         let blocks = u64::try_from(walk.leader_slots.len()).unwrap_or(u64::MAX);
-        Some(EpochEarnings {
+        let earnings = EpochEarnings {
             epoch,
             voting,
             voting_lost: passed
@@ -249,7 +252,9 @@ impl Collector {
             bonus_max: blocks.saturating_mul(rates.full_block),
             commission_bps: row.inflation_rewards_commission_bps,
             unread: walk.unread,
-        })
+        };
+        self.earnings.shown = Some(earnings);
+        Some(earnings)
     }
 
     /// Latched once the schedule is in hand; reading it walks the whole epoch.

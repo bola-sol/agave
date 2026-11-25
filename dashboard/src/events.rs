@@ -13,6 +13,7 @@ pub const EPOCH_STREAM: StreamName = agave_event_system::stream_name!("bank.epoc
 pub const SLOT_CLOCK_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_clock");
 pub const LEDGER_SLOT_STREAM: StreamName = agave_event_system::stream_name!("ledger.first_shred");
 pub const BLOCK_STREAM: StreamName = agave_event_system::stream_name!("ledger.reward_cert");
+pub const OWN_BLOCK_STREAM: StreamName = agave_event_system::stream_name!("ledger.own_reward_cert");
 pub const ADMITTED_STREAM: StreamName = agave_event_system::stream_name!("bank.admitted");
 pub const SLOT_HISTORY_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_history");
 pub const TX_OUTCOME_STREAM: StreamName = agave_event_system::stream_name!("ledger.tx_outcome");
@@ -151,7 +152,7 @@ pub struct AdmittedEvent {
 /// Words of the slot history per event.
 pub const HISTORY_WORDS: usize = 256;
 
-/// One part of the root bank's slot history bitmap, sent whole at turn-on and every 30 seconds.
+/// One part of the root bank's slot history bitmap, sent whole at turn-on and every 5 seconds.
 #[event]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotHistoryEvent {
@@ -246,6 +247,94 @@ pub struct BlockEvent {
     pub skip: [u8; BITMAP_BYTES],
     pub has_fast: bool,
     pub fast: bool,
+}
+
+/// One of our blocks this epoch up to `covered_to`, as a member of a set sent whole every few
+/// seconds. A set with none is one event with `count` 0.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnBlockEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub epoch: Epoch,
+    pub identity: [u8; 32],
+    pub generation: u64,
+    pub index: u32,
+    pub count: u32,
+    /// The root the set was read up to.
+    pub covered_to: Slot,
+    pub slot: Slot,
+    pub kind: u8,
+    pub close_nanos: u64,
+    pub has_notar: bool,
+    pub notar_len: u16,
+    pub notar: [u8; BITMAP_BYTES],
+    pub has_skip: bool,
+    pub skip_len: u16,
+    pub skip: [u8; BITMAP_BYTES],
+    pub has_fast: bool,
+    pub fast: bool,
+}
+
+/// Who sent an own block set, where it belongs and the event's place in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnSetPlace {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub epoch: Epoch,
+    pub identity: [u8; 32],
+    pub generation: u64,
+    pub index: u32,
+    pub count: u32,
+    pub covered_to: Slot,
+}
+
+impl OwnBlockEvent {
+    pub fn new(place: OwnSetPlace, block: &BlockEvent) -> Self {
+        Self {
+            pid: place.pid,
+            tid: place.tid,
+            timestamp_ns: place.timestamp_ns,
+            epoch: place.epoch,
+            identity: place.identity,
+            generation: place.generation,
+            index: place.index,
+            count: place.count,
+            covered_to: place.covered_to,
+            slot: block.slot,
+            kind: block.kind,
+            close_nanos: block.close_nanos,
+            has_notar: block.has_notar,
+            notar_len: block.notar_len,
+            notar: block.notar,
+            has_skip: block.has_skip,
+            skip_len: block.skip_len,
+            skip: block.skip,
+            has_fast: block.has_fast,
+            fast: block.fast,
+        }
+    }
+
+    pub fn block(&self) -> BlockEvent {
+        BlockEvent {
+            pid: self.pid,
+            tid: self.tid,
+            timestamp_ns: self.timestamp_ns,
+            slot: self.slot,
+            kind: self.kind,
+            close_nanos: self.close_nanos,
+            has_notar: self.has_notar,
+            notar_len: self.notar_len,
+            notar: self.notar,
+            has_skip: self.has_skip,
+            skip_len: self.skip_len,
+            skip: self.skip,
+            has_fast: self.has_fast,
+            fast: self.fast,
+        }
+    }
 }
 
 pub const OUTCOME_SUCCEEDED: u8 = 0;

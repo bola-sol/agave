@@ -8,9 +8,10 @@ use {
             ADMITTED_STREAM, AdmittedEvent, BLOCK_STREAM, BlockEvent, EPOCH_STREAM, EpochEvent,
             FINALIZATION_STREAM, FinalizationEvent, GOSSIP_PEER_STREAM, GossipPeerEvent,
             LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM, MessageVersionsEvent,
-            NODE_INFO_STREAM, NodeInfoEvent, SLOT_CLOCK_STREAM, SLOT_HISTORY_STREAM,
-            SLOT_STATUS_STREAM, SlotClockEvent, SlotHistoryEvent, SlotStatusEvent,
-            TX_OUTCOME_STREAM, TxOutcomeEvent, VALIDATOR_INFO_STREAM, ValidatorInfoEvent,
+            NODE_INFO_STREAM, NodeInfoEvent, OWN_BLOCK_STREAM, OwnBlockEvent, SLOT_CLOCK_STREAM,
+            SLOT_HISTORY_STREAM, SLOT_STATUS_STREAM, SlotClockEvent, SlotHistoryEvent,
+            SlotStatusEvent, TX_OUTCOME_STREAM, TxOutcomeEvent, VALIDATOR_INFO_STREAM,
+            ValidatorInfoEvent,
         },
         metric_events::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -106,6 +107,7 @@ stamped!(
     SlotClockEvent,
     LedgerSlotEvent,
     BlockEvent,
+    OwnBlockEvent,
     AdmittedEvent,
     SlotHistoryEvent,
     TxOutcomeEvent,
@@ -517,6 +519,7 @@ pub struct EventInput {
     pub clock: Stream<SlotClockEvent>,
     pub ledger: Stream<LedgerSlotEvent>,
     pub blocks: Stream<BlockEvent>,
+    pub own_blocks: Stream<OwnBlockEvent>,
     pub admitted: Stream<AdmittedEvent>,
     pub history: Stream<SlotHistoryEvent>,
     pub outcomes: Stream<TxOutcomeEvent>,
@@ -562,6 +565,7 @@ impl EventInput {
             clock: Stream::new(SLOT_CLOCK_STREAM),
             ledger: Stream::new(LEDGER_SLOT_STREAM),
             blocks: Stream::new(BLOCK_STREAM),
+            own_blocks: Stream::new(OWN_BLOCK_STREAM),
             admitted: Stream::new(ADMITTED_STREAM),
             history: Stream::new(SLOT_HISTORY_STREAM),
             outcomes: Stream::new(TX_OUTCOME_STREAM),
@@ -614,6 +618,12 @@ impl EventInput {
         self.clock.connect(dir, &explorer);
         self.ledger.connect(dir, &explorer);
         self.blocks.connect(dir, &explorer);
+        let own_resubscribed = self.own_blocks.connect(dir, &explorer);
+        if own_resubscribed {
+            self.mirror.reset_set(SetStream::OwnBlocks);
+        }
+        self.mirror
+            .set_own_blocks_connected(self.own_blocks.connected(), own_resubscribed);
         self.versions.connect(dir, &explorer);
         for (resubscribed, stream) in [
             (self.wait.connect(dir, &explorer), SetStream::Wait),
@@ -655,6 +665,8 @@ impl EventInput {
         self.clock.disconnect();
         self.ledger.disconnect();
         self.blocks.disconnect();
+        self.own_blocks.disconnect();
+        self.mirror.set_own_blocks_connected(false, false);
         self.admitted.disconnect();
         self.history.disconnect();
         self.outcomes.disconnect();
@@ -700,6 +712,8 @@ impl EventInput {
         self.bank_frozen.drain(|event| mirror.apply_frozen(&event));
         self.ledger.drain(|event| mirror.apply_ledger(&event));
         self.blocks.drain(|event| mirror.apply_block(&event));
+        self.own_blocks
+            .drain(|event| mirror.apply_own_block(&event));
         self.admitted.drain(|event| mirror.apply_admitted(&event));
         self.history.drain(|event| mirror.apply_history(&event));
         // Versions first: a block reads as full once its outcomes are applied.
@@ -809,6 +823,7 @@ impl EventInput {
             clock,
             ledger,
             blocks,
+            own_blocks,
             admitted,
             history,
             outcomes,

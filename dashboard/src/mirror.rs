@@ -12,9 +12,9 @@ use {
             ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, AdmittedEvent, BITMAP_BYTES, BLOCK_FOOTER,
             BLOCK_MISSING, BlockEvent, EpochEvent, FinalizationEvent, GossipPeerEvent,
             INFO_FULL_SET, LedgerSlotEvent, MessageVersionsEvent, NodeInfoEvent, OUTCOME_FAILED,
-            OUTCOME_SUCCEEDED, PATH_BYTES, ROLE_ROOT, SlotClockEvent, SlotHistoryEvent,
-            SlotStatusEvent, TxOutcomeEvent, ValidatorInfoEvent, unpack_addr, unpack_path,
-            unpack_str,
+            OUTCOME_SUCCEEDED, OwnBlockEvent, PATH_BYTES, ROLE_ROOT, SlotClockEvent,
+            SlotHistoryEvent, SlotStatusEvent, TxOutcomeEvent, ValidatorInfoEvent, unpack_addr,
+            unpack_path, unpack_str,
         },
         snapshot,
         source::{
@@ -70,6 +70,18 @@ const FINALIZATION_WAIT: std::time::Duration = if cfg!(test) {
 } else {
     std::time::Duration::from_secs(1)
 };
+/// How long slots above the newest block sent at its root read as pending after it arrived.
+const BLOCKS_STALE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(20)
+};
+/// How long our blocks read as pending while their set is awaited.
+const OWN_SET_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(60)
+};
 
 /// Rank maps by epoch, shared by every bank built from one state.
 type Stakes = Arc<BTreeMap<Epoch, EpochStakeView>>;
@@ -98,6 +110,7 @@ pub enum SetStream {
     History,
     Admitted,
     Outcomes,
+    OwnBlocks,
 }
 
 /// A set's parts as they arrive, by index, for one generation.
@@ -633,6 +646,8 @@ struct State {
     ledger: BTreeMap<Slot, LedgerSlot>,
     rooted: BTreeSet<Slot>,
     blocks: BTreeMap<Slot, BlockEvent>,
+    /// The newest block sent at its root, and when it arrived.
+    blocks_to: Option<(Slot, std::time::Instant)>,
     shared: Shared,
     /// Each full block's non-vote transactions, and whether it was ours.
     outcomes: BTreeMap<Slot, (bool, Vec<TxOutcome>)>,
@@ -640,6 +655,20 @@ struct State {
     versions: BTreeMap<Slot, TxVersions>,
     pending_admitted: HashMap<Epoch, Option<PendingSet<AdmittedEvent>>>,
     pending_history: Option<PendingSet<SlotHistoryEvent>>,
+    /// Our blocks this epoch from the newest whole set.
+    own: Option<OwnSet>,
+    pending_own: Option<PendingSet<OwnBlockEvent>>,
+    /// Since when the own block stream has been connected; `None` while it is not.
+    own_connected: Option<std::time::Instant>,
+    /// The epoch and identity whose set our blocks wait for, and since when.
+    own_awaited: Option<((Epoch, Pubkey), std::time::Instant)>,
+}
+
+/// Our blocks of one epoch, as the validator read them up to a root.
+struct OwnSet {
+    epoch: Epoch,
+    identity: Pubkey,
+    blocks: BTreeMap<Slot, BlockEvent>,
 }
 
 pub struct Mirror {
@@ -715,6 +744,17 @@ impl Mirror {
             SetStream::History => state.pending_history = None,
             SetStream::Admitted => state.pending_admitted.clear(),
             SetStream::Outcomes => state.pending_outcomes.clear(),
+            SetStream::OwnBlocks => state.pending_own = None,
+        }
+    }
+
+    /// Whether the own block stream is connected, and whether its queue is new.
+    pub fn set_own_blocks_connected(&self, connected: bool, resubscribed: bool) {
+        let mut state = self.state.write().unwrap();
+        if !connected {
+            state.own_connected = None;
+        } else if resubscribed || state.own_connected.is_none() {
+            state.own_connected = Some(std::time::Instant::now());
         }
     }
 
@@ -1100,8 +1140,34 @@ impl Mirror {
         }
     }
 
+    pub fn apply_own_block(&self, event: &OwnBlockEvent) {
+        let mut state = self.state.write().unwrap();
+        let Some(parts) = PendingSet::add(
+            &mut state.pending_own,
+            event.generation,
+            event.index,
+            event.count.max(1),
+            event.clone(),
+        ) else {
+            return;
+        };
+        state.own = Some(OwnSet {
+            epoch: event.epoch,
+            identity: Pubkey::new_from_array(event.identity),
+            blocks: parts
+                .iter()
+                .filter(|part| part.count > 0)
+                .map(|part| (part.slot, part.block()))
+                .collect(),
+        });
+    }
+
     pub fn apply_block(&self, event: &BlockEvent) {
         let mut state = self.state.write().unwrap();
+        let newest = state
+            .blocks_to
+            .map_or(event.slot, |(to, _)| to.max(event.slot));
+        state.blocks_to = Some((newest, std::time::Instant::now()));
         state.blocks.insert(event.slot, event.clone());
         while state.blocks.len() > BLOCKS_KEPT {
             state.blocks.pop_first();
@@ -1197,6 +1263,40 @@ impl Mirror {
         let frozen = state.frozen.keys().next_back().copied().unwrap_or(0);
         let working = state.working.as_ref().map_or(0, |clock| clock.slot);
         reported.max(frozen).max(working)
+    }
+
+    /// Whether `slot` is ours in the root's epoch and that epoch's own block set is still awaited.
+    fn own_awaited(&self, slot: Slot, root: Slot) -> bool {
+        let state = self.state.read().unwrap();
+        let (Some(connected), Some(facts), Some(me)) = (
+            state.own_connected,
+            state.epoch.as_ref(),
+            state.node.as_ref().map(|node| node.identity),
+        ) else {
+            return false;
+        };
+        let schedule = &facts.schedule;
+        let epoch = schedule.get_epoch(root);
+        if schedule.get_epoch(slot) != epoch
+            || Self::leader_of(&state, schedule, slot) != Some(me)
+            || state
+                .own
+                .as_ref()
+                .is_some_and(|own| own.epoch == epoch && own.identity == me)
+        {
+            return false;
+        }
+        let awaited = state.own_awaited;
+        drop(state);
+        let now = std::time::Instant::now();
+        let since = match awaited {
+            Some((key, since)) if key == (epoch, me) => since,
+            _ => {
+                self.state.write().unwrap().own_awaited = Some(((epoch, me), now));
+                now
+            }
+        };
+        now.duration_since(since.max(connected)) < OWN_SET_WAIT
     }
 
     /// The turn leader of `slot`, where its epoch's schedule has arrived.
@@ -1496,8 +1596,21 @@ impl Source for Mirror {
             return Block::Pending;
         }
         let state = self.state.read().unwrap();
-        let Some(event) = state.blocks.get(&slot) else {
-            return Block::Opaque;
+        let held = state
+            .blocks
+            .get(&slot)
+            .or_else(|| state.own.as_ref().and_then(|own| own.blocks.get(&slot)));
+        let Some(event) = held else {
+            // The validator holds a block back while it settles, so its root can run ahead.
+            let behind = state
+                .blocks_to
+                .is_some_and(|(to, at)| slot > to && at.elapsed() < BLOCKS_STALE);
+            drop(state);
+            return if behind || self.own_awaited(slot, root) {
+                Block::Pending
+            } else {
+                Block::Opaque
+            };
         };
         let bitmap = |has: bool, len: u16, bytes: &[u8; BITMAP_BYTES]| {
             has.then(|| bytes.get(..usize::from(len)).unwrap_or_default().to_vec())
@@ -2021,5 +2134,190 @@ mod tests {
         );
         // Epoch 1's schedule has not arrived.
         assert_eq!(mirror.next_leader_slot(&me, 27, bank.as_ref(), 100), None);
+    }
+
+    /// A mirror whose node leads turns 1, 2 and 6 of a 32-slot epoch 0, with the own block
+    /// stream connected.
+    fn own_mirror() -> (Mirror, Pubkey) {
+        let harness = fixture();
+        let direct = Direct::new(harness.ctx.clone(), None);
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
+        mirror.apply_node(&node_event(&direct, 0));
+        let (me, other) = (direct.identity(), Pubkey::new_unique());
+        let leaders = [other, me, me, other, other, other, me, other];
+        mirror.apply_schedule(&EpochInfo {
+            epoch: 0,
+            start_slot: 0,
+            end_slot: 31,
+            slots_in_epoch: 32,
+            my_leader_slots: Vec::new(),
+            leaders: vec![other.to_string(), me.to_string()],
+            turns: leaders.iter().map(|key| u16::from(*key == me)).collect(),
+            block_cost_limit: 0,
+            account_cost_limit: 0,
+        });
+        mirror.apply_epoch(&EpochEvent {
+            slots_per_epoch: 32,
+            leader_schedule_slot_offset: 32,
+            warmup: false,
+            first_normal_epoch: 0,
+            first_normal_slot: 0,
+            ..empty_epoch()
+        });
+        mirror.set_own_blocks_connected(true, true);
+        (mirror, me)
+    }
+
+    fn footer(close_nanos: u64) -> Block {
+        Block::Footer(Box::new(FooterFacts {
+            close_nanos,
+            notar_bitmap: Some(vec![1, 2]),
+            skip_bitmap: None,
+            fast: Some(true),
+        }))
+    }
+
+    fn own_set(
+        epoch: Epoch,
+        me: Pubkey,
+        generation: u64,
+        blocks: &[(Slot, Block)],
+    ) -> Vec<OwnBlockEvent> {
+        let blocks: Vec<BlockEvent> = blocks
+            .iter()
+            .map(|(slot, block)| {
+                let block = match block {
+                    Block::Footer(facts) => Block::Footer(facts.clone()),
+                    Block::Missing => Block::Missing,
+                    Block::Pending => Block::Pending,
+                    Block::Opaque => Block::Opaque,
+                };
+                crate::event_output::block_event(*slot, block)
+            })
+            .collect();
+        crate::event_output::own_block_events((epoch, me), generation, 20, &blocks)
+    }
+
+    #[test]
+    fn test_our_blocks_wait_for_their_set_and_no_others_do() {
+        let (mirror, _) = own_mirror();
+        assert!(matches!(mirror.block(5, 20), Block::Pending));
+        assert!(matches!(mirror.block(12, 20), Block::Opaque));
+        // Ours, but in the epoch before the root's.
+        assert!(matches!(mirror.block(5, 40), Block::Opaque));
+        // A block sent at its root answers while the set is awaited.
+        mirror.apply_block(&crate::event_output::block_event(5, footer(7)));
+        assert!(matches!(mirror.block(5, 20), Block::Footer(_)));
+        assert!(matches!(mirror.block(4, 20), Block::Pending));
+        mirror.set_own_blocks_connected(false, false);
+        assert!(matches!(mirror.block(4, 20), Block::Opaque));
+    }
+
+    #[test]
+    fn test_a_whole_own_set_answers_for_our_blocks() {
+        let (mirror, me) = own_mirror();
+        let mut set = own_set(0, me, 1, &[(4, footer(9)), (5, Block::Missing)]);
+        assert_eq!(
+            set.iter().map(|part| part.count).collect::<Vec<_>>(),
+            [2, 2]
+        );
+        assert_eq!(set[1].covered_to, 20);
+        let last = set.pop().unwrap();
+        mirror.apply_own_block(&set[0]);
+        assert!(matches!(mirror.block(6, 20), Block::Pending));
+        // A resubscribed stream drops the partial set.
+        mirror.reset_set(SetStream::OwnBlocks);
+        mirror.apply_own_block(&last);
+        assert!(matches!(mirror.block(6, 20), Block::Pending));
+        for part in own_set(0, me, 2, &[(4, footer(9)), (5, Block::Missing)]) {
+            mirror.apply_own_block(&part);
+        }
+        match mirror.block(4, 20) {
+            Block::Footer(facts) => {
+                assert_eq!(facts.close_nanos, 9);
+                assert_eq!(facts.notar_bitmap, Some(vec![1, 2]));
+                assert_eq!(facts.fast, Some(true));
+            }
+            _ => panic!("expected a footer"),
+        }
+        assert!(matches!(mirror.block(5, 20), Block::Missing));
+        // Ours, but not in the set.
+        assert!(matches!(mirror.block(6, 20), Block::Opaque));
+    }
+
+    #[test]
+    fn test_only_this_epochs_set_for_our_identity_ends_the_wait() {
+        let (mirror, me) = own_mirror();
+        for part in own_set(0, Pubkey::new_unique(), 1, &[]) {
+            mirror.apply_own_block(&part);
+        }
+        assert!(matches!(mirror.block(5, 20), Block::Pending));
+        for part in own_set(1, me, 2, &[]) {
+            mirror.apply_own_block(&part);
+        }
+        assert!(matches!(mirror.block(5, 20), Block::Pending));
+        let empty = own_set(0, me, 3, &[]);
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].count, 0);
+        mirror.apply_own_block(&empty[0]);
+        assert!(matches!(mirror.block(5, 20), Block::Opaque));
+    }
+
+    #[test]
+    fn test_our_blocks_stop_waiting_after_a_while() {
+        let (mirror, _) = own_mirror();
+        assert!(matches!(mirror.block(5, 20), Block::Pending));
+        std::thread::sleep(OWN_SET_WAIT);
+        assert!(matches!(mirror.block(5, 20), Block::Opaque));
+    }
+
+    #[test]
+    fn test_a_block_comes_back_whole_through_an_own_set() {
+        let block = crate::event_output::block_event(4, footer(3));
+        let place = crate::events::OwnSetPlace {
+            pid: block.pid,
+            tid: block.tid,
+            timestamp_ns: block.timestamp_ns,
+            epoch: 2,
+            identity: [7; 32],
+            generation: 1,
+            index: 0,
+            count: 1,
+            covered_to: 4,
+        };
+        assert_eq!(OwnBlockEvent::new(place, &block).block(), block);
+    }
+
+    #[test]
+    fn test_a_slot_past_the_newest_block_sent_waits_for_it_a_while() {
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
+        assert!(matches!(mirror.block(9, 20), Block::Opaque));
+        mirror.apply_block(&crate::event_output::block_event(10, Block::Missing));
+        assert!(matches!(mirror.block(9, 20), Block::Opaque));
+        assert!(matches!(mirror.block(11, 20), Block::Pending));
+        std::thread::sleep(BLOCKS_STALE);
+        assert!(matches!(mirror.block(11, 20), Block::Opaque));
+    }
+
+    #[test]
+    fn test_the_sender_reads_our_slots_up_to_the_root_and_resumes() {
+        use crate::event_output::OwnBlocks;
+        let harness = fixture();
+        let bank = harness.advance_to(20);
+        let direct = Direct::new(harness.ctx.clone(), None);
+        let me = direct.identity();
+        let view = direct.root_bank();
+        let mut own = OwnBlocks::new(&direct, view.as_ref(), (0, me)).unwrap();
+        let ours: Vec<Slot> = crate::collect::leader_slots_in_epoch(&direct, view.as_ref(), 0, &me)
+            .unwrap()
+            .into_iter()
+            .filter(|slot| *slot <= 20)
+            .collect();
+        assert!(!ours.is_empty());
+        assert!(own.read_to(&direct, 10));
+        let first = ours.iter().filter(|slot| **slot <= 10).count();
+        assert_eq!(own.read_slots(), &ours[..first]);
+        assert!(own.read_to(&direct, bank.slot()));
+        assert_eq!(own.read_slots(), ours);
     }
 }
