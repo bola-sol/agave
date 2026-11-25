@@ -1,5 +1,5 @@
 //! Vote accounts and leader schedules (the previous, this and the next epoch's) as sets of
-//! events, resent in full every 30 seconds.
+//! events, resent in full every 5 seconds for subscribers that join late.
 //! Members of a set share a `generation`, and `index` and `count` mark when it is complete.
 //! Vote accounts are read from the working bank, and each tick sends those that changed,
 //! last vote included.
@@ -38,7 +38,7 @@ pub const VOTE_ACCOUNT_CHANGE: u8 = 1;
 pub const TURNS_PER_EVENT: usize = 256;
 
 const TICK: Duration = Duration::from_secs(1);
-const FULL_SET_INTERVAL: Duration = Duration::from_secs(30);
+const FULL_SET_INTERVAL: Duration = Duration::from_secs(5);
 const PACE_BATCH: usize = 512;
 const PACE_PAUSE: Duration = Duration::from_millis(50);
 

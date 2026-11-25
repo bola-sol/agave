@@ -1149,14 +1149,18 @@ impl Mirror {
 
     /// A completed epoch schedule.
     pub fn apply_schedule(&self, info: &EpochInfo) {
+        let Ok(keys) = info
+            .leaders
+            .iter()
+            .map(|key| Pubkey::from_str(key))
+            .collect::<Result<Vec<Pubkey>, _>>()
+        else {
+            return;
+        };
         let Some(leaders) = info
             .turns
             .iter()
-            .map(|index| {
-                info.leaders
-                    .get(usize::from(*index))
-                    .and_then(|key| Pubkey::from_str(key).ok())
-            })
+            .map(|index| keys.get(usize::from(*index)).copied())
             .collect::<Option<Vec<Pubkey>>>()
         else {
             return;
