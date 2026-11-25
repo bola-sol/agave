@@ -9,9 +9,8 @@ use {
             FINALIZATION_STREAM, FinalizationEvent, GOSSIP_PEER_STREAM, GossipPeerEvent,
             LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM, MessageVersionsEvent,
             NODE_INFO_STREAM, NodeInfoEvent, SLOT_CLOCK_STREAM, SLOT_HISTORY_STREAM,
-            SLOT_STATUS_STREAM, START_PROGRESS_STREAM, SlotClockEvent, SlotHistoryEvent,
-            SlotStatusEvent, StartProgressEvent, TX_OUTCOME_STREAM, TxOutcomeEvent,
-            VALIDATOR_INFO_STREAM, ValidatorInfoEvent,
+            SLOT_STATUS_STREAM, SlotClockEvent, SlotHistoryEvent, SlotStatusEvent,
+            TX_OUTCOME_STREAM, TxOutcomeEvent, VALIDATOR_INFO_STREAM, ValidatorInfoEvent,
         },
         metric_events::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -37,6 +36,10 @@ use {
         },
         replay_stage::events::{BANK_FROZEN_STREAM, BankFrozenEvent, SLOT_EVENT_STREAM, SlotEvent},
         shred_fetch_events::{SHRED_FETCH_PATH_REPAIR, SHRED_FETCH_STREAM, ShredFetchCounters},
+        start_events::{
+            START_PROGRESS_STREAM, SUPERMAJORITY_WAIT_STREAM, StartProgressEvent,
+            SupermajorityWaitEvent,
+        },
     },
     solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_pubkey::Pubkey,
@@ -97,6 +100,7 @@ macro_rules! stamped {
 stamped!(
     NodeInfoEvent,
     StartProgressEvent,
+    SupermajorityWaitEvent,
     SlotStatusEvent,
     EpochEvent,
     SlotClockEvent,
@@ -507,6 +511,7 @@ pub struct EventInput {
     pub schedule: Stream<LeaderScheduleEvent>,
     pub node: Stream<NodeInfoEvent>,
     pub progress: Stream<StartProgressEvent>,
+    pub wait: Stream<SupermajorityWaitEvent>,
     pub status: Stream<SlotStatusEvent>,
     pub epoch: Stream<EpochEvent>,
     pub clock: Stream<SlotClockEvent>,
@@ -551,6 +556,7 @@ impl EventInput {
             schedule: Stream::new(LEADER_SCHEDULE_STREAM),
             node: Stream::new(NODE_INFO_STREAM),
             progress: Stream::new(START_PROGRESS_STREAM),
+            wait: Stream::new(SUPERMAJORITY_WAIT_STREAM),
             status: Stream::new(SLOT_STATUS_STREAM),
             epoch: Stream::new(EPOCH_STREAM),
             clock: Stream::new(SLOT_CLOCK_STREAM),
@@ -610,6 +616,7 @@ impl EventInput {
         self.blocks.connect(dir, &explorer);
         self.versions.connect(dir, &explorer);
         for (resubscribed, stream) in [
+            (self.wait.connect(dir, &explorer), SetStream::Wait),
             (self.admitted.connect(dir, &explorer), SetStream::Admitted),
             (self.history.connect(dir, &explorer), SetStream::History),
             (self.outcomes.connect(dir, &explorer), SetStream::Outcomes),
@@ -642,6 +649,7 @@ impl EventInput {
         self.schedule.disconnect();
         self.node.disconnect();
         self.progress.disconnect();
+        self.wait.disconnect();
         self.status.disconnect();
         self.epoch.disconnect();
         self.clock.disconnect();
@@ -711,6 +719,7 @@ impl EventInput {
         let mirror = &self.mirror;
         self.node.drain(|event| mirror.apply_node(&event));
         self.progress.drain(|event| mirror.apply_progress(&event));
+        self.wait.drain(|event| mirror.apply_wait(&event));
         self.status.drain(|event| mirror.apply_status(&event));
         self.epoch.drain(|event| mirror.apply_epoch(&event));
         self.clock.drain(|event| mirror.apply_clock(&event));
@@ -794,6 +803,7 @@ impl EventInput {
             schedule,
             node,
             progress,
+            wait,
             status,
             epoch,
             clock,

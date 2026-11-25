@@ -245,7 +245,11 @@ impl DashboardService {
                                 gossip_stake(cluster_info, &bank, &info_cache.read().unwrap())
                             },
                         );
-                        startup.lock().unwrap().publish_gossip(&publisher, stake);
+                        let mut startup = startup.lock().unwrap();
+                        // Read from another process, the wait comes as the validator reported it.
+                        let stake = stake.or_else(|| startup.reported_gossip().filter(|_| waiting));
+                        startup.publish_gossip(&publisher, stake);
+                        drop(startup);
                         thread::sleep(BOOT_POLL);
                     }
                     startup.lock().unwrap().publish_gossip(&publisher, None);
@@ -411,7 +415,7 @@ impl DashboardService {
             .clone()
             .ok_or_else(|| io::Error::other("the collector is not attached"))?;
         let output = crate::event_output::EventOutput::new(event_system)?;
-        self.events = Some(output.spawn(src, self.startup_progress.clone(), self.exit.clone())?);
+        self.events = Some(output.spawn(src, self.exit.clone())?);
         // Bounded so a stalled publisher costs points, not the validator's memory.
         let (sender, receiver) = crossbeam_channel::bounded(16_384);
         self.metrics_tap.forward_to(sender);
@@ -419,6 +423,11 @@ impl DashboardService {
         self.metric_events =
             Some(metrics.spawn(self.metrics_tap.clone(), receiver, self.exit.clone())?);
         Ok(())
+    }
+
+    /// Publishes the validator's start as another process's events report it.
+    pub fn report_startup_from(&self, reported: crate::startup::SharedReported) {
+        self.startup.lock().unwrap().report_from(reported);
     }
 
     /// The tap the meters and collector read, for points observed in another process.

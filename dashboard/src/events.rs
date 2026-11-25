@@ -8,8 +8,6 @@ use {
 };
 
 pub const NODE_INFO_STREAM: StreamName = agave_event_system::stream_name!("node.info");
-pub const START_PROGRESS_STREAM: StreamName =
-    agave_event_system::stream_name!("node.start_progress");
 pub const SLOT_STATUS_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_status");
 pub const EPOCH_STREAM: StreamName = agave_event_system::stream_name!("bank.epoch");
 pub const SLOT_CLOCK_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_clock");
@@ -73,21 +71,6 @@ pub struct NodeInfoEvent {
     pub incremental_snapshot_interval: u64,
     /// Gossip accepts only globally routable addresses, which the RPC node count follows.
     pub global_addresses_only: bool,
-}
-
-/// `ValidatorStartProgress`, with its fields where it has them.
-#[event]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartProgressEvent {
-    pub pid: i32,
-    pub tid: i32,
-    pub timestamp_ns: u64,
-    /// The variant in declaration order.
-    pub phase: u8,
-    pub slot: Slot,
-    pub max_slot: Slot,
-    pub gossip_stake_percent: u64,
-    pub rpc_addr: [u8; ADDR_BYTES],
 }
 
 /// Where the node stands: commitment, the highest slot, the tip and the ledger's floor.

@@ -1062,10 +1062,9 @@ impl Meters {
         let now = SystemTime::now();
         self.publisher
             .publish(TOPIC_SUMMARY, "server_time_nanos", &system_time_nanos(now));
-        let uptime = now
-            .duration_since(self.started)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        // Read from another process, uptime is the validator's.
+        let started = crate::host_stats::process_started().unwrap_or(self.started);
+        let uptime = now.duration_since(started).unwrap_or_default().as_nanos() as u64;
         self.publisher
             .publish(TOPIC_SUMMARY, "uptime_nanos", &uptime);
     }

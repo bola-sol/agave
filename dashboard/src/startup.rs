@@ -20,6 +20,7 @@ use {
     solana_time_utils::timestamp,
     std::{
         collections::HashMap,
+        sync::{Arc, RwLock},
         time::{Duration, Instant},
     },
 };
@@ -135,6 +136,53 @@ pub struct StartupPublisher {
     current: Option<(String, Instant)>,
     /// Accumulated if a phase comes round again, as `loading_ledger` does.
     taken: Vec<PhaseTiming>,
+    /// Whether the current phase was seen to begin; a phase first seen part way is not timed.
+    witnessed: bool,
+    /// What the validator reported of its start, where this process reads it from events.
+    reported: Option<SharedReported>,
+}
+
+/// The validator's own phase timings, from its start progress events.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportedTimings {
+    pub phase: &'static str,
+    pub phase_elapsed_nanos: u64,
+    /// Monotonic nanoseconds `phase_elapsed_nanos` was read at.
+    pub at_ns: u64,
+    pub taken: Vec<PhaseTiming>,
+    pub replay_origin: Option<Slot>,
+}
+
+/// The validator's start as its events report it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Reported {
+    pub timings: Option<ReportedTimings>,
+    /// The supermajority wait's newest check.
+    pub gossip: Option<GossipStake>,
+    /// Whether any reading of the validator's phase has arrived; before one, the phase shown is
+    /// only the default.
+    pub readings: bool,
+}
+
+pub type SharedReported = Arc<RwLock<Reported>>;
+
+/// Phase names in the order `solana_core::start_events::phase_code` numbers them.
+const PHASE_NAMES: [&str; solana_core::start_events::PHASES] = [
+    "initializing",
+    "searching_for_rpc_service",
+    "downloading_snapshot",
+    "cleaning_blockstore",
+    "cleaning_accounts",
+    "loading_ledger",
+    "processing_ledger",
+    "starting_services",
+    "halted",
+    "waiting_for_supermajority",
+    "running",
+];
+
+pub fn phase_name(code: u8) -> Option<&'static str> {
+    PHASE_NAMES.get(usize::from(code)).copied()
 }
 
 impl Default for StartupPublisher {
@@ -145,6 +193,8 @@ impl Default for StartupPublisher {
             replay_origin: None,
             current: None,
             taken: Vec::new(),
+            witnessed: false,
+            reported: None,
         }
     }
 }
@@ -154,12 +204,55 @@ impl StartupPublisher {
         self.gossip.publish(publisher, stake);
     }
 
+    /// Publishes the validator's reported timings over this process's, which began later.
+    pub fn report_from(&mut self, reported: SharedReported) {
+        self.reported = Some(reported);
+    }
+
+    /// The supermajority wait's newest check, as the validator reported it.
+    pub fn reported_gossip(&self) -> Option<GossipStake> {
+        self.reported
+            .as_ref()
+            .and_then(|reported| reported.read().unwrap().gossip.clone())
+    }
+
     pub fn publish(
         &mut self,
         publisher: &Publisher,
         progress: ValidatorStartProgress,
         stake_in_gossip: Option<StakeInGossip>,
     ) {
+        self.publish_at(
+            publisher,
+            progress,
+            stake_in_gossip,
+            agave_event_system::event_metadata::monotonic_timestamp_ns(),
+        );
+    }
+
+    /// `now_ns` is monotonic, as the validator's event timestamps are.
+    fn publish_at(
+        &mut self,
+        publisher: &Publisher,
+        progress: ValidatorStartProgress,
+        stake_in_gossip: Option<StakeInGossip>,
+        now_ns: u64,
+    ) {
+        let reported = self
+            .reported
+            .as_ref()
+            .map(|reported| reported.read().unwrap().clone())
+            .unwrap_or_default();
+        if let Some(origin) = reported.timings.as_ref().and_then(|t| t.replay_origin) {
+            self.replay_origin = Some(origin);
+        }
+        // During the wait the tap's `wfsm_gossip` comes every tenth check, if at all.
+        let stake_in_gossip = stake_in_gossip.or_else(|| {
+            reported.gossip.as_ref().map(|gossip| StakeInGossip {
+                online: gossip.seen,
+                total: gossip.total,
+            })
+        });
         let phase = describe(progress);
         let waiting = matches!(
             progress,
@@ -172,8 +265,27 @@ impl StartupPublisher {
             fraction: self.fraction(phase.replay_slots),
             stake_percent: phase.stake_percent,
             stake_in_gossip: stake_in_gossip.filter(|_| waiting),
-            phase_elapsed_nanos: self.elapsed(phase.name, Instant::now()),
+            phase_elapsed_nanos: if self.reported.is_none() || reported.readings {
+                self.elapsed(phase.name, Instant::now())
+            } else {
+                0
+            },
             phases_taken: self.taken.clone(),
+        };
+        let progress = match reported.timings {
+            Some(timings) => StartupProgress {
+                phase_elapsed_nanos: if timings.phase == phase.name {
+                    let elapsed = timings
+                        .phase_elapsed_nanos
+                        .saturating_add(now_ns.saturating_sub(timings.at_ns));
+                    Duration::from_secs(Duration::from_nanos(elapsed).as_secs()).as_nanos() as u64
+                } else {
+                    progress.phase_elapsed_nanos
+                },
+                phases_taken: merged_taken(&progress.phases_taken, timings.taken),
+                ..progress
+            },
+            None => progress,
         };
         self.debounce.publish(publisher, progress);
     }
@@ -183,7 +295,8 @@ impl StartupPublisher {
         match &mut self.current {
             Some((current, since)) if current == phase => whole_seconds(now, *since),
             other => {
-                if let Some((finished, since)) = other.take() {
+                let first = other.is_none();
+                if let Some((finished, since)) = other.take().filter(|_| self.witnessed) {
                     let elapsed_nanos = now.duration_since(since).as_nanos() as u64;
                     match self
                         .taken
@@ -200,7 +313,10 @@ impl StartupPublisher {
                         }),
                     }
                 }
-                *other = Some((phase.to_string(), now));
+                // Read from another process, the first phase seen began unseen unless the validator
+                // was only starting; inside the validator every phase is seen from its start.
+                self.witnessed = !first || phase == "initializing" || self.reported.is_none();
+                self.current = Some((phase.to_string(), now));
                 0
             }
         }
@@ -269,6 +385,18 @@ fn describe(progress: ValidatorStartProgress) -> Phase {
     }
 }
 
+/// The phases this process timed that the validator did not report, which came before its event
+/// system, then the validator's own.
+fn merged_taken(seen: &[PhaseTiming], reported: Vec<PhaseTiming>) -> Vec<PhaseTiming> {
+    let mut merged: Vec<PhaseTiming> = seen
+        .iter()
+        .filter(|timing| reported.iter().all(|other| other.phase != timing.phase))
+        .cloned()
+        .collect();
+    merged.extend(reported);
+    merged
+}
+
 fn whole_seconds(now: Instant, since: Instant) -> u64 {
     Duration::from_secs(now.duration_since(since).as_secs()).as_nanos() as u64
 }
@@ -279,6 +407,176 @@ mod tests {
 
     fn replaying(slot: Slot, max_slot: Slot) -> ValidatorStartProgress {
         ValidatorStartProgress::ProcessingLedger { slot, max_slot }
+    }
+
+    fn published_progress(publisher: &Publisher) -> serde_json::Value {
+        let message = publisher
+            .snapshot()
+            .iter()
+            .map(|message| message.to_string())
+            .find(|message| message.contains(r#""key":"startup_progress""#))
+            .expect("startup progress published");
+        serde_json::from_str::<serde_json::Value>(&message).unwrap()["value"].clone()
+    }
+
+    fn reported(phase: &'static str, elapsed_secs: u64, at_ns: u64) -> SharedReported {
+        Arc::new(RwLock::new(Reported {
+            timings: Some(ReportedTimings {
+                phase,
+                phase_elapsed_nanos: Duration::from_secs(elapsed_secs).as_nanos() as u64,
+                at_ns,
+                taken: vec![PhaseTiming {
+                    phase: "loading_ledger".to_string(),
+                    elapsed_nanos: 90,
+                }],
+                replay_origin: Some(1000),
+            }),
+            gossip: None,
+            readings: true,
+        }))
+    }
+
+    #[test]
+    fn test_a_phase_first_seen_part_way_is_not_timed() {
+        let mut publisher = StartupPublisher::default();
+        publisher.report_from(SharedReported::default());
+        let base = Instant::now();
+        publisher.elapsed("processing_ledger", base);
+        publisher.elapsed("starting_services", base + Duration::from_secs(5));
+        publisher.elapsed("running", base + Duration::from_secs(7));
+        let taken: Vec<_> = publisher.taken.iter().map(|t| t.phase.as_str()).collect();
+        assert_eq!(taken, ["starting_services"]);
+    }
+
+    #[test]
+    fn test_no_phase_is_timed_before_the_first_reading() {
+        let publisher = Publisher::new();
+        let mut startup = StartupPublisher::default();
+        let shared = SharedReported::default();
+        startup.report_from(shared.clone());
+        startup.publish_at(&publisher, ValidatorStartProgress::Initializing, None, 0);
+        shared.write().unwrap().readings = true;
+        startup.publish_at(&publisher, ValidatorStartProgress::Running, None, 0);
+        assert_eq!(
+            published_progress(&publisher)["phases_taken"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn test_every_phase_code_names_the_phase_it_describes() {
+        use solana_core::start_events::phase_code;
+        let all = [
+            ValidatorStartProgress::Initializing,
+            ValidatorStartProgress::SearchingForRpcService,
+            ValidatorStartProgress::DownloadingSnapshot {
+                slot: 1,
+                rpc_addr: "1.2.3.4:8899".parse().unwrap(),
+            },
+            ValidatorStartProgress::CleaningBlockStore,
+            ValidatorStartProgress::CleaningAccounts,
+            ValidatorStartProgress::LoadingLedger,
+            replaying(1, 2),
+            ValidatorStartProgress::StartingServices,
+            ValidatorStartProgress::Halted,
+            ValidatorStartProgress::WaitingForSupermajority {
+                slot: 1,
+                gossip_stake_percent: 5,
+            },
+            ValidatorStartProgress::Running,
+        ];
+        for progress in all {
+            assert_eq!(
+                phase_name(phase_code(&progress)),
+                Some(describe(progress).name)
+            );
+        }
+    }
+
+    #[test]
+    fn test_reported_timings_replace_this_processs_and_run_on() {
+        let publisher = Publisher::new();
+        let mut startup = StartupPublisher::default();
+        startup.report_from(reported("processing_ledger", 10, 1_000));
+        let five_and_a_half = Duration::from_millis(5_500).as_nanos() as u64;
+        startup.publish_at(
+            &publisher,
+            replaying(1500, 2000),
+            None,
+            1_000 + five_and_a_half,
+        );
+        let value = published_progress(&publisher);
+        assert_eq!(value["phase_elapsed_nanos"], 15_000_000_000u64);
+        assert_eq!(value["fraction"], 0.5);
+        assert_eq!(value["phases_taken"][0]["phase"], "loading_ledger");
+        assert_eq!(value["phases_taken"][0]["elapsed_nanos"], 90);
+    }
+
+    #[test]
+    fn test_reported_timings_for_another_phase_leave_the_local_clock() {
+        let publisher = Publisher::new();
+        let mut startup = StartupPublisher::default();
+        startup.report_from(reported("loading_ledger", 10, 0));
+        startup.publish_at(
+            &publisher,
+            ValidatorStartProgress::StartingServices,
+            None,
+            0,
+        );
+        assert_eq!(published_progress(&publisher)["phase_elapsed_nanos"], 0);
+    }
+
+    #[test]
+    fn test_phases_seen_before_the_reports_come_first() {
+        let seen = vec![
+            PhaseTiming {
+                phase: "searching_for_rpc_service".to_string(),
+                elapsed_nanos: 18,
+            },
+            PhaseTiming {
+                phase: "loading_ledger".to_string(),
+                elapsed_nanos: 3,
+            },
+        ];
+        let reported = vec![PhaseTiming {
+            phase: "loading_ledger".to_string(),
+            elapsed_nanos: 90,
+        }];
+        let merged = merged_taken(&seen, reported);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|timing| (timing.phase.as_str(), timing.elapsed_nanos))
+                .collect::<Vec<_>>(),
+            [("searching_for_rpc_service", 18), ("loading_ledger", 90)]
+        );
+    }
+
+    #[test]
+    fn test_the_reported_wait_gives_the_stake_in_gossip() {
+        let publisher = Publisher::new();
+        let mut startup = StartupPublisher::default();
+        let shared = SharedReported::default();
+        shared.write().unwrap().gossip = Some(GossipStake {
+            slot: 7,
+            shred_version: 1,
+            total: 100,
+            seen: 70,
+            validators: Vec::new(),
+        });
+        startup.report_from(shared);
+        let waiting = ValidatorStartProgress::WaitingForSupermajority {
+            slot: 7,
+            gossip_stake_percent: 70,
+        };
+        startup.publish_at(&publisher, waiting, None, 0);
+        let value = published_progress(&publisher);
+        assert_eq!(value["stake_in_gossip"]["online"], 70);
+        assert_eq!(value["stake_in_gossip"]["total"], 100);
+        assert_eq!(
+            startup.reported_gossip().map(|gossip| gossip.seen),
+            Some(70)
+        );
     }
 
     #[test]

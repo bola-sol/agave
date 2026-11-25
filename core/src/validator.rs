@@ -24,6 +24,7 @@ use {
         resource_limits::{ResourceLimitError, adjust_nofile_limit},
         sample_performance_service::SamplePerformanceService,
         snapshot_packager_service::SnapshotPackagerService,
+        start_events::{StartProgressEvents, SupermajorityWaitEvents},
         stats_reporter_service::StatsReporterService,
         system_monitor_service::{
             SystemMonitorService, SystemMonitorStatsReportConfig, XdpNetworkConfigReport,
@@ -748,6 +749,7 @@ pub struct Validator {
     xdp_transmitter: Option<Transmitter>,
     bank_notification_relay: Option<JoinHandle<()>>,
     bank_state_events: BankStateEvents,
+    start_progress_events: StartProgressEvents,
     // This runtime is used to run the client owned by SendTransactionService.
     // We don't wait for its JoinHandle here because ownership and shutdown
     // are managed elsewhere. This variable is intentionally unused.
@@ -973,6 +975,8 @@ impl Validator {
 
         let dependency_tracker = Arc::new(DependencyTracker::default());
 
+        // Loading the ledger starts here, before the event system can see it.
+        let loading_since = Instant::now();
         let (
             bank_forks,
             blockstore,
@@ -1009,6 +1013,19 @@ impl Validator {
         .map_err(ValidatorError::Other)?;
 
         let event_system = initialize_event_system(&blockstore)?;
+        let start_progress_events = StartProgressEvents::new(
+            &event_system,
+            start_progress.clone(),
+            loading_since,
+            exit.clone(),
+        )
+        .map_err(ValidatorError::Other)?;
+        // Made before the wait, so a subscriber is there for its first check.
+        let mut supermajority_wait_events = config.wait_for_supermajority.and_then(|_| {
+            SupermajorityWaitEvents::new(&event_system)
+                .inspect_err(|err| warn!("{err}"))
+                .ok()
+        });
 
         let migration_status = bank_forks.read().unwrap().migration_status();
 
@@ -1644,6 +1661,7 @@ impl Validator {
             &cluster_info,
             rpc_override_health_check,
             &start_progress,
+            supermajority_wait_events.as_mut(),
         )?;
 
         let blockstore_metric_report_service =
@@ -1999,6 +2017,7 @@ impl Validator {
             xdp_transmitter,
             bank_notification_relay,
             bank_state_events,
+            start_progress_events,
             _tpu_client_next_runtime: tpu_client_next_runtime,
         })
     }
@@ -2166,6 +2185,9 @@ impl Validator {
         self.tpu.join().expect("tpu");
         self.tvu.join().expect("tvu");
         self.bank_state_events.join().expect("bank_state_events");
+        self.start_progress_events
+            .join()
+            .expect("start_progress_events");
         if let Some(relay) = self.bank_notification_relay {
             relay.join().expect("bank_notification_relay");
         }
@@ -3203,6 +3225,7 @@ fn wait_for_supermajority(
     cluster_info: &ClusterInfo,
     rpc_override_health_check: Arc<AtomicBool>,
     start_progress: &Arc<RwLock<ValidatorStartProgress>>,
+    mut wait_events: Option<&mut SupermajorityWaitEvents>,
 ) -> Result<bool, ValidatorError> {
     match config.wait_for_supermajority {
         None => Ok(false),
@@ -3246,6 +3269,9 @@ fn wait_for_supermajority(
 
                 let gossip_stake_percent =
                     get_stake_percent_in_gossip(&bank, cluster_info, logging);
+                if let Some(wait_events) = wait_events.as_deref_mut() {
+                    wait_events.publish(&bank, cluster_info, wait_for_supermajority_slot);
+                }
 
                 *start_progress.write().unwrap() =
                     ValidatorStartProgress::WaitingForSupermajority {
@@ -3859,6 +3885,7 @@ mod tests {
                 &cluster_info,
                 rpc_override_health_check.clone(),
                 &start_progress,
+                None,
             )
             .unwrap()
         );
@@ -3873,6 +3900,7 @@ mod tests {
                 &cluster_info,
                 rpc_override_health_check.clone(),
                 &start_progress,
+                None,
             ),
             Err(ValidatorError::NotEnoughLedgerData(_, _)),
         ));
@@ -3892,6 +3920,7 @@ mod tests {
                 &cluster_info,
                 rpc_override_health_check.clone(),
                 &start_progress,
+                None,
             )
             .unwrap()
         );
@@ -3907,6 +3936,7 @@ mod tests {
                 &cluster_info,
                 rpc_override_health_check,
                 &start_progress,
+                None,
             ),
             Err(ValidatorError::BankHashMismatch(_, _)),
         ));
