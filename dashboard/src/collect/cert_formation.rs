@@ -4,11 +4,10 @@
 
 use {
     super::Collector,
-    crate::metrics_tap::VoteArrival,
+    crate::{metrics_tap::VoteArrival, source::BankView},
     serde::Serialize,
     solana_clock::Epoch,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
     std::collections::{BTreeMap, HashMap},
 };
 
@@ -156,7 +155,7 @@ fn formation(
 
 impl Collector {
     /// Read every tick, so a page left closed loses no slot.
-    pub(super) fn collect_finalized_paths(&mut self, root_bank: &Bank) {
+    pub(super) fn collect_finalized_paths(&mut self, root_bank: &dyn BankView) {
         let schedule = root_bank.epoch_schedule();
         for (slot, fast) in self.metrics_tap.take_finalized_paths() {
             self.finalized_paths.note(schedule.get_epoch(slot), fast);
@@ -164,7 +163,7 @@ impl Collector {
     }
 
     /// Rebuilt only when votor reports a new epoch, or that epoch's slot time or path counts move.
-    pub(super) fn collect_cert_formation(&mut self, bank: &Bank) {
+    pub(super) fn collect_cert_formation(&mut self, bank: &dyn BankView) {
         let Some(epoch) = self.metrics_tap.vote_arrival_epoch() else {
             return;
         };
@@ -192,21 +191,16 @@ impl Collector {
 }
 
 fn cert_formation(
-    bank: &Bank,
+    bank: &dyn BankView,
     epoch: Epoch,
     arrivals: &HashMap<Pubkey, VoteArrival>,
     slot_nanos: Option<u64>,
 ) -> Option<CertFormation> {
     let first_slot = bank.epoch_schedule().get_first_slot_in_epoch(epoch);
-    let rank_map = bank.get_rank_map(first_slot)?;
+    let rank_map = bank.rank_map(first_slot)?;
     let ranked: Vec<(u64, Option<&VoteArrival>)> = (0..rank_map.len())
-        .filter_map(|rank| rank_map.get_pubkey_stake_entry(rank))
-        .map(|entry| {
-            (
-                entry.stake.get().get(),
-                arrivals.get(&entry.vote_account_pubkey),
-            )
-        })
+        .filter_map(|rank| rank_map.entry(rank))
+        .map(|entry| (entry.stake, arrivals.get(&entry.vote)))
         .collect();
     let votes: Vec<(u64, Option<u64>, Option<u64>)> = ranked
         .iter()
@@ -222,13 +216,7 @@ fn cert_formation(
         .iter()
         .filter_map(|(_, arrival)| arrival.and_then(|arrival| arrival.notarize_count))
         .max();
-    formation(
-        epoch,
-        rank_map.total_stake().get().get(),
-        &votes,
-        slot_nanos,
-        slots,
-    )
+    formation(epoch, rank_map.total_stake(), &votes, slot_nanos, slots)
 }
 
 #[cfg(test)]

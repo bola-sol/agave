@@ -3,6 +3,7 @@
 //! into their block footers.
 
 use {
+    crate::source::{BankView, Source},
     agave_votor_messages::reward_certificate::NUM_SLOTS_FOR_REWARD,
     serde::Serialize,
     solana_clock::{Epoch, Slot},
@@ -11,7 +12,6 @@ use {
     },
     solana_ledger::{blockstore::Blockstore, shred::DATA_SHREDS_PER_FEC_BLOCK},
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
     solana_signer_store::{Decoded, decode},
     std::collections::{BTreeMap, HashMap},
 };
@@ -558,8 +558,36 @@ impl Tally {
     }
 }
 
-pub(crate) enum Block {
-    Footer(Box<BlockFooterV1>),
+/// What the dashboard reads of a block footer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FooterFacts {
+    /// The leader's close time, unix nanoseconds.
+    pub close_nanos: u64,
+    pub notar_bitmap: Option<Vec<u8>>,
+    pub skip_bitmap: Option<Vec<u8>>,
+    /// Whether the finalization certificate it carries is the fast one.
+    pub fast: Option<bool>,
+}
+
+impl From<&BlockFooterV1> for FooterFacts {
+    fn from(footer: &BlockFooterV1) -> Self {
+        Self {
+            close_nanos: footer.block_producer_time_nanos,
+            notar_bitmap: footer
+                .notar_reward_cert
+                .as_ref()
+                .map(|cert| cert.bitmap().to_vec()),
+            skip_bitmap: footer
+                .skip_reward_cert
+                .as_ref()
+                .map(|cert| cert.to_bitmap().to_vec()),
+            fast: carried_fast(footer),
+        }
+    }
+}
+
+pub enum Block {
+    Footer(Box<FooterFacts>),
     Missing,
     Pending,
     Opaque,
@@ -587,8 +615,8 @@ pub struct FooterReading {
 
 /// Stops at the first slot past the root. Footers are read whether or not we hold a rank.
 pub fn walk(
-    blockstore: &Blockstore,
-    bank: &Bank,
+    src: &dyn Source,
+    bank: &dyn BankView,
     vote_account: &Pubkey,
     from: Slot,
     to: Slot,
@@ -596,7 +624,7 @@ pub fn walk(
     let root = bank.slot();
     let mut walked = Walked::default();
     for slot in from..=to {
-        let block = read_block(blockstore, slot, root);
+        let block = src.block(slot, root);
         if matches!(block, Block::Pending) {
             break;
         }
@@ -621,14 +649,15 @@ fn read_slot(block: Block, ranked: Option<(Slot, (usize, usize))>) -> (Option<u6
     match block {
         Block::Footer(footer) => {
             let mark = ranked.and_then(|(reward_slot, (rank, len))| {
-                let notar = footer.notar_reward_cert.as_ref().map(|cert| cert.bitmap());
-                let skip = footer
-                    .skip_reward_cert
-                    .as_ref()
-                    .map(|cert| cert.to_bitmap());
-                build_mark(notar, skip, reward_slot, rank, len)
+                build_mark(
+                    footer.notar_bitmap.as_deref(),
+                    footer.skip_bitmap.as_deref(),
+                    reward_slot,
+                    rank,
+                    len,
+                )
             });
-            (Some(footer.block_producer_time_nanos), mark)
+            (Some(footer.close_nanos), mark)
         }
         Block::Missing => (
             None,
@@ -640,15 +669,15 @@ fn read_slot(block: Block, ranked: Option<(Slot, (usize, usize))>) -> (Option<u6
 
 /// A leader writes the highest finalization certificate it holds and prefers the fast one for
 /// the same slot, so fast means 80% of stake notarized in time for it.
-fn footer_reading(bank: &Bank, slot: Slot, footer: &BlockFooterV1) -> FooterReading {
-    let notarized = footer.notar_reward_cert.as_ref().and_then(|cert| {
+fn footer_reading(bank: &dyn BankView, slot: Slot, footer: &FooterFacts) -> FooterReading {
+    let notarized = footer.notar_bitmap.as_ref().and_then(|bitmap| {
         let rewarded = rewarded_slot(slot)?;
-        Some((rewarded, notarized_share(bank, rewarded, cert.bitmap())?))
+        Some((rewarded, notarized_share(bank, rewarded, bitmap)?))
     });
     FooterReading {
         slot,
         notarized,
-        fast: carried_fast(footer),
+        fast: footer.fast,
     }
 }
 
@@ -662,26 +691,24 @@ fn carried_fast(footer: &BlockFooterV1) -> Option<bool> {
 }
 
 /// The share of the slot's rank map stake set in `bitmap`, in basis points.
-fn notarized_share(bank: &Bank, slot: Slot, bitmap: &[u8]) -> Option<u16> {
-    let map = bank.get_rank_map(slot)?;
+fn notarized_share(bank: &dyn BankView, slot: Slot, bitmap: &[u8]) -> Option<u16> {
+    let map = bank.rank_map(slot)?;
     let paid = decode_paid(bitmap, map.len())?;
     let notarized = (0..map.len())
         .filter(|rank| paid.get(*rank) == Some(&true))
-        .filter_map(|rank| map.get_pubkey_stake_entry(rank))
-        .fold(0u64, |sum, entry| {
-            sum.saturating_add(entry.stake.get().get())
-        });
+        .filter_map(|rank| map.entry(rank))
+        .fold(0u64, |sum, entry| sum.saturating_add(entry.stake));
     let share = u128::from(notarized)
         .saturating_mul(10_000)
-        .checked_div(u128::from(map.total_stake().get().get()))?;
+        .checked_div(u128::from(map.total_stake()))?;
     u16::try_from(share).ok()
 }
 
 /// `None` where it holds no stake there.
-fn rank_of(bank: &Bank, vote_account: &Pubkey, slot: Slot) -> Option<(usize, usize)> {
-    let map = bank.get_rank_map(slot)?;
-    let rank = map.get_rank_for_vote_pubkey(vote_account)?;
-    Some((usize::from(*rank), map.len()))
+fn rank_of(bank: &dyn BankView, vote_account: &Pubkey, slot: Slot) -> Option<(usize, usize)> {
+    let map = bank.rank_map(slot)?;
+    let rank = map.rank_of(vote_account)?;
+    Some((usize::from(rank), map.len()))
 }
 
 pub(crate) fn read_block(blockstore: &Blockstore, slot: Slot, root: Slot) -> Block {
@@ -715,7 +742,9 @@ pub(crate) fn read_block(blockstore: &Blockstore, slot: Slot, root: Slot) -> Blo
                 .map(|VersionedBlockFooter::V1(footer)| footer.clone()),
             BlockComponent::EntryBatch(_) => None,
         })
-        .map_or(Block::Opaque, |footer| Block::Footer(Box::new(footer)))
+        .map_or(Block::Opaque, |footer| {
+            Block::Footer(Box::new(FooterFacts::from(&footer)))
+        })
 }
 
 /// Takes each certificate's bitmap. Neither means nobody was paid; `None` where one could not
@@ -912,20 +941,22 @@ mod tests {
         assert!(matches!(read_block(&blockstore, 5, 9), Block::Missing));
         assert!(matches!(read_block(&blockstore, 6, 9), Block::Opaque));
         assert!(matches!(read_block(&blockstore, 7, 9), Block::Opaque));
-        assert!(matches!(read_block(&blockstore, 9, 9), Block::Footer(read) if *read == footer));
+        assert!(
+            matches!(read_block(&blockstore, 9, 9), Block::Footer(read) if *read == FooterFacts::from(&footer))
+        );
         assert!(matches!(read_block(&blockstore, 12, 9), Block::Pending));
     }
 
     fn footer_closed_at(nanos: u64) -> Block {
         let (_, entries) = make_slot_entries(1, 0, 1);
-        Block::Footer(Box::new(BlockFooterV1 {
+        Block::Footer(Box::new(FooterFacts::from(&BlockFooterV1 {
             bank_hash: entries[0].hash,
             block_producer_time_nanos: nanos,
             block_user_agent: vec![],
             block_final_cert: None,
             skip_reward_cert: None,
             notar_reward_cert: None,
-        }))
+        })))
     }
 
     #[test]

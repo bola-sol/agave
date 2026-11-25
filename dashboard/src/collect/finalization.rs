@@ -4,12 +4,13 @@
 
 use {
     super::{Collector, cluster_charts::at_percent},
-    crate::geoip,
+    crate::{
+        geoip,
+        source::{BankView, PeerRow},
+    },
     serde::Serialize,
     solana_clock::Slot,
-    solana_gossip::contact_info::ContactInfo,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
     solana_time_utils::timestamp,
     std::collections::{HashMap, VecDeque},
 };
@@ -195,26 +196,30 @@ impl FinalizationTally {
 }
 
 impl Collector {
-    pub(super) fn observe_finalization(&mut self, bank: &Bank) {
+    pub(super) fn observe_finalization(&mut self, bank: &dyn BankView) {
         if !bank.is_alpenglow() {
             return;
         }
         // Only an account with a rank can be in a certificate.
-        let Some(ranks) = bank.get_rank_map(bank.slot()) else {
+        let Some(ranks) = bank.rank_map(bank.slot()) else {
             return;
         };
-        let votes: Vec<(Pubkey, Slot)> = bank
-            .vote_accounts()
-            .iter()
-            .filter(|(vote, _)| ranks.get_rank_for_vote_pubkey(vote).is_some())
-            .filter_map(|(vote, (_, account))| {
-                Some((*vote, account.vote_state_view().last_voted_slot()?))
-            })
-            .collect();
+        let mut votes: Vec<(Pubkey, Slot)> = Vec::new();
+        bank.for_each_vote_row(&mut |row| {
+            if ranks.rank_of(&row.vote).is_some()
+                && let Some(last) = row.last_voted_slot
+            {
+                votes.push((row.vote, last));
+            }
+        });
         self.finalization.observe(&votes, timestamp());
     }
 
-    pub(super) fn collect_finalization_share(&mut self, bank: &Bank, peers: &[(ContactInfo, u64)]) {
+    pub(super) fn collect_finalization_share(
+        &mut self,
+        bank: &dyn BankView,
+        peers: &[(PeerRow, u64)],
+    ) {
         let now_millis = timestamp();
         let share = bank
             .is_alpenglow()
@@ -223,8 +228,12 @@ impl Collector {
                     .metrics_tap
                     .vote_lag_micros(now_millis, VOTE_WINDOW_MILLIS);
                 let places = self.places(bank, peers);
-                self.finalization
-                    .summary(&self.ctx.vote_account, now_millis, vote_micros, &places)
+                self.finalization.summary(
+                    &self.src.vote_account(),
+                    now_millis,
+                    vote_micros,
+                    &places,
+                )
             })
             .flatten();
         self.debounces
@@ -233,12 +242,11 @@ impl Collector {
     }
 
     /// Countries from gossip addresses; empty when our own address has none.
-    fn places(&self, bank: &Bank, peers: &[(ContactInfo, u64)]) -> Places {
+    fn places(&self, bank: &dyn BankView, peers: &[(PeerRow, u64)]) -> Places {
         let Some(ours) = self
-            .ctx
-            .cluster_info
-            .my_contact_info()
-            .gossip()
+            .src
+            .my_contact()
+            .gossip
             .and_then(|addr| geoip::country(addr.ip()))
         else {
             return Places::default();
@@ -246,17 +254,19 @@ impl Collector {
         let by_node: HashMap<Pubkey, &'static str> = peers
             .iter()
             .filter_map(|(contact, _)| {
-                Some((*contact.pubkey(), geoip::country(contact.gossip()?.ip())?))
+                Some((contact.pubkey, geoip::country(contact.gossip?.ip())?))
             })
             .collect();
-        let mut by_vote: HashMap<Pubkey, &'static str> = bank
-            .vote_accounts()
-            .iter()
-            .filter(|(_, (stake, _))| *stake > 0)
-            .filter_map(|(vote, (_, account))| Some((*vote, *by_node.get(account.node_pubkey())?)))
-            .collect();
+        let mut by_vote: HashMap<Pubkey, &'static str> = HashMap::new();
+        bank.for_each_vote_row(&mut |row| {
+            if row.stake > 0
+                && let Some(country) = by_node.get(&row.identity)
+            {
+                by_vote.insert(row.vote, country);
+            }
+        });
         // The gossip table's copy leaves this node out.
-        by_vote.insert(self.ctx.vote_account, ours);
+        by_vote.insert(self.src.vote_account(), ours);
         Places {
             ours: Some(ours),
             by_vote,
@@ -266,17 +276,20 @@ impl Collector {
     /// Each node's share over the window, for the peers list.
     pub(super) fn finalization_by_node(
         &self,
-        bank: &Bank,
+        bank: &dyn BankView,
         now_millis: u64,
     ) -> HashMap<Pubkey, f64> {
         let shares = self.finalization.shares(now_millis);
         if shares.is_empty() {
             return HashMap::new();
         }
-        bank.vote_accounts()
-            .iter()
-            .filter_map(|(vote, (_, account))| Some((*account.node_pubkey(), *shares.get(vote)?)))
-            .collect()
+        let mut by_node = HashMap::new();
+        bank.for_each_vote_row(&mut |row| {
+            if let Some(share) = shares.get(&row.vote) {
+                by_node.insert(row.identity, *share);
+            }
+        });
+        by_node
     }
 }
 

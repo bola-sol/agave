@@ -17,24 +17,19 @@ use {
         refill::Refilled,
         search::{LeaderMap, LeaderTraits},
         slots::{BlockDetail, ShredArrival, SlotEntry, SlotLevel, SlotRing},
-        snapshot::{self, SnapshotTracker, Snapshots},
+        snapshot::{SnapshotTracker, Snapshots},
+        source::{BankView, Direct, PeerRow, Source},
         startup::StartupPublisher,
         tips::{TipMeter, TipRates},
         turns::{LeaderTurn, TurnTracker},
-        validator_info::{self, ValidatorInfoCache},
-        versions,
+        validator_info::ValidatorInfoCache,
     },
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
     solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
-    solana_ledger::blockstore::Blockstore,
     solana_pubkey::Pubkey,
-    solana_rpc::optimistically_confirmed_bank_tracker::{
-        BankNotification, BankNotificationReceiver,
-    },
+    solana_rpc::optimistically_confirmed_bank_tracker::BankNotificationReceiver,
     solana_rpc_client_types::request::DELINQUENT_VALIDATOR_SLOT_DISTANCE,
-    solana_runtime::bank::{Bank, VATHealthError},
     solana_time_utils::timestamp,
     solana_vote_interface::state::VoteStateV4,
     std::{
@@ -59,7 +54,6 @@ mod handoff;
 mod skip_rate;
 mod slot_clock;
 
-pub(crate) use self::slot_clock::CATCH_UP_SLOTS_PER_SECOND;
 use self::{
     block_life::{BlockLifeSummary, BlockLives},
     cert_formation::{CertFormation, FinalizedPaths, FormationKey},
@@ -75,9 +69,11 @@ pub use self::{
     certificates::{
         MissList, MissReplies, MissRow, MissValidator, MissWriter, WrittenList, WrittenRow,
     },
+    fee_payers::TxOutcome,
     gossip_peers::GossipPeers,
     handoff::LeaderFigures,
 };
+pub(crate) use self::{fee_payers::tx_outcomes, slot_clock::CATCH_UP_SLOTS_PER_SECOND};
 
 const SLOW_TICK: Duration = Duration::from_secs(5);
 
@@ -402,21 +398,16 @@ pub struct Admission {
 }
 
 /// From the rank maps, which hold each epoch's admitted set. `None` before alpenglow.
-fn read_admission(bank: &Bank, vote_account: &Pubkey) -> Option<Admission> {
+fn read_admission(bank: &dyn BankView, vote_account: &Pubkey) -> Option<Admission> {
     if !bank.is_alpenglow() {
         return None;
     }
     let schedule = bank.epoch_schedule();
     let seated = |epoch: Epoch| {
-        bank.get_rank_map(schedule.get_first_slot_in_epoch(epoch))
-            .map(|map| map.get_rank_for_vote_pubkey(vote_account).is_some())
+        bank.rank_map(schedule.get_first_slot_in_epoch(epoch))
+            .map(|map| map.rank_of(vote_account).is_some())
     };
-    let ticket_short = match bank.get_vat_health_for_next_epoch(vote_account) {
-        Err(VATHealthError::InsufficientFundsInVoteAccount(balance, minimum)) => {
-            Some(minimum.saturating_sub(balance))
-        }
-        Ok(()) | Err(_) => None,
-    };
+    let ticket_short = bank.vat_ticket_short(vote_account);
     Some(Admission {
         seat: seated(bank.epoch())?,
         next_seat: seated(bank.epoch().saturating_add(1)),
@@ -542,7 +533,7 @@ impl Default for Debounces {
 }
 
 pub struct Collector {
-    ctx: DashboardContext,
+    src: Arc<dyn Source>,
     publisher: Arc<Publisher>,
     /// From the service, since the boot thread reports before a context exists.
     startup_progress: StartProgress,
@@ -604,8 +595,6 @@ pub struct Collector {
     subscribers: usize,
 
     tips: Option<TipMeter>,
-    /// `None` reads bank forks instead, which misses banks pruned between ticks.
-    frozen_banks: Option<BankNotificationReceiver>,
     totals: BTreeMap<Slot, Totals>,
     /// Failed transactions along the working fork, read by the meters for TPS.
     failed_total: Arc<AtomicU64>,
@@ -649,12 +638,28 @@ pub struct CollectorShared {
 }
 
 impl Collector {
+    /// Reads a running validator. Without `frozen_banks` it reads bank forks instead, which misses
+    /// banks pruned between ticks.
     pub fn new(
         ctx: DashboardContext,
         shared: CollectorShared,
         tips: Option<TipMeter>,
         commission_bps: Option<u16>,
         frozen_banks: Option<BankNotificationReceiver>,
+    ) -> Self {
+        Self::with_source(
+            Arc::new(Direct::new(ctx, frozen_banks)),
+            shared,
+            tips,
+            commission_bps,
+        )
+    }
+
+    pub fn with_source(
+        src: Arc<dyn Source>,
+        shared: CollectorShared,
+        tips: Option<TipMeter>,
+        commission_bps: Option<u16>,
     ) -> Self {
         let CollectorShared {
             publisher,
@@ -670,7 +675,7 @@ impl Collector {
         let now = Instant::now();
         Self {
             slots: SlotRing::new(SLOT_HISTORY),
-            ctx,
+            src,
             publisher,
             startup_progress,
             debounces: Debounces::default(),
@@ -723,7 +728,6 @@ impl Collector {
             turn_reference: TapCounters::default(),
             turn_drained: None,
             held_from: 0,
-            frozen_banks,
             totals: BTreeMap::new(),
             failed_total,
             overview_dirty: false,
@@ -749,7 +753,7 @@ impl Collector {
             .publish(TOPIC_SUMMARY, "version", &version.as_semver_string());
         self.collect_contact();
         self.publisher
-            .publish(TOPIC_SUMMARY, "cluster", &self.ctx.cluster_name());
+            .publish(TOPIC_SUMMARY, "cluster", &self.src.cluster_name());
         // The rates the page derives tip figures with, sent rather than applied so a corrected rate
         // repairs the whole history.
         if let Some(meter) = &self.tips {
@@ -767,26 +771,19 @@ impl Collector {
                 },
             );
         }
-        self.publisher.publish(
-            TOPIC_SUMMARY,
-            "shred_version",
-            &self.ctx.cluster_info.my_shred_version(),
-        );
+        self.publisher
+            .publish(TOPIC_SUMMARY, "shred_version", &self.src.shred_version());
     }
 
     pub fn tick(&mut self) {
         let now = Instant::now();
 
-        // Held only to clone the handles out: replay takes this lock to advance.
-        let (root_bank, working_bank, highest_slot, mut frozen) = {
-            let bank_forks = self.ctx.bank_forks.read().unwrap();
-            (
-                bank_forks.root_bank(),
-                bank_forks.working_bank(),
-                bank_forks.highest_slot(),
-                bank_forks.frozen_banks().collect::<Vec<_>>(),
-            )
-        };
+        let crate::source::Banks {
+            root: root_bank,
+            working: working_bank,
+            highest_slot,
+            mut frozen,
+        } = self.src.banks();
         // Slot order, for the tip meter's running total. Everything else is a
         // difference against a parent and would be right in any order.
         frozen.sort_by_key(|(slot, _)| *slot);
@@ -798,12 +795,17 @@ impl Collector {
         self.hold_produced_from(&root_bank);
         // Read once: before Alpenglow it opens a blockstore iterator, and two
         // readers want it every tick.
-        let cluster_tip = self.ctx.cluster_tip();
+        let cluster_tip = self.src.cluster_tip();
         self.cluster_tip = cluster_tip;
         // Measured against the cluster's tip, not this node's own view, which
         // lags when replay lags.
-        let behind_cluster = cluster_tip
-            .map(|tip| blocks_behind(&self.ctx.blockstore, tip, self.last_completed_slot));
+        let behind_cluster = cluster_tip.map(|tip| {
+            walk_behind(
+                |slot| self.src.parent_of(slot),
+                tip,
+                self.last_completed_slot,
+            )
+        });
         self.mark_caught_cluster(behind_cluster);
         self.collect_leaders(&root_bank, highest_slot);
         self.collect_slot_levels(&root_bank, &frozen);
@@ -881,7 +883,7 @@ impl Collector {
         let now_millis = timestamp();
         if subscribers > 0 && self.cluster_charts_due(now_millis) {
             self.cluster_charts_made = now_millis;
-            let peers = self.ctx.cluster_info.all_peers();
+            let peers = self.src.all_peers();
             self.collect_cluster_charts(&root_bank, &working_bank, &peers, now_millis);
         }
 
@@ -889,7 +891,7 @@ impl Collector {
             self.last_slow_tick = now;
             // One snapshot for both walks below: it clones the whole table under
             // the gossip lock.
-            let peers = self.ctx.cluster_info.all_peers();
+            let peers = self.src.all_peers();
             self.collect_contact();
             let votes = self.collect_peers(&working_bank, &peers);
             self.collect_health();
@@ -906,12 +908,11 @@ impl Collector {
             self.debounces
                 .block_life
                 .publish(&self.publisher, self.block_lives.summary(timestamp()));
-            let ours = self.ctx.identity();
+            let ours = self.src.identity();
             self.debounces.handoff.publish(
                 &self.publisher,
-                self.handoffs.summary(timestamp(), &ours, |key| {
-                    country_of(&self.ctx.cluster_info, key)
-                }),
+                self.handoffs
+                    .summary(timestamp(), &ours, |key| country_of(self.src.as_ref(), key)),
             );
             if let Some(leaders) = self.handoffs.take_leaders()
                 && let Ok(mut held) = self.replies.handoff_leaders.write()
@@ -926,7 +927,7 @@ impl Collector {
                 .iter()
                 .map(|(contact, at_millis)| {
                     (
-                        *contact.pubkey(),
+                        contact.pubkey,
                         GossipEntry {
                             contact,
                             at_millis: *at_millis,
@@ -945,11 +946,11 @@ impl Collector {
     /// client comes from gossip rather than the build: jito's validator gossips `AgaveBam` while on
     /// BAM and `JitoLabs` otherwise.
     fn collect_contact(&mut self) {
-        let contact = self.ctx.cluster_info.my_contact_info();
+        let contact = self.src.my_contact();
         self.debounces
             .client
-            .publish(&self.publisher, contact.version().client().to_string());
-        let address = contact.gossip().map(|addr| GossipAddress {
+            .publish(&self.publisher, contact.client.clone());
+        let address = contact.gossip.map(|addr| GossipAddress {
             ip: addr.ip().to_string(),
             country: geoip::country(addr.ip()),
         });
@@ -973,21 +974,24 @@ impl Collector {
     }
 
     fn collect_snapshots(&mut self) {
-        let read = self.ctx.snapshot_config.as_ref().and_then(snapshot::read);
+        let read = self.src.snapshots();
         let snapshots = self
             .snapshots
             .observe(read, self.last_completed_slot, timestamp());
         self.debounces.snapshots.publish(&self.publisher, snapshots);
     }
 
-    fn collect_slot_positions(&mut self, root_bank: &Bank, highest_slot: Slot, completed: Slot) {
-        let commitment = self.ctx.block_commitment_cache.read().unwrap();
-        let (root, confirmed, finalized) = (
-            commitment.root(),
-            commitment.highest_confirmed_slot(),
-            commitment.highest_super_majority_root(),
-        );
-        drop(commitment);
+    fn collect_slot_positions(
+        &mut self,
+        root_bank: &dyn BankView,
+        highest_slot: Slot,
+        completed: Slot,
+    ) {
+        let crate::source::Commitment {
+            root,
+            confirmed,
+            finalized,
+        } = self.src.commitment();
 
         // `root_bank` is the authority on the root. The commitment cache can
         // briefly lag it during startup.
@@ -1013,7 +1017,7 @@ impl Collector {
         self.observe_slot_duration(root_bank, completed);
     }
 
-    fn observe_slot_duration(&mut self, root_bank: &Bank, completed: Slot) {
+    fn observe_slot_duration(&mut self, root_bank: &dyn BankView, completed: Slot) {
         let now = Instant::now();
         if completed > self.last_completed_slot {
             self.last_completed_slot = completed;
@@ -1044,7 +1048,7 @@ impl Collector {
     }
 
     /// Timed from the blockstore's first-shred record rather than a 200ms poll.
-    fn collect_slot_durations(&mut self, root_bank: &Bank, up_to: Slot) {
+    fn collect_slot_durations(&mut self, root_bank: &dyn BankView, up_to: Slot) {
         let schedule = root_bank.epoch_schedule();
         let mut changed = Vec::new();
         let mut filled = Vec::new();
@@ -1114,7 +1118,7 @@ impl Collector {
     /// The delay at a leader's handoff, once the first shreds of this slot and the previous leader's
     /// last two are known. Not after our own turn, where it is a round trip to the next leader, nor
     /// while catching up, when repair rather than turbine brings the blocks.
-    fn note_handoff(&mut self, root_bank: &Bank, slot: Slot) {
+    fn note_handoff(&mut self, root_bank: &dyn BankView, slot: Slot) {
         if self.handoffs.holds(slot)
             || (self.trailed_cluster && !self.caught_cluster)
             || self
@@ -1132,31 +1136,30 @@ impl Collector {
         else {
             return;
         };
-        let cache = &self.ctx.leader_schedule_cache;
+        let src = &self.src;
         let (Some(leader), Some(last), Some(second_last)) = (
-            cache.slot_leader_at(slot, Some(root_bank)),
-            cache.slot_leader_at(previous, Some(root_bank)),
-            cache.slot_leader_at(earlier, Some(root_bank)),
+            src.slot_leader(slot, root_bank),
+            src.slot_leader(previous, root_bank),
+            src.slot_leader(earlier, root_bank),
         ) else {
             return;
         };
-        if leader.id == last.id || last.id != second_last.id || last.id == self.ctx.identity() {
+        if leader == last || last != second_last || last == self.src.identity() {
             return;
         }
         let Some(delay) = handoff::delay(arrived, last_at, second_last_at) else {
             return;
         };
-        self.handoffs.note(slot, leader.id, delay, arrived);
+        self.handoffs.note(slot, leader, delay, arrived);
     }
 
     /// The leader whose turn is arriving now, from the first slot of its run of turns.
-    fn collect_handoff_now(&mut self, root_bank: &Bank) {
+    fn collect_handoff_now(&mut self, root_bank: &dyn BankView) {
         let slot = self.newest_arrival;
         if slot == 0 {
             return;
         }
-        let cache = &self.ctx.leader_schedule_cache;
-        let Some(leader) = cache.slot_leader_at(slot, Some(root_bank)) else {
+        let Some(leader) = self.src.slot_leader(slot, root_bank) else {
             return;
         };
         let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get() as u64;
@@ -1166,9 +1169,10 @@ impl Collector {
             let Some(before) = first.checked_sub(stride) else {
                 break;
             };
-            if cache
-                .slot_leader_at(before, Some(root_bank))
-                .is_none_or(|earlier| earlier.id != leader.id)
+            if self
+                .src
+                .slot_leader(before, root_bank)
+                .is_none_or(|earlier| earlier != leader)
             {
                 break;
             }
@@ -1183,8 +1187,8 @@ impl Collector {
             return;
         }
         self.handoff_now_for = Some(key);
-        let country = country_of(&self.ctx.cluster_info, &leader.id);
-        let now = self.handoffs.now(&leader.id, country, first, timestamp());
+        let country = country_of(self.src.as_ref(), &leader);
+        let now = self.handoffs.now(&leader, country, first, timestamp());
         self.debounces
             .handoff_now
             .publish(&self.publisher, Some(now));
@@ -1236,14 +1240,11 @@ impl Collector {
     }
 
     fn first_shred_time(&self, slot: Slot) -> Option<u64> {
-        match self.ctx.blockstore.meta(slot) {
-            Ok(Some(meta)) if meta.first_shred_timestamp > 0 => Some(meta.first_shred_timestamp),
-            _ => None,
-        }
+        self.src.first_shred_time(slot)
     }
 
-    fn collect_leaders(&mut self, root_bank: &Bank, highest_slot: Slot) {
-        let me = self.ctx.identity();
+    fn collect_leaders(&mut self, root_bank: &dyn BankView, highest_slot: Slot) {
+        let me = self.src.identity();
         // Slots before the tip at start would all read as skipped.
         let from = match self.first_observed_slot {
             None => {
@@ -1256,15 +1257,11 @@ impl Collector {
         };
 
         for slot in from..=highest_slot {
-            let Some(leader) = self
-                .ctx
-                .leader_schedule_cache
-                .slot_leader_at(slot, Some(root_bank))
-            else {
+            let Some(leader) = self.src.slot_leader(slot, root_bank) else {
                 self.leaders_resolved_to = slot;
                 return;
             };
-            if let Some(entry) = self.slots.set_mine(slot, leader.id == me) {
+            if let Some(entry) = self.slots.set_mine(slot, leader == me) {
                 self.publish_slot(&entry);
             }
             self.leaders_resolved_to = slot.saturating_add(1);
@@ -1272,13 +1269,9 @@ impl Collector {
 
         // The cache's own lookahead skips slots we already have shreds for. A
         // plain walk of the schedule would report those as still upcoming.
-        let next_mine = self.ctx.leader_schedule_cache.next_leader_slot(
-            &me,
-            highest_slot,
-            root_bank,
-            Some(self.ctx.blockstore.as_ref()),
-            NEXT_LEADER_LOOKAHEAD,
-        );
+        let next_mine =
+            self.src
+                .next_leader_slot(&me, highest_slot, root_bank, NEXT_LEADER_LOOKAHEAD);
         self.debounces
             .next_leader_slot
             .publish(&self.publisher, next_mine.map(|(first, _last)| first));
@@ -1340,7 +1333,7 @@ impl Collector {
     }
 
     /// This epoch's blocks and the whole previous epoch's.
-    fn hold_produced_from(&mut self, root_bank: &Bank) {
+    fn hold_produced_from(&mut self, root_bank: &dyn BankView) {
         let schedule = root_bank.epoch_schedule();
         let epoch = schedule.get_epoch(root_bank.slot());
         let floor = schedule.get_first_slot_in_epoch(epoch.saturating_sub(1));
@@ -1357,17 +1350,15 @@ impl Collector {
     }
 
     /// The leaders of the next slots, as far as the schedule is known.
-    fn upcoming_leaders(&self, root_bank: &Bank, highest_slot: Slot) -> HashSet<Pubkey> {
-        let cache = &self.ctx.leader_schedule_cache;
+    fn upcoming_leaders(&self, root_bank: &dyn BankView, highest_slot: Slot) -> HashSet<Pubkey> {
         (highest_slot.saturating_add(1)..=highest_slot.saturating_add(UPCOMING_SLOTS))
-            .map_while(|slot| cache.slot_leader_at(slot, Some(root_bank)))
-            .map(|leader| leader.id)
+            .map_while(|slot| self.src.slot_leader(slot, root_bank))
             .collect()
     }
 
     /// The client, country and stake of every staked node and of every held epoch's leaders, which
     /// the schedule's leader conditions, its by-client summary and its turn cards read.
-    fn collect_leader_traits(&self, bank: &Bank, peers: &[(ContactInfo, u64)]) {
+    fn collect_leader_traits(&self, bank: &dyn BankView, peers: &[(PeerRow, u64)]) {
         let tally = tally_bank_stake(bank);
         let mut map: LeaderMap = tally
             .staked
@@ -1393,14 +1384,14 @@ impl Collector {
             .filter_map(|key| key.parse().ok())
             .collect();
         for (contact_info, _) in peers {
-            let identity = contact_info.pubkey();
+            let identity = &contact_info.pubkey;
             if map.contains_key(identity) || scheduled.contains(identity) {
                 let traits = map.entry(*identity).or_default();
-                traits.client = Some(contact_info.version().client().to_string());
-                traits.version = Some(contact_info.version().to_string());
-                traits.ip = contact_info.gossip().map(|addr| addr.ip().to_string());
+                traits.client = Some(contact_info.client.clone());
+                traits.version = Some(contact_info.version.clone());
+                traits.ip = contact_info.gossip.map(|addr| addr.ip().to_string());
                 traits.country = contact_info
-                    .gossip()
+                    .gossip
                     .and_then(|addr| geoip::country(addr.ip()));
             }
         }
@@ -1411,21 +1402,17 @@ impl Collector {
 
     fn collect_peer_table(
         &mut self,
-        bank: &Bank,
+        bank: &dyn BankView,
         mut leaders: HashSet<Pubkey>,
-        peers: &[(ContactInfo, u64)],
+        peers: &[(PeerRow, u64)],
     ) {
         let highest = self.last_completed_slot;
         let first = highest.saturating_sub(SLOT_OVERVIEW_LEN as u64);
         let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get() as u64;
         let mut slot = first.saturating_sub(first.checked_rem(stride).unwrap_or(0));
         while slot <= highest {
-            if let Some(leader) = self
-                .ctx
-                .leader_schedule_cache
-                .slot_leader_at(slot, Some(bank))
-            {
-                leaders.insert(leader.id);
+            if let Some(leader) = self.src.slot_leader(slot, bank) {
+                leaders.insert(leader);
             }
             slot = slot.saturating_add(stride);
         }
@@ -1434,18 +1421,18 @@ impl Collector {
 
         let mut gossip: HashMap<Pubkey, Heard> = HashMap::new();
         for (contact_info, _) in peers {
-            let identity = contact_info.pubkey();
+            let identity = &contact_info.pubkey;
             if !leaders.contains(identity) {
                 continue;
             }
             gossip.insert(
                 *identity,
                 Heard {
-                    version: Some(contact_info.version().to_string()),
-                    client: Some(contact_info.version().client().to_string()),
-                    ip: contact_info.gossip().map(|addr| addr.ip().to_string()),
+                    version: Some(contact_info.version.clone()),
+                    client: Some(contact_info.client.clone()),
+                    ip: contact_info.gossip.map(|addr| addr.ip().to_string()),
                     country: contact_info
-                        .gossip()
+                        .gossip
                         .and_then(|addr| geoip::country(addr.ip())),
                 },
             );
@@ -1478,32 +1465,29 @@ impl Collector {
         self.debounces.peers.publish(&self.publisher, peers);
     }
 
-    fn collect_slot_levels(&mut self, root_bank: &Bank, frozen: &[(Slot, Arc<Bank>)]) {
-        let commitment = self.ctx.block_commitment_cache.read().unwrap();
-        let (confirmed, finalized) = (
-            commitment.highest_confirmed_slot(),
-            commitment.highest_super_majority_root(),
-        );
-        drop(commitment);
+    fn collect_slot_levels(
+        &mut self,
+        root_bank: &dyn BankView,
+        frozen: &[(Slot, Arc<dyn BankView>)],
+    ) {
+        let crate::source::Commitment {
+            confirmed,
+            finalized,
+            ..
+        } = self.src.commitment();
         let root = root_bank.slot();
 
-        let banks: Vec<Arc<Bank>> = match &self.frozen_banks {
-            Some(receiver) => receiver
-                .try_iter()
-                .filter_map(|(notification, _)| match notification {
-                    BankNotification::Frozen(bank) => Some(bank),
-                    _ => None,
-                })
-                .collect(),
-            None => frozen.iter().map(|(_, bank)| bank.clone()).collect(),
-        };
-        self.collect_validator_info(&banks, frozen);
+        let notified = self.src.take_frozen();
+        let repeated = notified.is_none();
+        let banks: Vec<Arc<dyn BankView>> =
+            notified.unwrap_or_else(|| frozen.iter().map(|(_, bank)| bank.clone()).collect());
+        self.collect_validator_info(&banks, frozen, repeated);
 
         let mut changed = Vec::new();
         let mut became_full = Vec::new();
         let mut captured = false;
         for bank in &banks {
-            self.observe_finalization(bank);
+            self.observe_finalization(bank.as_ref());
             let slot = bank.slot();
             // Counts are cumulative along a fork; a block's own is the difference
             // from its parent, off the parent's totals or the parent itself.
@@ -1536,7 +1520,10 @@ impl Collector {
                 Totals {
                     transactions: bank.transaction_count(),
                     non_vote: bank.non_vote_transaction_count_since_restart(),
-                    tips: self.tips.as_ref().map_or(0, |meter| meter.total(bank)),
+                    tips: self
+                        .tips
+                        .as_ref()
+                        .map_or(0, |meter| meter.total(bank.as_ref())),
                     failed,
                 },
             );
@@ -1550,8 +1537,8 @@ impl Collector {
                 self.tips.as_mut().and_then(|meter| {
                     let before_tips = before
                         .map(|before| before.tips)
-                        .or_else(|| parent.as_ref().map(|parent| meter.total(parent)))?;
-                    Some(meter.measure(bank, before_tips))
+                        .or_else(|| parent.as_ref().map(|parent| meter.total(parent.as_ref())))?;
+                    Some(meter.measure(bank.as_ref(), before_tips))
                 })
             } else {
                 None
@@ -1577,14 +1564,14 @@ impl Collector {
             let shreds = fresh
                 .then(|| self.metrics_tap.shred_fill(slot).map(ShredArrival::from))
                 .flatten();
-            let detail = counts
-                .filter(|_| fresh)
-                .map(|(total, non_vote)| block_detail(bank, total, non_vote, tips, replay));
+            let detail = counts.filter(|_| fresh).map(|(total, non_vote)| {
+                block_detail(bank.as_ref(), total, non_vote, tips, replay)
+            });
 
             if let Some(detail) = &detail
                 && mine
             {
-                let block = self.capture_block(slot, bank, detail);
+                let block = self.capture_block(slot, bank.as_ref(), detail);
                 if self.replies.produced.write().unwrap().insert(block) {
                     self.versions_pending.insert(slot);
                     self.execution_pending.insert(slot);
@@ -1625,8 +1612,7 @@ impl Collector {
                 changed.push(entry);
             }
         }
-        let blockstore = &self.ctx.blockstore;
-        let fees = self.fee_payers.read(blockstore);
+        let fees = self.fee_payers.read(self.src.as_ref());
         if !fees.is_empty() {
             let mut produced = self.replies.produced.write().unwrap();
             for block in fees {
@@ -1638,13 +1624,14 @@ impl Collector {
                 produced.set_fees(block);
             }
         }
+        let src = self.src.clone();
         self.fee_payers
-            .settle(root, root_bank.epoch(), |slot| blockstore.is_root(slot));
+            .settle(root, root_bank.epoch(), |slot| src.is_root(slot));
         // A block of ours the cluster skipped is not a produced block.
         let dropped = self.replies.produced.write().unwrap().drop_unrooted(
             self.produced_settled_to,
             root,
-            |slot| blockstore.is_root(slot),
+            |slot| src.is_root(slot),
         );
         self.produced_settled_to = root;
         let refilled = self.merge_refill(root);
@@ -1712,12 +1699,11 @@ impl Collector {
             ..
         } = refilled;
         let read = blocks.len();
-        let blockstore = &self.ctx.blockstore;
-        let lowest = blockstore.lowest_slot();
-        let (kept, dropped): (Vec<ProducedBlock>, Vec<ProducedBlock>) =
-            blocks.into_values().partition(|block| {
-                block.slot < lowest || block.slot > root || blockstore.is_root(block.slot)
-            });
+        let src = self.src.clone();
+        let lowest = src.lowest_slot();
+        let (kept, dropped): (Vec<ProducedBlock>, Vec<ProducedBlock>) = blocks
+            .into_values()
+            .partition(|block| block.slot < lowest || block.slot > root || src.is_root(block.slot));
         if !dropped.is_empty() {
             // So the next read drops them too, once the ledger no longer holds them.
             let slots: Vec<Slot> = dropped.iter().map(|block| block.slot).collect();
@@ -1742,7 +1728,7 @@ impl Collector {
     }
 
     /// From the working fork's newest frozen bank, so failures on an abandoned fork drop out.
-    fn store_failed(&self, working_bank: &Bank) {
+    fn store_failed(&self, working_bank: &dyn BankView) {
         let slot = if working_bank.is_frozen() {
             working_bank.slot()
         } else {
@@ -1783,21 +1769,20 @@ impl Collector {
     }
 
     fn fill_versions(&mut self) -> bool {
-        let blockstore = &self.ctx.blockstore;
-        let floor = blockstore.lowest_slot();
+        let src = self.src.clone();
+        let floor = src.lowest_slot();
         let mut changed = false;
         for slot in std::mem::take(&mut self.versions_pending) {
             if slot < floor || !self.replies.produced.read().unwrap().contains(slot) {
                 continue;
             }
-            if !blockstore.is_full(slot) {
+            if !src.is_full(slot) {
                 self.versions_pending.insert(slot);
                 continue;
             }
-            let Ok(entries) = blockstore.get_slot_entries(slot, 0) else {
+            let Some(tally) = src.message_versions(slot) else {
                 continue;
             };
-            let tally = versions::tally(entries.iter().flat_map(|entry| &entry.transactions));
             if self
                 .replies
                 .produced
@@ -1867,7 +1852,12 @@ impl Collector {
         changed
     }
 
-    fn capture_block(&self, slot: Slot, bank: &Bank, detail: &BlockDetail) -> ProducedBlock {
+    fn capture_block(
+        &self,
+        slot: Slot,
+        bank: &dyn BankView,
+        detail: &BlockDetail,
+    ) -> ProducedBlock {
         ProducedBlock {
             slot,
             slot_time_millis: self.first_shred_time(slot),
@@ -1912,14 +1902,15 @@ impl Collector {
         }
     }
 
-    fn collect_identity_and_vote(&mut self, bank: &Bank, behind_cluster: Option<u64>) {
-        let identity = self.ctx.identity();
+    fn collect_identity_and_vote(&mut self, bank: &dyn BankView, behind_cluster: Option<u64>) {
+        let identity = self.src.identity();
+        let vote_account = self.src.vote_account();
         self.debounces
             .identity_key
             .publish(&self.publisher, identity.to_string());
         self.debounces
             .vote_key
-            .publish(&self.publisher, self.ctx.vote_account.to_string());
+            .publish(&self.publisher, vote_account.to_string());
         let (my_name, my_icon) = self.peer_display(&identity);
         self.debounces
             .identity_name
@@ -1932,53 +1923,47 @@ impl Collector {
             .publish(&self.publisher, bank.get_balance(&identity));
         self.debounces
             .vote_balance
-            .publish(&self.publisher, bank.get_balance(&self.ctx.vote_account));
+            .publish(&self.publisher, bank.get_balance(&vote_account));
 
         let epoch = bank.epoch();
-        let vote_accounts = bank.vote_accounts();
-        let mine = vote_accounts.get(&self.ctx.vote_account);
-        let pending = mine.map_or(0, |(_, account)| {
-            account.vote_state_view().pending_delegator_rewards()
-        });
+        let mine = bank.vote_row(&vote_account);
+        let pending = mine.as_ref().map_or(0, |row| row.pending_delegator_rewards);
         self.debounces
             .vote_cost
             .publish(&self.publisher, compute_vote_cost(bank, pending));
-        let total_stake: u64 = vote_accounts.values().map(|(stake, _)| *stake).sum();
+        let mut total_stake = 0u64;
         // From the same bank as our own credits, so the share never compares two moments.
-        let staked_credits: Vec<u64> = vote_accounts
-            .values()
-            .filter(|(stake, _)| *stake > 0)
-            .map(|(_, account)| count_epoch_credits(account.vote_state_view(), epoch))
-            .collect();
+        let mut staked_credits: Vec<u64> = Vec::new();
+        bank.for_each_vote_row(&mut |row| {
+            total_stake = total_stake.saturating_add(row.stake);
+            if row.stake > 0 {
+                staked_credits.push(row.credits_in(epoch));
+            }
+        });
         let cluster_max = staked_credits.iter().copied().max();
         let cluster_median = certs::median_of(staked_credits);
 
         // After a failover the vote account is voted from another machine, whose
         // last vote must not be read as this one's health.
-        let voting = mine.is_some_and(|(_, account)| *account.node_pubkey() == identity);
+        let voting = mine.as_ref().is_some_and(|row| row.identity == identity);
         self.voting = voting;
 
-        let (activated_stake, commission, voter_vote) = match mine {
-            Some((stake, account)) => {
-                let view = account.vote_state_view();
-                (*stake, Some(view.commission()), view.last_voted_slot())
-            }
+        let (activated_stake, commission, voter_vote) = match &mine {
+            Some(row) => (row.stake, Some(row.commission), row.last_voted_slot),
             None => (0, None, None),
         };
 
-        let bls_key =
-            mine.map(|(_, account)| account.vote_state_view().bls_pubkey_compressed().is_some());
-        let vote_credits = mine.map(|(_, account)| VoteCredits {
+        let bls_key = mine.as_ref().map(|row| row.has_bls_key);
+        let vote_credits = mine.as_ref().map(|row| VoteCredits {
             epoch,
-            credits: count_epoch_credits(account.vote_state_view(), epoch),
+            credits: row.credits_in(epoch),
             cluster_max,
             cluster_median,
         });
         self.debounces.bls_key.publish(&self.publisher, bls_key);
-        self.debounces.admission.publish(
-            &self.publisher,
-            read_admission(bank, &self.ctx.vote_account),
-        );
+        self.debounces
+            .admission
+            .publish(&self.publisher, read_admission(bank, &vote_account));
         self.debounces
             .vote_credits
             .publish(&self.publisher, vote_credits);
@@ -2014,7 +1999,7 @@ impl Collector {
             .publish(&self.publisher, behind_cluster);
     }
 
-    fn collect_epoch(&mut self, bank: &Bank, completed_height: Option<u64>) {
+    fn collect_epoch(&mut self, bank: &dyn BankView, completed_height: Option<u64>) {
         // Blocks, not slots: the gap between the two is how many slots the cluster skipped.
         if let Some(height) = completed_height {
             self.debounces.block_height.publish(&self.publisher, height);
@@ -2026,7 +2011,7 @@ impl Collector {
         let start_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
         let end_slot = epoch_schedule.get_last_slot_in_epoch(epoch);
 
-        let me = self.ctx.identity();
+        let me = self.src.identity();
         if self.epoch_published != Some((epoch, me, true)) {
             let current = EpochInfo {
                 // An unknown schedule is published as no leader slots.
@@ -2058,7 +2043,7 @@ impl Collector {
     /// Rounded to the second so the debounce has something to suppress.
     fn collect_epoch_countdown(
         &mut self,
-        bank: &Bank,
+        bank: &dyn BankView,
         epoch: Epoch,
         start_slot: Slot,
         end_slot: Slot,
@@ -2089,15 +2074,13 @@ impl Collector {
     }
 
     /// With no leader slots of ours, and no turns where the schedule is not derived.
-    fn epoch_record(&self, bank: &Bank, epoch: Epoch) -> EpochInfo {
+    fn epoch_record(&self, bank: &dyn BankView, epoch: Epoch) -> EpochInfo {
         let schedule = bank.epoch_schedule();
         let start_slot = schedule.get_first_slot_in_epoch(epoch);
         let slots_in_epoch = schedule.get_slots_in_epoch(epoch);
         let (leaders, turns) = self.epoch_turns(epoch, slots_in_epoch);
-        let (block_cost_limit, account_cost_limit) = match bank.read_cost_tracker() {
-            Ok(tracker) => (tracker.get_block_limit(), tracker.get_account_limit()),
-            Err(_) => (0, 0),
-        };
+        let cost = bank.cost();
+        let (block_cost_limit, account_cost_limit) = (cost.block_limit, cost.account_limit);
         EpochInfo {
             epoch,
             start_slot,
@@ -2113,11 +2096,7 @@ impl Collector {
 
     /// Empty, never partial, if the length is not whole turns.
     fn epoch_turns(&self, epoch: Epoch, slots_in_epoch: u64) -> (Vec<String>, Vec<u16>) {
-        let Some(schedule) = self
-            .ctx
-            .leader_schedule_cache
-            .get_epoch_leader_schedule(epoch)
-        else {
+        let Some(schedule) = self.src.epoch_turn_leaders(epoch) else {
             return (Vec::new(), Vec::new());
         };
         let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get();
@@ -2125,15 +2104,15 @@ impl Collector {
         let mut leaders: Vec<String> = Vec::new();
         let mut seen: HashMap<Pubkey, u16> = HashMap::new();
         let mut turns: Vec<u16> = Vec::new();
-        for leader in schedule.get_slot_leaders().step_by(stride) {
-            let index = match seen.get(&leader.id) {
+        for leader in schedule {
+            let index = match seen.get(&leader) {
                 Some(index) => *index,
                 None => {
                     let Ok(index) = u16::try_from(leaders.len()) else {
                         return (Vec::new(), Vec::new());
                     };
-                    leaders.push(leader.id.to_string());
-                    seen.insert(leader.id, index);
+                    leaders.push(leader.to_string());
+                    seen.insert(leader, index);
                     index
                 }
             };
@@ -2153,37 +2132,33 @@ impl Collector {
     }
 
     /// `None` means the schedule is not known yet, which is not an empty list.
-    fn leader_slots_in_epoch(&self, bank: &Bank, epoch: Epoch) -> Option<Vec<Slot>> {
+    fn leader_slots_in_epoch(&self, bank: &dyn BankView, epoch: Epoch) -> Option<Vec<Slot>> {
         let epoch_schedule = bank.epoch_schedule();
         let start_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
         let end_slot = epoch_schedule.get_last_slot_in_epoch(epoch);
-
-        // `get_leader_upcoming_slots` yields an endlessly repeating schedule, so
-        // the `take_while` is what bounds it to the epoch asked for.
-        let me = self.ctx.identity();
-        self.ctx
-            .leader_schedule_cache
-            .get_epoch_leader_schedule(epoch)
-            .map(|leaders| {
-                leaders
-                    .get_leader_upcoming_slots(&me, 0)
-                    .map(|index| start_slot.saturating_add(index as Slot))
-                    .take_while(|slot| *slot <= end_slot)
+        let slots = end_slot.saturating_sub(start_slot).saturating_add(1);
+        let me = self.src.identity();
+        self.src
+            .leader_slot_indexes(epoch, &me, slots)
+            .map(|indexes| {
+                indexes
+                    .into_iter()
+                    .map(|index| start_slot.saturating_add(index))
                     .collect()
             })
     }
 
     /// Returns each validator's stalest vote, which the certificate lists mark delinquency by.
-    fn collect_peers(&mut self, bank: &Bank, peers: &[(ContactInfo, u64)]) -> LastVotes {
-        let rpc_nodes = count_rpc_nodes(&self.ctx.cluster_info, peers);
+    fn collect_peers(&mut self, bank: &dyn BankView, peers: &[(PeerRow, u64)]) -> LastVotes {
+        let rpc_nodes = self.src.rpc_node_count(peers);
         let tally = tally_bank_stake(bank);
 
         // A validator can be in gossip or the vote accounts without the other, so both are walked.
         // Versions are kept only for the staked identities they are counted over.
         let versions: HashMap<Pubkey, String> = peers
             .iter()
-            .filter(|(contact_info, _)| tally.staked.contains_key(contact_info.pubkey()))
-            .map(|(contact_info, _)| (*contact_info.pubkey(), contact_info.version().to_string()))
+            .filter(|(contact_info, _)| tally.staked.contains_key(&contact_info.pubkey))
+            .map(|(contact_info, _)| (contact_info.pubkey, contact_info.version.clone()))
             .collect();
 
         self.debounces.validator_counts.publish(
@@ -2211,9 +2186,14 @@ impl Collector {
         }
     }
 
-    fn collect_validator_info(&mut self, banks: &[Arc<Bank>], frozen: &[(Slot, Arc<Bank>)]) {
-        // Bank forks repeats a bank every tick; the notification stream sends each once.
-        let repeated = self.frozen_banks.is_none();
+    /// `repeated` where `banks` came from bank forks, which repeats a bank every tick; the
+    /// notification stream sends each once.
+    fn collect_validator_info(
+        &mut self,
+        banks: &[Arc<dyn BankView>],
+        frozen: &[(Slot, Arc<dyn BankView>)],
+        repeated: bool,
+    ) {
         let mut found = Vec::new();
         // Banks frozen while the ledger loaded at startup are never notified, so the first sweep
         // reads bank forks too.
@@ -2221,7 +2201,7 @@ impl Collector {
             for (slot, bank) in frozen {
                 if banks.iter().all(|notified| notified.slot() != *slot) {
                     self.info_scanned_to = self.info_scanned_to.max(*slot);
-                    found.push((*slot, validator_info::scan_slot(bank)));
+                    found.push((*slot, bank.validator_info_changed()));
                 }
             }
         }
@@ -2231,7 +2211,7 @@ impl Collector {
                 continue;
             }
             self.info_scanned_to = self.info_scanned_to.max(slot);
-            found.push((slot, validator_info::scan_slot(bank)));
+            found.push((slot, bank.validator_info_changed()));
         }
         found.retain(|(_, entries)| !entries.is_empty());
         if found.is_empty() {
@@ -2298,13 +2278,13 @@ impl Collector {
 
     /// On the same basis as `solana block-production`, each slot checked once as the root passes
     /// it.
-    fn collect_skip_rate(&mut self, root_bank: &Bank) {
+    fn collect_skip_rate(&mut self, root_bank: &dyn BankView) {
         // The root's epoch, not the working bank's: they differ for half a minute
         // after a rollover.
         let epoch = root_bank.epoch();
         // Keyed on the identity too, so a validator that boots on a dummy one and
         // swaps counts its real slots.
-        let me = self.ctx.identity();
+        let me = self.src.identity();
         let previous = epoch.checked_sub(1);
         // At a rollover the current walk carries on as the previous epoch's, so its last slots
         // are still counted.
@@ -2363,16 +2343,11 @@ impl Collector {
 
 /// Blocks on the tip's chain that replay has yet to complete, so slots the cluster skipped are not
 /// distance. Past the walk, or below a slot whose parent is unknown, the rest is counted in slots.
-fn blocks_behind(blockstore: &Blockstore, tip: Slot, completed: Slot) -> u64 {
+fn walk_behind(parent_of: impl Fn(Slot) -> Option<Slot>, tip: Slot, completed: Slot) -> u64 {
     let mut slot = tip;
     let mut blocks = 0u64;
     while slot > completed && blocks < BEHIND_WALK_BLOCKS {
-        let Some(parent) = blockstore
-            .meta(slot)
-            .ok()
-            .flatten()
-            .and_then(|meta| meta.parent_slot)
-        else {
+        let Some(parent) = parent_of(slot) else {
             break;
         };
         blocks = blocks.saturating_add(1);
@@ -2391,7 +2366,7 @@ fn measure_replay_rate(window: &VecDeque<(Instant, Slot)>) -> Option<f64> {
     Some(newest.saturating_sub(*oldest) as f64 / span.as_secs_f64())
 }
 
-fn compute_vote_cost(bank: &Bank, pending: u64) -> VoteCost {
+fn compute_vote_cost(bank: &dyn BankView, pending: u64) -> VoteCost {
     if bank.is_alpenglow() {
         let minimum = bank.minimum_vote_account_balance_for_vat();
         let rent = bank.get_minimum_balance_for_rent_exemption(VoteStateV4::size_of());
@@ -2410,6 +2385,7 @@ fn compute_vote_cost(bank: &Bank, pending: u64) -> VoteCost {
 }
 
 /// Reads only the newest entry, which is the bank's own epoch once the account has voted in it.
+#[cfg(test)]
 fn count_epoch_credits(view: &solana_vote::vote_state_view::VoteStateView, epoch: Epoch) -> u64 {
     view.epoch_credits_iter()
         .last()
@@ -2419,10 +2395,8 @@ fn count_epoch_credits(view: &solana_vote::vote_state_view::VoteStateView, epoch
 
 /// Most settled first: the thresholds cross while the commitment cache lags the root at startup.
 /// The country of a validator's gossip address, for one not on the peer table.
-fn country_of(cluster_info: &ClusterInfo, key: &Pubkey) -> Option<&'static str> {
-    cluster_info
-        .lookup_contact_info(key, |contact| contact.gossip())
-        .flatten()
+fn country_of(src: &dyn Source, key: &Pubkey) -> Option<&'static str> {
+    src.peer_gossip(key)
         .and_then(|addr| geoip::country(addr.ip()))
 }
 
@@ -2457,15 +2431,12 @@ pub(crate) fn is_delinquent(last_vote: Option<Slot>, tip: Slot) -> bool {
 }
 
 /// The bank's staked vote accounts tallied by identity, against the bank's own slot.
-pub(crate) fn tally_bank_stake(bank: &Bank) -> StakeTally {
-    let accounts = bank.vote_accounts();
-    tally_stake(
-        accounts.iter().map(|(_, (stake, account))| {
-            let last_vote = account.vote_state_view().last_voted_slot();
-            (*account.node_pubkey(), *stake, last_vote)
-        }),
-        bank.slot(),
-    )
+pub(crate) fn tally_bank_stake(bank: &dyn BankView) -> StakeTally {
+    let mut accounts = Vec::new();
+    bank.for_each_vote_row(&mut |row| {
+        accounts.push((row.identity, row.stake, row.last_voted_slot));
+    });
+    tally_stake(accounts.into_iter(), bank.slot())
 }
 
 fn tally_stake(
@@ -2534,14 +2505,15 @@ fn assess_health(
 }
 
 /// `ClusterInfo::rpc_peers`' filter over a copy of the table, which holds one contact per identity.
-fn count_rpc_nodes(cluster_info: &ClusterInfo, peers: &[(ContactInfo, u64)]) -> usize {
+pub(crate) fn count_rpc_nodes(
+    cluster_info: &solana_gossip::cluster_info::ClusterInfo,
+    peers: &[(PeerRow, u64)],
+) -> usize {
     let me = cluster_info.id();
     let space = cluster_info.socket_addr_space();
     peers
         .iter()
-        .filter(|(contact, _)| {
-            contact.pubkey() != &me && contact.rpc().is_some_and(|addr| space.check(&addr))
-        })
+        .filter(|(peer, _)| peer.pubkey != me && peer.rpc.is_some_and(|addr| space.check(&addr)))
         .count()
 }
 
@@ -2591,32 +2563,25 @@ fn version_shares(
 /// The error and entry counters are per bank, so only `transactions` and `non_vote` come
 /// differenced.
 fn block_detail(
-    bank: &Bank,
+    bank: &dyn BankView,
     transactions: u64,
     non_vote: u64,
     tips: Option<u64>,
     replay_micros: Option<u64>,
 ) -> BlockDetail {
-    let (block_cost, block_cost_limit, account_cost_limit) = match bank.read_cost_tracker() {
-        Ok(tracker) => (
-            tracker.block_cost(),
-            tracker.get_block_limit(),
-            tracker.get_account_limit(),
-        ),
-        Err(_) => (0, 0, 0),
-    };
-    let fees = bank.get_collector_fee_details();
+    let cost = bank.cost();
+    let fees = bank.fees();
 
     BlockDetail {
         transactions,
         non_vote_transactions: non_vote,
         failed_transactions: bank.transaction_error_count(),
         entries: bank.transaction_entries_count(),
-        block_cost,
-        block_cost_limit,
-        account_cost_limit,
-        total_fees: fees.total_transaction_fee(),
-        priority_fees: fees.total_priority_fee(),
+        block_cost: cost.block_cost,
+        block_cost_limit: cost.block_limit,
+        account_cost_limit: cost.account_limit,
+        total_fees: fees.total,
+        priority_fees: fees.priority,
         tips,
         replay_micros,
     }
@@ -2700,15 +2665,51 @@ mod tests {
             fixture::{Fixture, fixture},
             snapshot::Writing,
             startup::StartupPublisher,
+            validator_info,
         },
         solana_core::validator::ValidatorStartProgress,
+        solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
         solana_keypair::Keypair,
         solana_leader_schedule::SlotLeader,
-        solana_ledger::{blockstore::make_slot_entries, get_tmp_ledger_path_auto_delete},
+        solana_ledger::{
+            blockstore::{Blockstore, make_slot_entries},
+            get_tmp_ledger_path_auto_delete,
+        },
         solana_net_utils::SocketAddrSpace,
+        solana_rpc::optimistically_confirmed_bank_tracker::BankNotification,
+        solana_runtime::bank::Bank,
         solana_signer::Signer,
         std::net::SocketAddr,
     };
+
+    fn blocks_behind(blockstore: &Blockstore, tip: Slot, completed: Slot) -> u64 {
+        walk_behind(
+            |slot| {
+                blockstore
+                    .meta(slot)
+                    .ok()
+                    .flatten()
+                    .and_then(|meta| meta.parent_slot)
+            },
+            tip,
+            completed,
+        )
+    }
+
+    fn rows(peers: &[(ContactInfo, u64)]) -> Vec<(PeerRow, u64)> {
+        peers
+            .iter()
+            .map(|(contact, at)| (PeerRow::from(contact), *at))
+            .collect()
+    }
+
+    impl Collector {
+        /// Fed by replay's freeze notifications from here on.
+        fn notify_from(&mut self, frozen_banks: BankNotificationReceiver) {
+            let ctx = self.src.direct().unwrap().clone();
+            self.src = Arc::new(Direct::new(ctx, Some(frozen_banks)));
+        }
+    }
 
     #[test]
     fn test_level_reads_the_thresholds_most_settled_first() {
@@ -3146,7 +3147,7 @@ mod tests {
         let harness = fixture();
         let mut collector = harness.collector();
         let bank = harness.working_bank();
-        let peers = harness.ctx.cluster_info.all_peers();
+        let peers = rows(&harness.ctx.cluster_info.all_peers());
         let now = timestamp();
 
         collector.collect_gossip_peers(&bank, bank.slot(), &peers, now);
@@ -3194,7 +3195,7 @@ mod tests {
         let harness = fixture();
         let mut collector = harness.collector();
         let bank = harness.working_bank();
-        let peers = harness.ctx.cluster_info.all_peers();
+        let peers = rows(&harness.ctx.cluster_info.all_peers());
         let now = timestamp();
         let mut point = solana_metrics::datapoint::DataPoint::new("consensus_vote_metrics");
         point.add_tag("address", &harness.ctx.vote_account.to_string());
@@ -3454,7 +3455,7 @@ mod tests {
             .leaders
             .extend([scheduled.to_string(), silent.to_string()]);
 
-        let peers = harness.ctx.cluster_info.all_peers();
+        let peers = rows(&harness.ctx.cluster_info.all_peers());
         collector.collect_leader_traits(&harness.working_bank(), &peers);
 
         let map = collector.replies.leader_traits.read().unwrap();
@@ -3477,7 +3478,7 @@ mod tests {
         // The fixture node is staked and in its own gossip table.
         let harness = fixture();
         let mut collector = harness.collector();
-        let peers = harness.ctx.cluster_info.all_peers();
+        let peers = rows(&harness.ctx.cluster_info.all_peers());
         collector.collect_peers(&harness.working_bank(), &peers);
 
         let version = harness
@@ -3515,7 +3516,11 @@ mod tests {
             }
             cluster_info.insert_info(ContactInfo::new(Pubkey::new_unique(), timestamp(), 0));
 
-            let peers = cluster_info.all_peers();
+            let peers: Vec<(PeerRow, u64)> = cluster_info
+                .all_peers()
+                .iter()
+                .map(|(contact, at)| (PeerRow::from(contact), *at))
+                .collect();
             assert_eq!(peers.len(), 4);
             let counted = count_rpc_nodes(&cluster_info, &peers);
             assert_eq!(counted, cluster_info.rpc_peers().len());
@@ -3876,7 +3881,7 @@ mod tests {
         let bank = harness.advance_to(8);
         let mut collector = harness.collector();
         let (sender, receiver) = crossbeam_channel::unbounded();
-        collector.frozen_banks = Some(receiver);
+        collector.notify_from(receiver);
 
         collector.tick();
         assert!(
@@ -3901,7 +3906,7 @@ mod tests {
         let bank = harness.advance_with_failures(1, 3);
         let mut collector = harness.collector();
         let (sender, receiver) = crossbeam_channel::unbounded();
-        collector.frozen_banks = Some(receiver);
+        collector.notify_from(receiver);
 
         // A duplicate block's slot is frozen again once the cluster's version is repaired.
         sender
@@ -4035,7 +4040,7 @@ mod tests {
         let harness = fixture();
         let mut collector = harness.collector();
         let (sender, receiver) = crossbeam_channel::unbounded();
-        collector.frozen_banks = Some(receiver);
+        collector.notify_from(receiver);
         let parent = harness.advance_to(1);
         let higher = harness.advance_to(3);
         // A fork off slot 1 that freezes after slot 3.
@@ -4081,7 +4086,7 @@ mod tests {
         );
         let mut collector = harness.collector();
         let (_sender, receiver) = crossbeam_channel::unbounded();
-        collector.frozen_banks = Some(receiver);
+        collector.notify_from(receiver);
 
         collector.tick();
         assert_eq!(
