@@ -527,6 +527,10 @@ pub trait Source: Send + Sync {
     fn caught_up_millis(&self) -> Option<u64> {
         None
     }
+    /// Whether `caught_up_millis` comes from another process, which is then waited for.
+    fn reports_caught_up(&self) -> bool {
+        false
+    }
     fn banks(&self) -> Banks;
     fn root_bank(&self) -> Arc<dyn BankView>;
     fn working_bank(&self) -> Arc<dyn BankView>;

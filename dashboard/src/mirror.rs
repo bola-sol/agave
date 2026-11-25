@@ -1348,6 +1348,9 @@ impl Source for Mirror {
             })
             .count()
     }
+    fn reports_caught_up(&self) -> bool {
+        true
+    }
     fn caught_up_millis(&self) -> Option<u64> {
         let state = self.state.read().unwrap();
         state
