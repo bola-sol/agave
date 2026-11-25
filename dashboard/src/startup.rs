@@ -270,7 +270,12 @@ impl StartupPublisher {
             stake_in_gossip: stake_in_gossip.filter(|_| waiting),
             phase_elapsed_nanos: if self.reported.is_none() || reported.readings {
                 let now = Instant::now();
-                let process_since = crate::host_stats::process_started()
+                // Needed only for the first phase seen.
+                let process_since = self
+                    .current
+                    .is_none()
+                    .then(crate::host_stats::process_started)
+                    .flatten()
                     .and_then(|started| SystemTime::now().duration_since(started).ok())
                     .and_then(|age| now.checked_sub(age));
                 self.elapsed_from(phase.name, now, process_since)
