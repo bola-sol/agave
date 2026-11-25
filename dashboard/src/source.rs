@@ -21,7 +21,6 @@ use {
         bank_forks::SharableBanks,
         epoch_stakes::BLSPubkeyToRankMap,
     },
-    solana_signature::Signature,
     solana_slot_history::SlotHistory,
     std::{
         collections::HashMap,
@@ -32,7 +31,7 @@ use {
 };
 
 /// A vote account as of one bank.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VoteRow {
     pub vote: Pubkey,
     pub identity: Pubkey,
@@ -60,10 +59,7 @@ impl VoteRow {
             commission: view.commission(),
             inflation_rewards_commission_bps: view.inflation_rewards_commission(),
             last_voted_slot: view.last_voted_slot(),
-            last_epoch_credits: view
-                .epoch_credits_iter()
-                .last()
-                .map(|item| (item.epoch(), item.credits(), item.prev_credits())),
+            last_epoch_credits: newest_credits(view),
             pending_delegator_rewards: view.pending_delegator_rewards(),
             has_bls_key: view.bls_pubkey_compressed().is_some(),
         }
@@ -75,6 +71,15 @@ impl VoteRow {
             .filter(|(at, _, _)| *at == epoch)
             .map_or(0, |(_, credits, prev)| credits.saturating_sub(prev))
     }
+}
+
+/// The vote state's newest epoch credits entry: epoch, credits, previous credits.
+pub(crate) fn newest_credits(
+    view: &solana_vote::vote_state_view::VoteStateView,
+) -> Option<(Epoch, u64, u64)> {
+    view.epoch_credits_iter()
+        .last()
+        .map(|item| (item.epoch(), item.credits(), item.prev_credits()))
 }
 
 /// One rank of an epoch's admitted set.
@@ -209,7 +214,6 @@ pub trait BankView: Send + Sync {
     fn get_minimum_balance_for_rent_exemption(&self, len: usize) -> u64;
     fn get_slot_history(&self) -> Option<SlotHistory>;
     fn account_data(&self, key: &Pubkey) -> Option<Vec<u8>>;
-    fn signature_status_slot(&self, signature: &Signature) -> Option<Slot>;
     /// Validator info entries this bank changed.
     fn validator_info_changed(&self) -> Vec<(Pubkey, ValidatorInfo)>;
     /// The bank itself, where it is one.
@@ -305,9 +309,6 @@ macro_rules! forward_bank_view {
             }
             fn account_data(&self, key: &Pubkey) -> Option<Vec<u8>> {
                 BankView::account_data(&**self, key)
-            }
-            fn signature_status_slot(&self, signature: &Signature) -> Option<Slot> {
-                BankView::signature_status_slot(&**self, signature)
             }
             fn validator_info_changed(&self) -> Vec<(Pubkey, ValidatorInfo)> {
                 BankView::validator_info_changed(&**self)
@@ -440,9 +441,6 @@ impl BankView for Bank {
     fn account_data(&self, key: &Pubkey) -> Option<Vec<u8>> {
         use solana_account::ReadableAccount;
         self.get_account(key).map(|account| account.data().to_vec())
-    }
-    fn signature_status_slot(&self, signature: &Signature) -> Option<Slot> {
-        Bank::get_signature_status_slot(self, signature).map(|(slot, _)| slot)
     }
     fn validator_info_changed(&self) -> Vec<(Pubkey, ValidatorInfo)> {
         crate::validator_info::scan_slot(self)

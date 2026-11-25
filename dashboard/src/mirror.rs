@@ -400,9 +400,6 @@ impl BankView for MirrorBank {
         (*key == crate::collect::VOTE_REWARD_ACCOUNT && !self.epoch.vote_reward.is_empty())
             .then(|| self.epoch.vote_reward.clone())
     }
-    fn signature_status_slot(&self, _signature: &Signature) -> Option<Slot> {
-        None
-    }
     fn validator_info_changed(&self) -> Vec<(Pubkey, ValidatorInfo)> {
         Vec::new()
     }
@@ -419,6 +416,9 @@ pub struct FrozenBank {
     parent: Option<Arc<FrozenBank>>,
     /// What the finalization share reads of this bank, where it arrived.
     finalization: Option<Arc<FinalizationEvent>>,
+    /// Whether readings were arriving when the collector took this bank, so one missing is lost
+    /// rather than never sent.
+    expects_finalization: bool,
     /// Validator info entries handed to the collector with this bank.
     info_changes: Vec<(Pubkey, ValidatorInfo)>,
 }
@@ -503,14 +503,18 @@ impl BankView for FrozenBank {
     fn for_each_vote_row(&self, each: &mut dyn FnMut(&VoteRow)) {
         let ranks = self.rank_map(self.event.slot);
         let (Some(reading), Some(ranks)) = (self.finalization.as_ref(), ranks) else {
-            for row in self.votes.values() {
-                each(row);
+            // Another bank's votes would count this block as carried by everyone.
+            if !self.expects_finalization {
+                for row in self.votes.values() {
+                    each(row);
+                }
             }
             return;
         };
         let bit = |bits: &[u8], rank: usize| {
+            let shift = u32::try_from(rank % 8).unwrap_or(0);
             bits.get(rank / 8)
-                .is_some_and(|byte| byte & 1u8.checked_shl((rank % 8) as u32).unwrap_or(0) != 0)
+                .is_some_and(|byte| byte & 1u8.checked_shl(shift).unwrap_or(0) != 0)
         };
         let behind = reading
             .front
@@ -563,9 +567,6 @@ impl BankView for FrozenBank {
     fn account_data(&self, key: &Pubkey) -> Option<Vec<u8>> {
         (*key == crate::collect::VOTE_REWARD_ACCOUNT && !self.epoch.vote_reward.is_empty())
             .then(|| self.epoch.vote_reward.clone())
-    }
-    fn signature_status_slot(&self, _signature: &Signature) -> Option<Slot> {
-        None
     }
     fn validator_info_changed(&self) -> Vec<(Pubkey, ValidatorInfo)> {
         self.info_changes.clone()
@@ -649,6 +650,16 @@ impl Mirror {
             && state.shared.history.is_some()
     }
 
+    /// Drops partial sets after a resubscribe, since a new queue numbers generations afresh.
+    pub fn reset_sets(&self) {
+        let mut state = self.state.write().unwrap();
+        state.pending_peers = None;
+        state.pending_info = None;
+        state.pending_history = None;
+        state.pending_admitted.clear();
+        state.pending_outcomes.clear();
+    }
+
     /// Drops the banks frozen while the collector waited to start, which it never watched.
     pub fn drop_backlog(&self) {
         self.state.write().unwrap().notified.clear();
@@ -720,6 +731,7 @@ impl Mirror {
             shared: state.shared.clone(),
             parent,
             finalization: None,
+            expects_finalization: false,
             info_changes: Vec::new(),
         });
         state.frozen.insert(event.slot, bank.clone());
@@ -882,6 +894,10 @@ impl Mirror {
             }
         }
         history.next_slot = parts.first().map_or(0, |part| part.next_slot);
+        // Roots that arrived after the validator read the history, in order.
+        for slot in state.rooted.range(history.next_slot..) {
+            history.add(*slot);
+        }
         state.shared.history = Some(Arc::new(history));
     }
 
@@ -1241,6 +1257,7 @@ impl Source for Mirror {
             .map(|(bank, _)| {
                 Arc::new(FrozenBank {
                     finalization: state.finalization.get(&bank.event.slot).cloned(),
+                    expects_finalization: waiting,
                     info_changes: std::mem::take(&mut changes),
                     ..FrozenBank::clone(&bank)
                 }) as Arc<dyn BankView>
@@ -1561,6 +1578,99 @@ mod tests {
         let held = mirror.root_bank().get_slot_history().unwrap();
         history.add(4_002);
         assert_eq!(held, history);
+    }
+
+    fn frozen(slot: Slot) -> BankFrozenEvent {
+        BankFrozenEvent {
+            pid: 0,
+            tid: 0,
+            timestamp_ns: 0,
+            slot,
+            bank_id: 0,
+            parent_slot: slot.saturating_sub(1),
+            leader: [0u8; 32],
+            blockhash: [0u8; 32],
+            transaction_count: 0,
+            non_vote_transaction_count: 0,
+            failed_transaction_count: 0,
+            transaction_entry_count: 0,
+            block_cost: 0,
+            block_cost_limit: 0,
+            account_cost_limit: 0,
+            total_fee: 0,
+            priority_fee: 0,
+            block_height: 0,
+            transaction_count_total: 0,
+            non_vote_transaction_count_total: 0,
+        }
+    }
+
+    fn reading(slot: Slot) -> FinalizationEvent {
+        FinalizationEvent {
+            pid: 0,
+            tid: 0,
+            timestamp_ns: 0,
+            slot,
+            front: 0,
+            ranks: 0,
+            seen: [0u8; crate::events::FINALIZATION_RANKS / 8],
+            carried: [0u8; crate::events::FINALIZATION_RANKS / 8],
+        }
+    }
+
+    #[test]
+    fn test_a_frozen_bank_waits_for_its_reading_and_counts_nothing_without_it() {
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
+        mirror.apply_votes(std::iter::empty());
+        // Before any reading has arrived, banks go straight through.
+        mirror.apply_frozen(&frozen(1));
+        assert_eq!(mirror.take_frozen().unwrap().len(), 1);
+
+        mirror.apply_finalization(&reading(2));
+        mirror.apply_frozen(&frozen(2));
+        mirror.apply_frozen(&frozen(3));
+        let taken = mirror.take_frozen().unwrap();
+        assert_eq!(
+            taken.iter().map(|bank| bank.slot()).collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        std::thread::sleep(FINALIZATION_WAIT);
+        let taken = mirror.take_frozen().unwrap();
+        assert_eq!(
+            taken.iter().map(|bank| bank.slot()).collect::<Vec<_>>(),
+            vec![3]
+        );
+        let mut rows = 0;
+        taken[0].for_each_vote_row(&mut |_| rows += 1);
+        assert_eq!(rows, 0, "a bank without its reading counts nobody");
+    }
+
+    #[test]
+    fn test_roots_before_the_history_arrives_are_kept() {
+        use crate::event_output::history_events;
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
+        let mut history = SlotHistory::default();
+        history.add(10);
+        mirror.apply_rooted(12);
+        for event in history_events(&history, 1) {
+            mirror.apply_history(&event);
+        }
+        history.add(12);
+        assert_eq!(mirror.root_bank().get_slot_history().unwrap(), history);
+    }
+
+    #[test]
+    fn test_a_set_restarted_under_the_same_generation_completes_from_its_new_parts() {
+        let mut pending = None;
+        assert!(PendingSet::add(&mut pending, 1, 0, 3, 'a').is_none());
+        // A resubscribe drops the partial set; the new queue starts at generation 1 again.
+        pending = None;
+        assert!(PendingSet::add(&mut pending, 1, 1, 2, 'x').is_none());
+        assert_eq!(
+            PendingSet::add(&mut pending, 1, 0, 2, 'y'),
+            Some(vec!['y', 'x'])
+        );
     }
 
     #[test]

@@ -608,12 +608,17 @@ impl EventInput {
         self.clock.connect(dir, &explorer);
         self.ledger.connect(dir, &explorer);
         self.blocks.connect(dir, &explorer);
-        self.admitted.connect(dir, &explorer);
-        self.history.connect(dir, &explorer);
-        self.outcomes.connect(dir, &explorer);
         self.versions.connect(dir, &explorer);
-        self.peers.connect(dir, &explorer);
-        self.info.connect(dir, &explorer);
+        let resubscribed = [
+            self.admitted.connect(dir, &explorer),
+            self.history.connect(dir, &explorer),
+            self.outcomes.connect(dir, &explorer),
+            self.peers.connect(dir, &explorer),
+            self.info.connect(dir, &explorer),
+        ];
+        if resubscribed.contains(&true) {
+            self.mirror.reset_sets();
+        }
         self.finalization.connect(dir, &explorer);
         self.metric_slot.connect(dir, &explorer);
         self.metric_leader.connect(dir, &explorer);
