@@ -72,6 +72,7 @@ pub struct DashboardService {
     /// What the collector reads, kept for the event streams.
     source: Option<Arc<dyn Source>>,
     events: Option<JoinHandle<()>>,
+    metric_events: Option<JoinHandle<()>>,
 }
 
 impl DashboardService {
@@ -294,6 +295,7 @@ impl DashboardService {
             refill,
             source: None,
             events: None,
+            metric_events: None,
         })
     }
 
@@ -410,12 +412,24 @@ impl DashboardService {
             .ok_or_else(|| io::Error::other("the collector is not attached"))?;
         let output = crate::event_output::EventOutput::new(event_system)?;
         self.events = Some(output.spawn(src, self.startup_progress.clone(), self.exit.clone())?);
+        // Bounded so a stalled publisher costs points, not the validator's memory.
+        let (sender, receiver) = crossbeam_channel::bounded(16_384);
+        self.metrics_tap.forward_to(sender);
+        let metrics = crate::event_output::MetricOutput::new(event_system)?;
+        self.metric_events =
+            Some(metrics.spawn(self.metrics_tap.clone(), receiver, self.exit.clone())?);
         Ok(())
+    }
+
+    /// The tap the meters and collector read, for points observed in another process.
+    pub fn metrics_tap(&self) -> Arc<MetricsTap> {
+        self.metrics_tap.clone()
     }
 
     pub fn join(mut self) -> thread::Result<()> {
         for handle in [
             self.events.take(),
+            self.metric_events.take(),
             self.collector.take(),
             self.meters.take(),
             self.boot.take(),

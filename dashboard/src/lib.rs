@@ -16,6 +16,7 @@ pub mod geoip;
 pub mod history;
 pub mod host_stats;
 pub mod meters;
+pub mod metric_events;
 pub mod metrics_tap;
 pub mod mirror;
 pub mod net_ifaces;

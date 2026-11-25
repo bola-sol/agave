@@ -137,7 +137,7 @@ fn main() -> ExitCode {
     );
 
     let mirror = Arc::new(Mirror::new(start_progress));
-    let mut input = EventInput::new(args.events_dir, mirror.clone());
+    let mut input = EventInput::new(args.events_dir, mirror.clone(), service.metrics_tap());
     let mut attached = false;
     let mut last_report = Instant::now();
     while !exit.load(Ordering::Relaxed) {

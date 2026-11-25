@@ -13,6 +13,8 @@ pub const START_PROGRESS_STREAM: StreamName =
 pub const SLOT_STATUS_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_status");
 pub const EPOCH_STREAM: StreamName = agave_event_system::stream_name!("bank.epoch");
 pub const SLOT_CLOCK_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_clock");
+pub const LEDGER_SLOT_STREAM: StreamName = agave_event_system::stream_name!("ledger.first_shred");
+pub const BLOCK_STREAM: StreamName = agave_event_system::stream_name!("ledger.reward_cert");
 
 /// Path bytes a node info event holds; a longer path is left empty.
 pub const PATH_BYTES: usize = 192;
@@ -153,6 +155,51 @@ pub struct SlotClockEvent {
     pub priority_fees: u64,
     pub identity_balance: u64,
     pub vote_balance: u64,
+}
+
+/// A slot's blockstore record: when its first shred arrived, its parent, and whether it is full.
+/// Sent when the first shred is seen and again when the slot fills.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerSlotEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub slot: Slot,
+    pub has_parent: bool,
+    pub parent_slot: Slot,
+    /// Unix milliseconds; 0 where none has arrived.
+    pub first_shred_ms: u64,
+    pub full: bool,
+}
+
+pub const BLOCK_MISSING: u8 = 1;
+pub const BLOCK_OPAQUE: u8 = 2;
+pub const BLOCK_FOOTER: u8 = 3;
+
+/// Bytes an encoded reward certificate bitmap holds; a longer one reads as opaque.
+pub const BITMAP_BYTES: usize = 512;
+
+/// A rooted slot as the certificate walks read it: skipped, unreadable, or its footer's figures.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub slot: Slot,
+    /// `BLOCK_MISSING`, `BLOCK_OPAQUE` or `BLOCK_FOOTER`.
+    pub kind: u8,
+    /// The leader's close time, unix nanoseconds.
+    pub close_nanos: u64,
+    pub has_notar: bool,
+    pub notar_len: u16,
+    pub notar: [u8; BITMAP_BYTES],
+    pub has_skip: bool,
+    pub skip_len: u16,
+    pub skip: [u8; BITMAP_BYTES],
+    pub has_fast: bool,
+    pub fast: bool,
 }
 
 pub fn pack_str<const N: usize>(value: &str) -> [u8; N] {

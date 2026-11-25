@@ -3,15 +3,15 @@
 
 use {
     crate::{
-        certs::Block,
+        certs::{Block, FooterFacts},
         collect::{EpochInfo, TxOutcome},
         context::StartProgress,
         events::{
             ACCOUNT_PATHS, ADDR_ALPENGLOW, ADDR_BYTES, ADDR_GOSSIP, ADDR_RPC,
             ADDR_SERVE_REPAIR_UDP, ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC,
-            ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, EpochEvent, NodeInfoEvent, PATH_BYTES, ROLE_ROOT,
-            SlotClockEvent, SlotStatusEvent, StartProgressEvent, unpack_addr, unpack_path,
-            unpack_str,
+            ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, BITMAP_BYTES, BLOCK_FOOTER, BLOCK_MISSING, BlockEvent,
+            EpochEvent, LedgerSlotEvent, NodeInfoEvent, PATH_BYTES, ROLE_ROOT, SlotClockEvent,
+            SlotStatusEvent, StartProgressEvent, unpack_addr, unpack_path, unpack_str,
         },
         snapshot,
         source::{
@@ -26,7 +26,10 @@ use {
         snapshot_config::{SnapshotConfig, SnapshotUsage},
     },
     solana_clock::{Clock, Epoch, Slot},
-    solana_core::{bank_state_events::VoteAccountEvent, validator::ValidatorStartProgress},
+    solana_core::{
+        bank_state_events::VoteAccountEvent, replay_stage::events::BankFrozenEvent,
+        validator::ValidatorStartProgress,
+    },
     solana_epoch_schedule::EpochSchedule,
     solana_hash::Hash,
     solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
@@ -34,7 +37,7 @@ use {
     solana_signature::Signature,
     solana_slot_history::SlotHistory,
     std::{
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, BTreeSet, HashMap},
         net::SocketAddr,
         num::NonZeroU64,
         path::PathBuf,
@@ -45,6 +48,12 @@ use {
 
 /// Epoch schedules kept: the previous, this and the next.
 const EPOCHS_KEPT: usize = 3;
+/// Slots of blockstore records and roots kept below the newest.
+const LEDGER_KEPT: u64 = 8192;
+/// Blocks kept for the certificate walks.
+const BLOCKS_KEPT: usize = 4096;
+/// Frozen banks held for a collector that has not taken them yet.
+const NOTIFIED_KEPT: usize = 1024;
 
 /// The node as `node.info` describes it.
 #[derive(Debug, Clone)]
@@ -286,6 +295,136 @@ impl BankView for MirrorBank {
     }
 }
 
+/// A frozen bank rebuilt from `replay.bank_frozen`.
+#[derive(Clone)]
+pub struct FrozenBank {
+    event: BankFrozenEvent,
+    epoch: Arc<EpochFacts>,
+    votes: Arc<HashMap<Pubkey, VoteRow>>,
+    /// The parent as it froze, without its own parent.
+    parent: Option<Arc<FrozenBank>>,
+}
+
+impl BankView for FrozenBank {
+    fn slot(&self) -> Slot {
+        self.event.slot
+    }
+    fn epoch(&self) -> Epoch {
+        self.epoch.schedule.get_epoch(self.event.slot)
+    }
+    fn epoch_schedule(&self) -> &EpochSchedule {
+        &self.epoch.schedule
+    }
+    fn is_alpenglow(&self) -> bool {
+        self.epoch.alpenglow
+    }
+    fn parent_slot(&self) -> Slot {
+        self.event.parent_slot
+    }
+    fn parent(&self) -> Option<Arc<dyn BankView>> {
+        self.parent
+            .clone()
+            .map(|parent| parent as Arc<dyn BankView>)
+    }
+    fn is_frozen(&self) -> bool {
+        true
+    }
+    fn block_height(&self) -> u64 {
+        self.event.block_height
+    }
+    fn clock(&self) -> Clock {
+        Clock {
+            slot: self.event.slot,
+            ..Clock::default()
+        }
+    }
+    fn ns_per_slot_at_slot(&self, _slot: Slot) -> u128 {
+        u128::from(self.epoch.ns_per_slot)
+    }
+    fn last_blockhash(&self) -> Hash {
+        Hash::new_from_array(self.event.blockhash)
+    }
+    fn get_lamports_per_signature(&self) -> u64 {
+        self.epoch.lamports_per_signature
+    }
+    // The bank's count is the fork's running total; the event's own count is the block's.
+    #[allow(clippy::misnamed_getters)]
+    fn transaction_count(&self) -> u64 {
+        self.event.transaction_count_total
+    }
+    fn non_vote_transaction_count_since_restart(&self) -> u64 {
+        self.event.non_vote_transaction_count_total
+    }
+    fn transaction_error_count(&self) -> u64 {
+        self.event.failed_transaction_count
+    }
+    fn transaction_entries_count(&self) -> u64 {
+        self.event.transaction_entry_count
+    }
+    fn get_balance(&self, _key: &Pubkey) -> u64 {
+        0
+    }
+    fn cost(&self) -> CostFacts {
+        CostFacts {
+            block_cost: self.event.block_cost,
+            block_limit: self.event.block_cost_limit,
+            account_limit: self.event.account_cost_limit,
+        }
+    }
+    fn fees(&self) -> FeeTotals {
+        FeeTotals {
+            total: self.event.total_fee,
+            priority: self.event.priority_fee,
+        }
+    }
+    fn vote_row(&self, vote: &Pubkey) -> Option<VoteRow> {
+        self.votes.get(vote).cloned()
+    }
+    fn for_each_vote_row(&self, each: &mut dyn FnMut(&VoteRow)) {
+        for row in self.votes.values() {
+            each(row);
+        }
+    }
+    fn rank_map(&self, _slot: Slot) -> Option<Arc<dyn Ranks>> {
+        None
+    }
+    fn epoch_stakes(&self, _epoch: Epoch) -> Option<EpochStakeView> {
+        None
+    }
+    fn epoch_stakes_from_slot(&self, _slot: Slot) -> Option<EpochStakeView> {
+        None
+    }
+    fn vat_ticket_short(&self, _vote: &Pubkey) -> Option<u64> {
+        None
+    }
+    fn minimum_vote_account_balance_for_vat(&self) -> u64 {
+        self.epoch.minimum_vat_balance
+    }
+    fn get_minimum_balance_for_rent_exemption(&self, _len: usize) -> u64 {
+        self.epoch.vote_account_rent
+    }
+    fn get_slot_history(&self) -> Option<SlotHistory> {
+        None
+    }
+    fn account_data(&self, _key: &Pubkey) -> Option<Vec<u8>> {
+        None
+    }
+    fn signature_status_slot(&self, _signature: &Signature) -> Option<Slot> {
+        None
+    }
+    fn validator_info_changed(&self) -> Vec<(Pubkey, ValidatorInfo)> {
+        Vec::new()
+    }
+}
+
+/// A slot's blockstore record.
+#[derive(Debug, Clone, Copy, Default)]
+struct LedgerSlot {
+    first_shred_ms: u64,
+    parent: Option<Slot>,
+    full: bool,
+}
+
 #[derive(Default)]
 struct State {
     node: Option<Node>,
@@ -296,6 +435,13 @@ struct State {
     votes: Arc<HashMap<Pubkey, VoteRow>>,
     /// Each epoch's turn leaders.
     schedules: BTreeMap<Epoch, Arc<Vec<Pubkey>>>,
+    /// Frozen banks above the root.
+    frozen: BTreeMap<Slot, Arc<FrozenBank>>,
+    /// Frozen banks the collector has not taken yet.
+    notified: Vec<Arc<dyn BankView>>,
+    ledger: BTreeMap<Slot, LedgerSlot>,
+    rooted: BTreeSet<Slot>,
+    blocks: BTreeMap<Slot, BlockEvent>,
 }
 
 pub struct Mirror {
@@ -322,6 +468,10 @@ impl Mirror {
     }
 
     pub fn apply_node(&self, event: &NodeInfoEvent) {
+        // The validator's memory and threads, not this process's.
+        if let Ok(pid) = u32::try_from(event.pid) {
+            crate::host_stats::read_process(pid);
+        }
         self.state.write().unwrap().node = Some(Node::from(event));
     }
 
@@ -353,7 +503,63 @@ impl Mirror {
     }
 
     pub fn apply_status(&self, event: &SlotStatusEvent) {
-        self.state.write().unwrap().status = Some(event.clone());
+        let mut state = self.state.write().unwrap();
+        // Bank forks keeps the root and drops the banks below it.
+        state.frozen = state.frozen.split_off(&event.root);
+        let floor = event.root.saturating_sub(LEDGER_KEPT);
+        state.rooted = state.rooted.split_off(&floor);
+        let highest = event.highest_slot.max(event.cluster_tip);
+        state.ledger = state.ledger.split_off(&highest.saturating_sub(LEDGER_KEPT));
+        state.status = Some(event.clone());
+    }
+
+    pub fn apply_frozen(&self, event: &BankFrozenEvent) {
+        let mut state = self.state.write().unwrap();
+        let epoch = state
+            .epoch
+            .clone()
+            .unwrap_or_else(|| Arc::new(EpochFacts::from(&empty_epoch())));
+        let parent = state.frozen.get(&event.parent_slot).map(|parent| {
+            Arc::new(FrozenBank {
+                parent: None,
+                ..FrozenBank::clone(parent)
+            })
+        });
+        let bank = Arc::new(FrozenBank {
+            event: event.clone(),
+            epoch,
+            votes: state.votes.clone(),
+            parent,
+        });
+        state.frozen.insert(event.slot, bank.clone());
+        state.notified.push(bank);
+        if state.notified.len() > NOTIFIED_KEPT {
+            let excess = state.notified.len().saturating_sub(NOTIFIED_KEPT);
+            state.notified.drain(..excess);
+        }
+    }
+
+    pub fn apply_rooted(&self, slot: Slot) {
+        self.state.write().unwrap().rooted.insert(slot);
+    }
+
+    pub fn apply_ledger(&self, event: &LedgerSlotEvent) {
+        self.state.write().unwrap().ledger.insert(
+            event.slot,
+            LedgerSlot {
+                first_shred_ms: event.first_shred_ms,
+                parent: event.has_parent.then_some(event.parent_slot),
+                full: event.full,
+            },
+        );
+    }
+
+    pub fn apply_block(&self, event: &BlockEvent) {
+        let mut state = self.state.write().unwrap();
+        state.blocks.insert(event.slot, event.clone());
+        while state.blocks.len() > BLOCKS_KEPT {
+            state.blocks.pop_first();
+        }
     }
 
     pub fn apply_epoch(&self, event: &EpochEvent) {
@@ -576,7 +782,11 @@ impl Source for Mirror {
                 .status
                 .as_ref()
                 .map_or(0, |status| status.highest_slot),
-            frozen: Vec::new(),
+            frozen: state
+                .frozen
+                .iter()
+                .map(|(slot, bank)| (*slot, bank.clone() as Arc<dyn BankView>))
+                .collect(),
         }
     }
     fn root_bank(&self) -> Arc<dyn BankView> {
@@ -595,7 +805,7 @@ impl Source for Mirror {
             .map_or(0, |status| status.highest_slot)
     }
     fn take_frozen(&self) -> Option<Vec<Arc<dyn BankView>>> {
-        Some(Vec::new())
+        Some(std::mem::take(&mut self.state.write().unwrap().notified))
     }
     fn commitment(&self) -> Commitment {
         let state = self.state.read().unwrap();
@@ -608,17 +818,24 @@ impl Source for Mirror {
                 finalized: status.finalized,
             })
     }
-    fn first_shred_time(&self, _slot: Slot) -> Option<u64> {
-        None
+    fn first_shred_time(&self, slot: Slot) -> Option<u64> {
+        let state = self.state.read().unwrap();
+        state
+            .ledger
+            .get(&slot)
+            .map(|ledger| ledger.first_shred_ms)
+            .filter(|ms| *ms > 0)
     }
-    fn parent_of(&self, _slot: Slot) -> Option<Slot> {
-        None
+    fn parent_of(&self, slot: Slot) -> Option<Slot> {
+        let state = self.state.read().unwrap();
+        state.ledger.get(&slot).and_then(|ledger| ledger.parent)
     }
-    fn is_root(&self, _slot: Slot) -> bool {
-        false
+    fn is_root(&self, slot: Slot) -> bool {
+        self.state.read().unwrap().rooted.contains(&slot)
     }
-    fn is_full(&self, _slot: Slot) -> bool {
-        false
+    fn is_full(&self, slot: Slot) -> bool {
+        let state = self.state.read().unwrap();
+        state.ledger.get(&slot).is_some_and(|ledger| ledger.full)
     }
     fn lowest_slot(&self) -> Slot {
         let state = self.state.read().unwrap();
@@ -645,9 +862,24 @@ impl Source for Mirror {
     }
     fn block(&self, slot: Slot, root: Slot) -> Block {
         if slot > root {
-            Block::Pending
-        } else {
-            Block::Opaque
+            return Block::Pending;
+        }
+        let state = self.state.read().unwrap();
+        let Some(event) = state.blocks.get(&slot) else {
+            return Block::Opaque;
+        };
+        let bitmap = |has: bool, len: u16, bytes: &[u8; BITMAP_BYTES]| {
+            has.then(|| bytes.get(..usize::from(len)).unwrap_or_default().to_vec())
+        };
+        match event.kind {
+            BLOCK_MISSING => Block::Missing,
+            BLOCK_FOOTER => Block::Footer(Box::new(FooterFacts {
+                close_nanos: event.close_nanos,
+                notar_bitmap: bitmap(event.has_notar, event.notar_len, &event.notar),
+                skip_bitmap: bitmap(event.has_skip, event.skip_len, &event.skip),
+                fast: event.has_fast.then_some(event.fast),
+            })),
+            _ => Block::Opaque,
         }
     }
     fn slot_leader(&self, slot: Slot, bank: &dyn BankView) -> Option<Pubkey> {
@@ -668,7 +900,10 @@ impl Source for Mirror {
         let end = from.saturating_add(range);
         let mut first = None;
         while slot <= end {
-            let leader = Self::leader_of(&state, schedule, slot)?;
+            // Past the schedules held, a run already found ends where they end.
+            let Some(leader) = Self::leader_of(&state, schedule, slot) else {
+                return first.map(|start| (start, slot.saturating_sub(1)));
+            };
             match (first, leader == *me) {
                 (None, true) => first = Some(slot),
                 (Some(start), false) => return Some((start, slot.saturating_sub(1))),
@@ -838,5 +1073,28 @@ mod tests {
             mirror.leader_slot_indexes(0, &me, 32),
             Some((4..12).chain(24..28).collect())
         );
+        mirror.apply_epoch(&EpochEvent {
+            slots_per_epoch: 32,
+            leader_schedule_slot_offset: 32,
+            warmup: false,
+            first_normal_epoch: 0,
+            first_normal_slot: 0,
+            ..empty_epoch()
+        });
+        let bank = mirror.working_bank();
+        assert_eq!(
+            mirror.next_leader_slot(&me, 0, bank.as_ref(), 100),
+            Some((4, 11))
+        );
+        assert_eq!(
+            mirror.next_leader_slot(&me, 12, bank.as_ref(), 100),
+            Some((24, 27))
+        );
+        assert_eq!(
+            mirror.next_leader_slot(&me, 25, bank.as_ref(), 100),
+            Some((26, 27))
+        );
+        // Epoch 1's schedule has not arrived.
+        assert_eq!(mirror.next_leader_slot(&me, 27, bank.as_ref(), 100), None);
     }
 }

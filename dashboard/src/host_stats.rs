@@ -248,9 +248,26 @@ pub struct ResidentKinds {
     pub shared: u64,
 }
 
+/// The process whose `/proc` entries are read; 0 is this one.
+static PROCESS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Reads another process's memory and threads, as a dashboard in its own process reads the
+/// validator's.
+pub fn read_process(pid: u32) {
+    PROCESS.store(pid, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `/proc/self`, or the process `read_process` named.
+pub fn proc_dir() -> String {
+    match PROCESS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => "/proc/self".to_string(),
+        pid => format!("/proc/{pid}"),
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn process_memory() -> io::Result<ProcessMemory> {
-    let status = std::fs::read_to_string("/proc/self/status")?;
+    let status = std::fs::read_to_string(format!("{}/status", proc_dir()))?;
     parse_process_memory(&status).ok_or_else(|| invalid("status has no VmRSS line"))
 }
 
