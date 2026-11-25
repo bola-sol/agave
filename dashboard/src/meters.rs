@@ -1568,6 +1568,8 @@ impl ThreadMeter {
         };
         let current = match thread_stats::read(known) {
             Ok(threads) => threads,
+            // Another process's entries go with it when it restarts, until the new pid arrives.
+            Err(_) if !crate::host_stats::reading_self() => return,
             Err(err) => {
                 self.unavailable = true;
                 log::info!("dashboard: thread counters unavailable, panel disabled: {err}");

@@ -287,7 +287,7 @@ pub struct MetricsTap {
     stake_in_gossip: Mutex<Option<StakeInGossip>>,
 
     /// Test branch only: where points go for the metric event streams.
-    forward: Mutex<Option<crossbeam_channel::Sender<(DataPoint, u64)>>>,
+    forward: std::sync::OnceLock<crossbeam_channel::Sender<(DataPoint, u64)>>,
     forwarding: AtomicBool,
     forward_drops: AtomicU64,
 }
@@ -1025,8 +1025,9 @@ impl MetricsTap {
     }
 
     /// Hands every point a metric stream carries to `sender` while forwarding is on.
+    /// Set once; a second call is ignored.
     pub fn forward_to(&self, sender: crossbeam_channel::Sender<(DataPoint, u64)>) {
-        *locked(&self.forward) = Some(sender);
+        let _ = self.forward.set(sender);
     }
 
     pub fn set_forwarding(&self, on: bool) {
@@ -1042,8 +1043,9 @@ impl MetricsTap {
         if !self.forwarding.load(Ordering::Relaxed) || !crate::metric_events::carried(point.name) {
             return;
         }
-        let sent = locked(&self.forward)
-            .as_ref()
+        let sent = self
+            .forward
+            .get()
             .is_some_and(|sender| sender.try_send((point.clone(), timestamp())).is_ok());
         if !sent {
             self.forward_drops.fetch_add(1, Ordering::Relaxed);

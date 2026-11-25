@@ -2387,15 +2387,6 @@ fn compute_vote_cost(bank: &dyn BankView, pending: u64) -> VoteCost {
     }
 }
 
-/// Reads only the newest entry, which is the bank's own epoch once the account has voted in it.
-#[cfg(test)]
-fn count_epoch_credits(view: &solana_vote::vote_state_view::VoteStateView, epoch: Epoch) -> u64 {
-    view.epoch_credits_iter()
-        .last()
-        .filter(|item| item.epoch() == epoch)
-        .map_or(0, |item| item.credits().saturating_sub(item.prev_credits()))
-}
-
 /// Most settled first: the thresholds cross while the commitment cache lags the root at startup.
 /// The country of a validator's gossip address, for one not on the peer table.
 fn country_of(src: &dyn Source, key: &Pubkey) -> Option<&'static str> {
@@ -3068,8 +3059,12 @@ mod tests {
             ..Default::default()
         };
         let view = solana_vote::vote_state_view::VoteStateView::from(state);
-        assert_eq!(count_epoch_credits(&view, 7), 150);
-        assert_eq!(count_epoch_credits(&view, 8), 0, "not voted in yet");
+        let row = crate::source::VoteRow {
+            last_epoch_credits: crate::source::newest_credits(&view),
+            ..crate::source::VoteRow::default()
+        };
+        assert_eq!(row.credits_in(7), 150);
+        assert_eq!(row.credits_in(8), 0, "not voted in yet");
     }
 
     #[test]

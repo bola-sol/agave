@@ -166,7 +166,7 @@ pub struct AdmittedEvent {
 /// Words of the slot history per event.
 pub const HISTORY_WORDS: usize = 256;
 
-/// One part of the root bank's slot history bitmap, sent whole at turn-on and every few minutes.
+/// One part of the root bank's slot history bitmap, sent whole at turn-on and every 30 seconds.
 #[event]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotHistoryEvent {

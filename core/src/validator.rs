@@ -2015,12 +2015,12 @@ impl Validator {
         Ok(flag)
     }
 
-    /// Monitor registered signal handlers and the validator's exit flag
     /// The event system the validator's streams are published on.
     pub fn event_system(&self) -> &EventSystem {
         &self.event_system
     }
 
+    /// Monitor registered signal handlers and the validator's exit flag
     pub fn listen_for_signals(&self) -> Result<()> {
         info!("Validator::listen_for_signals() has started");
         loop {
