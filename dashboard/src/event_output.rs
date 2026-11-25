@@ -163,9 +163,9 @@ const LATCHED_EVERY: Duration = Duration::from_secs(60);
 /// Set events sent before a pause, so a set larger than its stream arrives whole.
 const PACE_BATCH: usize = 512;
 const PACE_PAUSE: Duration = Duration::from_millis(50);
-/// Slots under the root within which an unreadable block is read again next tick, as a leader's
-/// own block can be rooted before its last shreds are stored.
-const SETTLE_SLOTS: u64 = 32;
+/// How long an unreadable block of ours is read again each tick, as a leader's own block can be
+/// rooted before its last shreds are stored.
+const SETTLE_FOR: Duration = Duration::from_secs(5);
 /// Blocks read per tick behind the root.
 const BLOCKS_PER_TICK: u64 = 64;
 
@@ -199,8 +199,9 @@ pub struct EventOutput {
     blocks: Publisher<BlockEvent>,
     /// The next rooted slot whose block goes out.
     next_block: Option<solana_clock::Slot>,
+    blocks_settle: Settle,
     own_blocks: Publisher<OwnBlockEvent>,
-    /// Our blocks this epoch read so far; `None` while the stream is off.
+    /// Our blocks this epoch read so far; `None` while the stream is off or the schedule unknown.
     own: Option<OwnBlocks>,
     own_generation: u64,
     node: Resent<NodeInfoEvent>,
@@ -241,6 +242,7 @@ impl EventOutput {
             ledger_sent: std::collections::BTreeMap::new(),
             blocks: stream(event_system, BLOCK_STREAM, 512)?,
             next_block: None,
+            blocks_settle: Settle::default(),
             own_blocks: stream(event_system, OWN_BLOCK_STREAM, 1024)?,
             own: None,
             own_generation: 0,
@@ -274,7 +276,7 @@ impl EventOutput {
         // One root for the blocks and the root clock, so no root goes out ahead of its block.
         let root_bank = src.root_bank();
         self.send_ledger(src);
-        self.send_blocks(src, root_bank.as_ref());
+        self.send_blocks(src, root_bank.as_ref(), now);
         self.send_own_blocks(src, root_bank.as_ref(), now);
         self.send_admitted(src, now);
         self.send_history(src, now);
@@ -571,7 +573,7 @@ impl EventOutput {
     }
 
     /// Each rooted slot's block, from the root at turn-on.
-    fn send_blocks(&mut self, src: &dyn Source, root_bank: &dyn BankView) {
+    fn send_blocks(&mut self, src: &dyn Source, root_bank: &dyn BankView, now: Instant) {
         if !self.blocks.is_enabled() {
             self.next_block = None;
             return;
@@ -579,9 +581,13 @@ impl EventOutput {
         let root = src.commitment().root.max(root_bank.slot());
         let mut next = *self.next_block.get_or_insert(root);
         let last = root.min(next.saturating_add(BLOCKS_PER_TICK).saturating_sub(1));
+        let me = src.identity();
         while next <= last {
             let block = src.block(next, root);
-            if !settled(next, root, &block) {
+            if matches!(block, crate::certs::Block::Opaque)
+                && src.slot_leader(next, root_bank) == Some(me)
+                && self.blocks_settle.hold(next, now)
+            {
                 break;
             }
             let _ = self.blocks.publish(&block_event(next, block));
@@ -605,7 +611,7 @@ impl EventOutput {
             return;
         };
         let root = root_bank.slot();
-        if !own.read_to(src, root)
+        if !own.read_to(src, root, now)
             || own
                 .sent
                 .is_some_and(|at| now.duration_since(at) < OWN_EVERY)
@@ -614,7 +620,7 @@ impl EventOutput {
         }
         self.own_generation = self.own_generation.saturating_add(1);
         own.sent = Some(now);
-        // Two batches at 724 slots; past about 2,000 the pauses would fill a tick.
+        // Past about 2,000 of our slots the pauses would fill a tick.
         publish_paced(
             &mut self.own_blocks,
             &own_block_events(key, self.own_generation, root, &own.events),
@@ -629,6 +635,7 @@ pub(crate) struct OwnBlocks {
     next: usize,
     events: Vec<BlockEvent>,
     sent: Option<Instant>,
+    settle: Settle,
 }
 
 impl OwnBlocks {
@@ -644,6 +651,7 @@ impl OwnBlocks {
             next: 0,
             events: Vec::new(),
             sent: None,
+            settle: Settle::default(),
         })
     }
 
@@ -653,14 +661,20 @@ impl OwnBlocks {
     }
 
     /// Reads up to `BLOCKS_PER_TICK` more of our slots up to `root`; whether all are read.
-    pub(crate) fn read_to(&mut self, src: &dyn Source, root: solana_clock::Slot) -> bool {
+    pub(crate) fn read_to(
+        &mut self,
+        src: &dyn Source,
+        root: solana_clock::Slot,
+        now: Instant,
+    ) -> bool {
         let mut read = 0u64;
+        let lowest = src.lowest_slot();
         while let Some(slot) = self.leader_slots.get(self.next).copied() {
             if slot > root || read == BLOCKS_PER_TICK {
                 break;
             }
-            let block = src.block(slot, root);
-            if !settled(slot, root, &block) {
+            let block = held_block(slot, lowest, src.block(slot, root));
+            if matches!(block, crate::certs::Block::Opaque) && self.settle.hold(slot, now) {
                 break;
             }
             self.events.push(block_event(slot, block));
@@ -673,16 +687,34 @@ impl OwnBlocks {
     }
 }
 
-/// Whether a block read up to `root` is final.
-fn settled(
+/// A slot under the ledger's first slot reads as skipped once cleaned; it is unreadable instead.
+pub(crate) fn held_block(
     slot: solana_clock::Slot,
-    root: solana_clock::Slot,
-    block: &crate::certs::Block,
-) -> bool {
-    !matches!(
-        block,
-        crate::certs::Block::Opaque | crate::certs::Block::Pending
-    ) || slot.saturating_add(SETTLE_SLOTS) <= root
+    lowest: solana_clock::Slot,
+    block: crate::certs::Block,
+) -> crate::certs::Block {
+    match block {
+        crate::certs::Block::Missing if slot < lowest => crate::certs::Block::Opaque,
+        block => block,
+    }
+}
+
+/// The first time a block read unreadable, so it is read again for `SETTLE_FOR`.
+#[derive(Debug, Default)]
+pub(crate) struct Settle(Option<(solana_clock::Slot, Instant)>);
+
+impl Settle {
+    /// Whether `slot`, unreadable at `now`, is held back for another read.
+    pub(crate) fn hold(&mut self, slot: solana_clock::Slot, now: Instant) -> bool {
+        let since = match self.0 {
+            Some((held, since)) if held == slot => since,
+            _ => {
+                self.0 = Some((slot, now));
+                now
+            }
+        };
+        now.duration_since(since) < SETTLE_FOR
+    }
 }
 
 /// Our blocks as one set; with none, one event with `count` 0.

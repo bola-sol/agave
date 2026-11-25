@@ -72,13 +72,13 @@ const FINALIZATION_WAIT: std::time::Duration = if cfg!(test) {
 };
 /// How long slots above the newest block sent at its root read as pending after it arrived.
 const BLOCKS_STALE: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_millis(50)
+    std::time::Duration::from_millis(500)
 } else {
     std::time::Duration::from_secs(20)
 };
 /// How long our blocks read as pending while their set is awaited.
 const OWN_SET_WAIT: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_millis(50)
+    std::time::Duration::from_millis(500)
 } else {
     std::time::Duration::from_secs(60)
 };
@@ -2289,6 +2289,28 @@ mod tests {
     }
 
     #[test]
+    fn test_an_unreadable_block_is_held_for_a_while_then_let_go() {
+        use crate::event_output::Settle;
+        let mut settle = Settle::default();
+        let start = std::time::Instant::now();
+        let at = |millis| start + std::time::Duration::from_millis(millis);
+        assert!(settle.hold(7, at(0)));
+        assert!(settle.hold(7, at(4_999)));
+        assert!(!settle.hold(7, at(5_000)));
+        // Another slot starts its own wait.
+        assert!(settle.hold(8, at(5_000)));
+        assert!(settle.hold(8, at(9_999)));
+    }
+
+    #[test]
+    fn test_a_cleaned_slot_is_unreadable_not_skipped() {
+        use crate::event_output::held_block;
+        assert!(matches!(held_block(4, 5, Block::Missing), Block::Opaque));
+        assert!(matches!(held_block(5, 5, Block::Missing), Block::Missing));
+        assert!(matches!(held_block(4, 5, footer(1)), Block::Footer(_)));
+    }
+
+    #[test]
     fn test_a_slot_past_the_newest_block_sent_waits_for_it_a_while() {
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         assert!(matches!(mirror.block(9, 20), Block::Opaque));
@@ -2314,10 +2336,11 @@ mod tests {
             .filter(|slot| *slot <= 20)
             .collect();
         assert!(!ours.is_empty());
-        assert!(own.read_to(&direct, 10));
+        let now = std::time::Instant::now();
+        assert!(own.read_to(&direct, 10, now));
         let first = ours.iter().filter(|slot| **slot <= 10).count();
         assert_eq!(own.read_slots(), &ours[..first]);
-        assert!(own.read_to(&direct, bank.slot()));
+        assert!(own.read_to(&direct, bank.slot(), now));
         assert_eq!(own.read_slots(), ours);
     }
 }
