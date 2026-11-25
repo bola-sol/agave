@@ -406,9 +406,9 @@ impl EventOutput {
     /// Every validator info entry, at turn-on and every ten minutes. The scan can take minutes on
     /// a real cluster, so it runs on a thread of its own and goes out when it finishes.
     fn send_info(&mut self, src: &Arc<dyn Source>, now: Instant) {
+        // A scan in flight is kept, so turning the stream off and on starts no second one.
         if !self.info.is_enabled() {
             self.info_sent = None;
-            self.info_scan = None;
             return;
         }
         if let Some(scan) = &self.info_scan {
