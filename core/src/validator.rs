@@ -3862,6 +3862,32 @@ mod tests {
     }
 
     #[test]
+    fn test_the_wait_events_count_stake_as_the_wait_does() {
+        use solana_runtime::genesis_utils::{
+            ValidatorVoteKeypairs, create_genesis_config_with_vote_accounts,
+        };
+        let ours = ValidatorVoteKeypairs::new_rand();
+        let other = ValidatorVoteKeypairs::new_rand();
+        let cluster_info = ClusterInfo::new(
+            ContactInfo::new_localhost(&ours.node_keypair.pubkey(), timestamp()),
+            Arc::new(ours.node_keypair.insecure_clone()),
+            SocketAddrSpace::Unspecified,
+        );
+        let genesis = create_genesis_config_with_vote_accounts(
+            1_000_000_000,
+            &[&ours, &other],
+            vec![100_000_000, 300_000_000],
+        );
+        let bank = Bank::new_for_tests(&genesis.genesis_config);
+
+        let (nodes, online, total) = crate::start_events::wait_nodes(&bank, &cluster_info);
+        assert_eq!(nodes.len(), 2);
+        assert!(total > online && online > 0);
+        let percent = get_stake_percent_in_gossip(&bank, &cluster_info, false);
+        assert_eq!(percent, (online as f64 / total as f64 * 100.) as u64);
+    }
+
+    #[test]
     fn test_wait_for_supermajority() {
         agave_logger::setup();
         let node_keypair = Arc::new(Keypair::new());

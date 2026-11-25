@@ -37,7 +37,7 @@ pub const START_PROGRESS_STREAM: StreamName =
 pub const SUPERMAJORITY_WAIT_STREAM: StreamName =
     agave_event_system::stream_name!("node.supermajority_wait");
 
-/// Start phases, numbered as `phase_code` numbers them.
+/// How many start phases `phase_code` numbers.
 pub const PHASES: usize = 11;
 /// Bytes of a peer's version text.
 pub const VERSION_BYTES: usize = 32;
@@ -204,13 +204,14 @@ impl StartProgressEvents {
             .map_err(|err| format!("Failed to create start progress stream: {err}"))?;
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
+        // Read here, so a phase the validator moves to before the thread runs is timed from then.
+        let mut clock = PhaseClock::starting(*start_progress.read().unwrap(), phase_since);
         let thread_hdl = Builder::new()
             .name("solEvtStart".to_string())
             .spawn(move || {
                 let mut publisher = factory
                     .try_create_publisher()
                     .expect("fresh start progress stream has one publisher slot");
-                let mut clock = PhaseClock::starting(*start_progress.read().unwrap(), phase_since);
                 let mut was_on = false;
                 let mut sent: Option<Instant> = None;
                 while !exit.load(Ordering::Relaxed) && !stopped.load(Ordering::Relaxed) {
@@ -263,13 +264,12 @@ pub struct SupermajorityWaitEvent {
     pub total_activated_stake: u64,
     pub identity: [u8; 32],
     pub activated_stake: u64,
-    /// In gossip with a fresh contact, or this node.
+    /// In gossip with a fresh contact, or this node; `version` is empty where not.
     pub seen: bool,
-    pub has_version: bool,
     pub version: [u8; VERSION_BYTES],
 }
 
-/// A staked node, with its gossip version where it was seen.
+/// A staked node, with its gossip version where it was seen, which is how it counts as seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaitNode {
     pub identity: Pubkey,
@@ -351,7 +351,6 @@ pub(crate) fn supermajority_wait_events(
                 identity: node.identity.to_bytes(),
                 activated_stake: node.activated_stake,
                 seen: node.version.is_some(),
-                has_version: node.version.is_some(),
                 version,
             }
         })
@@ -469,6 +468,23 @@ mod tests {
     }
 
     #[test]
+    fn test_the_thread_stops_when_dropped_unjoined() {
+        let dir = tempfile::tempdir().unwrap();
+        let event_system = EventSystem::new(dir.path()).unwrap();
+        let progress = Arc::new(RwLock::new(ValidatorStartProgress::LoadingLedger));
+        let events = StartProgressEvents::new(
+            &event_system,
+            progress,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let stop = events.stop.clone();
+        drop(events);
+        assert!(stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn test_phase_codes_follow_declaration_order() {
         assert_eq!(phase_code(&ValidatorStartProgress::Initializing), 0);
         assert_eq!(phase_code(&ValidatorStartProgress::Running), 10);
@@ -503,7 +519,8 @@ mod tests {
             .iter()
             .find(|event| event.activated_stake == 11)
             .unwrap();
-        assert!(!unseen.seen && !unseen.has_version);
+        assert!(!unseen.seen);
+        assert_eq!(unseen.version, [0u8; VERSION_BYTES]);
         let seen = events
             .iter()
             .find(|event| event.activated_stake == 10)
