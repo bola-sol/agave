@@ -8,8 +8,10 @@ use {
     std::time::{Duration, UNIX_EPOCH},
 };
 
-/// Bytes a tag or string field holds; a longer value is cut.
+/// Bytes a tag holds; a longer value is cut.
 pub const TEXT_BYTES: usize = 48;
+/// Bytes a string field holds, enough for a NIC's model name; a longer value is cut.
+pub const STRING_BYTES: usize = 128;
 
 /// A datapoint as an event of its row's stream.
 pub trait MetricEvent: Sized {
@@ -20,11 +22,11 @@ pub trait MetricEvent: Sized {
     fn timestamp_ns(&self) -> u64;
 }
 
-fn text(value: &str) -> [u8; TEXT_BYTES] {
+fn text<const N: usize>(value: &str) -> [u8; N] {
     crate::events::pack_str(value)
 }
 
-fn untext(packed: &[u8; TEXT_BYTES]) -> String {
+fn untext(packed: &[u8]) -> String {
     crate::events::unpack_str(packed)
 }
 
@@ -79,7 +81,7 @@ macro_rules! metric_row {
                     /// declaration order.
                     present: u64,
                     $($tag: [u8; TEXT_BYTES],)*
-                    $($string: [u8; TEXT_BYTES],)*
+                    $($string: [u8; STRING_BYTES],)*
                     $($flag: bool,)*
                     $($field: i64,)*
                 },
@@ -146,7 +148,7 @@ macro_rules! metric_row {
                                         .unwrap_or(value);
                                     text(&inner.replace("\\\"", "\""))
                                 }
-                                None => [0u8; TEXT_BYTES],
+                                None => [0u8; STRING_BYTES],
                             };
                             bit = bit.saturating_add(1);
                         )*
@@ -493,7 +495,11 @@ mod tests {
         point
             .add_tag("driver", "mlx5_core")
             .add_tag("zero_copy", "true")
-            .add_field_str("vendor", "Mellanox \"Tech\"");
+            .add_field_str("vendor", "Mellanox \"Tech\"")
+            .add_field_str(
+                "model",
+                "BCM57414 NetXtreme-E 10Gb/25Gb RDMA Ethernet Controller",
+            );
         let event = MetricOnce::from_point(&point, 42).unwrap();
         let (back, observed) = event.to_point();
         assert_eq!(observed, 42);
