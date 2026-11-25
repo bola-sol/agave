@@ -9,7 +9,8 @@
 
 use {
     agave_dashboard::{
-        config::DashboardConfig, event_input::EventInput, mirror::Mirror, service::DashboardService,
+        admin_socket, config::DashboardConfig, event_input::EventInput, mirror::Mirror,
+        service::DashboardService,
     },
     solana_core::validator::ValidatorStartProgress,
     std::{
@@ -140,8 +141,16 @@ fn main() -> ExitCode {
         args.events_dir.display()
     );
 
-    let mirror = Arc::new(Mirror::new(start_progress));
+    let mirror = Arc::new(Mirror::new(start_progress.clone()));
+    service.report_startup_from(mirror.reported());
+    let ledger = args
+        .events_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let mut input = EventInput::new(args.events_dir, mirror.clone(), service.metrics_tap());
+    let mut admin_read: Option<Instant> = None;
+    let mut admin_pid = None;
     let mut attached = false;
     let mut last_report = Instant::now();
     let mut watch = ValidatorWatch::default();
@@ -150,7 +159,18 @@ fn main() -> ExitCode {
         let now = Instant::now();
         input.connect(now);
         input.drain();
-        if watch.gone(mirror.validator_pid(), now) {
+        // Phases before the validator's event system exists come from its admin socket.
+        if !mirror.progress_reported()
+            && admin_read.is_none_or(|at| now.duration_since(at) >= ADMIN_POLL)
+        {
+            admin_read = Some(now);
+            if let Some(progress) = admin_socket::start_progress(&ledger) {
+                *start_progress.write().unwrap() = progress;
+                mirror.reported().write().unwrap().readings = true;
+                admin_pid = admin_socket::pid(&ledger).or(admin_pid);
+            }
+        }
+        if watch.gone(mirror.validator_pid().or(admin_pid), now) {
             log::info!("events: the validator exited or was replaced; starting again");
             restart = true;
             break;
@@ -200,6 +220,8 @@ fn main() -> ExitCode {
 
 /// How often the validator's process is looked for.
 const WATCH_EVERY: Duration = Duration::from_secs(1);
+/// How often the admin socket is asked the start phase.
+const ADMIN_POLL: Duration = Duration::from_millis(250);
 
 /// Follows the process id the node info carries.
 #[derive(Default)]

@@ -269,6 +269,36 @@ pub fn proc_dir() -> String {
     }
 }
 
+/// When the process `read_process` named started; `None` while reading this one.
+pub fn process_started() -> Option<std::time::SystemTime> {
+    if reading_self() {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("{}/stat", proc_dir())).ok()?;
+    let boot = std::fs::read_to_string("/proc/stat").ok()?;
+    started_from(&stat, &boot)
+}
+
+/// From `/proc/<pid>/stat`'s start time, in clock ticks since boot, and `/proc/stat`'s boot time.
+fn started_from(stat: &str, boot: &str) -> Option<std::time::SystemTime> {
+    // The kernel reports these in USER_HZ, 100 on every architecture Agave runs on.
+    const TICKS_PER_SECOND: u64 = 100;
+    // The command name is in parentheses and may hold spaces.
+    let (_, after_name) = stat.rsplit_once(')')?;
+    // Fields from the state on; the start time is the stat line's 22nd.
+    let ticks: u64 = after_name.split_whitespace().nth(19)?.parse().ok()?;
+    let boot_secs: u64 = boot
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    let millis = boot_secs
+        .saturating_mul(1000)
+        .saturating_add(ticks.saturating_mul(1000).saturating_div(TICKS_PER_SECOND));
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(millis))
+}
+
 #[cfg(target_os = "linux")]
 pub fn process_memory() -> io::Result<ProcessMemory> {
     let status = std::fs::read_to_string(format!("{}/status", proc_dir()))?;
@@ -478,6 +508,18 @@ fn parse_diskstats(contents: &str) -> BTreeMap<String, DiskCounters> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_process_start_is_boot_time_plus_its_ticks() {
+        let stat =
+            "4242 (agave validator) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 12345 19 20";
+        let boot = "cpu  1 2 3\nbtime 1700000000\nprocesses 9\n";
+        assert_eq!(
+            started_from(stat, boot),
+            std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(1_700_000_123_450))
+        );
+        assert_eq!(started_from("4242 (x) S", boot), None);
+    }
 
     #[test]
     fn test_reads_the_three_averages_and_the_thread_counts() {

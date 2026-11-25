@@ -5,7 +5,6 @@
 
 use {
     crate::{
-        context::StartProgress,
         events::{
             ACCOUNT_PATHS, ADDR_ALPENGLOW, ADDR_BYTES, ADDR_GOSSIP, ADDR_RPC,
             ADDR_SERVE_REPAIR_UDP, ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC,
@@ -17,9 +16,9 @@ use {
             MessageVersionsEvent, NAME_BYTES, NODE_INFO_STREAM, NodeInfoEvent, OUTCOME_FAILED,
             OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN, PATH_BYTES, RANKS_PER_EVENT, ROLE_ROOT,
             ROLE_WORKING, SLOT_CLOCK_STREAM, SLOT_HISTORY_STREAM, SLOT_STATUS_STREAM,
-            START_PROGRESS_STREAM, SlotClockEvent, SlotHistoryEvent, SlotStatusEvent,
-            StartProgressEvent, TX_OUTCOME_STREAM, TxOutcomeEvent, VALIDATOR_INFO_STREAM,
-            VOTE_REWARD_BYTES, ValidatorInfoEvent, pack_addr, pack_path, pack_str,
+            SlotClockEvent, SlotHistoryEvent, SlotStatusEvent, TX_OUTCOME_STREAM, TxOutcomeEvent,
+            VALIDATOR_INFO_STREAM, VOTE_REWARD_BYTES, ValidatorInfoEvent, pack_addr, pack_path,
+            pack_str,
         },
         metric_events::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -37,7 +36,6 @@ use {
         stream_name::StreamName,
     },
     agave_snapshots::SnapshotInterval,
-    solana_core::validator::ValidatorStartProgress,
     solana_metrics::datapoint::DataPoint,
     solana_vote_interface::state::VoteStateV4,
     std::{
@@ -111,13 +109,7 @@ macro_rules! keyed {
     )*};
 }
 
-keyed!(
-    NodeInfoEvent,
-    StartProgressEvent,
-    SlotStatusEvent,
-    EpochEvent,
-    SlotClockEvent
-);
+keyed!(NodeInfoEvent, SlotStatusEvent, EpochEvent, SlotClockEvent);
 
 /// Sends an event when its content changes, when its stream turns on, and every [`RESEND`].
 struct Resent<E: Event> {
@@ -201,7 +193,6 @@ pub struct EventOutput {
     /// The next rooted slot whose block goes out.
     next_block: Option<solana_clock::Slot>,
     node: Resent<NodeInfoEvent>,
-    progress: Resent<StartProgressEvent>,
     status: Resent<SlotStatusEvent>,
     epoch: Resent<EpochEvent>,
     root: Resent<SlotClockEvent>,
@@ -235,7 +226,6 @@ impl EventOutput {
             blocks: stream(event_system, BLOCK_STREAM, 512)?,
             next_block: None,
             node: Resent::new(stream(event_system, NODE_INFO_STREAM, 16)?),
-            progress: Resent::new(stream(event_system, START_PROGRESS_STREAM, 64)?),
             status: Resent::new(stream(event_system, SLOT_STATUS_STREAM, 256)?),
             epoch: Resent::new(stream(event_system, EPOCH_STREAM, 16)?),
             working: Resent::new(working),
@@ -247,20 +237,19 @@ impl EventOutput {
     pub fn spawn(
         mut self,
         src: Arc<dyn Source>,
-        start_progress: StartProgress,
         exit: Arc<AtomicBool>,
     ) -> io::Result<JoinHandle<()>> {
         thread::Builder::new()
             .name("solEvtDash".to_string())
             .spawn(move || {
                 while !exit.load(Ordering::Relaxed) {
-                    self.tick(&src, &start_progress);
+                    self.tick(&src);
                     thread::sleep(TICK);
                 }
             })
     }
 
-    fn tick(&mut self, held_src: &Arc<dyn Source>, start_progress: &StartProgress) {
+    fn tick(&mut self, held_src: &Arc<dyn Source>) {
         let src = held_src.as_ref();
         let now = Instant::now();
         self.send_ledger(src);
@@ -271,10 +260,6 @@ impl EventOutput {
         self.send_peers(src, now);
         self.send_info(held_src, now);
         self.send_frozen_reads(src);
-        if self.progress.enabled() {
-            let progress = *start_progress.read().unwrap();
-            self.progress.offer(progress_event(progress), now);
-        }
         if self.node.enabled() {
             self.node.offer(node_event(src), now);
         }
@@ -966,49 +951,6 @@ pub(crate) fn node_event(src: &dyn Source) -> NodeInfoEvent {
         }),
         global_addresses_only: src.global_addresses_only(),
     }
-}
-
-fn progress_event(progress: ValidatorStartProgress) -> StartProgressEvent {
-    let (pid, tid, timestamp_ns) = header();
-    let mut event = StartProgressEvent {
-        pid,
-        tid,
-        timestamp_ns,
-        phase: 0,
-        slot: 0,
-        max_slot: 0,
-        gossip_stake_percent: 0,
-        rpc_addr: [0u8; ADDR_BYTES],
-    };
-    event.phase = match progress {
-        ValidatorStartProgress::Initializing => 0,
-        ValidatorStartProgress::SearchingForRpcService => 1,
-        ValidatorStartProgress::DownloadingSnapshot { slot, rpc_addr } => {
-            event.slot = slot;
-            event.rpc_addr = pack_addr(Some(rpc_addr));
-            2
-        }
-        ValidatorStartProgress::CleaningBlockStore => 3,
-        ValidatorStartProgress::CleaningAccounts => 4,
-        ValidatorStartProgress::LoadingLedger => 5,
-        ValidatorStartProgress::ProcessingLedger { slot, max_slot } => {
-            event.slot = slot;
-            event.max_slot = max_slot;
-            6
-        }
-        ValidatorStartProgress::StartingServices => 7,
-        ValidatorStartProgress::Halted => 8,
-        ValidatorStartProgress::WaitingForSupermajority {
-            slot,
-            gossip_stake_percent,
-        } => {
-            event.slot = slot;
-            event.gossip_stake_percent = gossip_stake_percent;
-            9
-        }
-        ValidatorStartProgress::Running => 10,
-    };
-    event
 }
 
 pub(crate) fn status_event(src: &dyn Source) -> SlotStatusEvent {

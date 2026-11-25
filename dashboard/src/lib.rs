@@ -3,6 +3,7 @@
 //! feed of its state on one port, read through handles the validator already
 //! holds.
 
+pub mod admin_socket;
 pub mod certs;
 pub mod collect;
 pub mod config;
