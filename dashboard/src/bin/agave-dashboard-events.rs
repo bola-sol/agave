@@ -3,6 +3,9 @@
 //!
 //! Usage: agave-dashboard-events --events-dir <ledger>/events [--port 3011] [--poll-ms 5]
 //!        [--report-secs 10] [--history-dir <dir>] [--leave-handles]
+//!
+//! When the validator it reads exits or is replaced, it starts itself again from argv[0], since
+//! the mirror and the collector hold the old validator's state.
 
 use {
     agave_dashboard::{
@@ -11,8 +14,9 @@ use {
     solana_core::validator::ValidatorStartProgress,
     std::{
         net::{Ipv4Addr, SocketAddr},
-        path::PathBuf,
-        process::ExitCode,
+        os::unix::process::CommandExt,
+        path::{Path, PathBuf},
+        process::{Command, ExitCode},
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, Ordering},
@@ -140,10 +144,17 @@ fn main() -> ExitCode {
     let mut input = EventInput::new(args.events_dir, mirror.clone(), service.metrics_tap());
     let mut attached = false;
     let mut last_report = Instant::now();
+    let mut watch = ValidatorWatch::default();
+    let mut restart = false;
     while !exit.load(Ordering::Relaxed) {
         let now = Instant::now();
         input.connect(now);
         input.drain();
+        if watch.gone(mirror.validator_pid(), now) {
+            log::info!("events: the validator exited or was replaced; starting again");
+            restart = true;
+            break;
+        }
         // The collector starts once the mirror holds what it reads once; see `Mirror::ready`.
         if !attached && mirror.ready() {
             mirror.drop_backlog();
@@ -163,14 +174,66 @@ fn main() -> ExitCode {
     }
 
     log::info!("\n{}", input.report());
-    if args.leave_handles {
+    if args.leave_handles && !restart {
         log::info!("events: exiting without dropping the subscribers");
         std::process::exit(0);
     }
     input.disconnect();
     log::info!("events: subscribers dropped");
+    if restart {
+        exit.store(true, Ordering::Relaxed);
+    }
     if service.join().is_err() {
         log::error!("events: a dashboard thread panicked");
     }
+    if restart {
+        let mut argv = std::env::args_os();
+        let program = argv
+            .next()
+            .unwrap_or_else(|| "agave-dashboard-events".into());
+        let err = Command::new(program).args(argv).exec();
+        log::error!("events: could not start again: {err}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
+}
+
+/// How often the validator's process is looked for.
+const WATCH_EVERY: Duration = Duration::from_secs(1);
+
+/// Follows the process id the node info carries.
+#[derive(Default)]
+struct ValidatorWatch {
+    pid: Option<u32>,
+    /// Whether `/proc` showed the process, so a validator in another pid namespace is not taken
+    /// for gone.
+    visible: bool,
+    checked: Option<Instant>,
+}
+
+impl ValidatorWatch {
+    /// True once the watched validator's process has exited, or another validator's node info
+    /// has arrived.
+    fn gone(&mut self, pid: Option<u32>, now: Instant) -> bool {
+        if self
+            .checked
+            .is_some_and(|at| now.duration_since(at) < WATCH_EVERY)
+        {
+            return false;
+        }
+        self.checked = Some(now);
+        let Some(pid) = pid else {
+            return false;
+        };
+        let alive = Path::new("/proc").join(pid.to_string()).exists();
+        match self.pid {
+            None => {
+                self.pid = Some(pid);
+                self.visible = alive;
+                false
+            }
+            Some(held) if held != pid => true,
+            Some(_) => self.visible && !alive,
+        }
+    }
 }

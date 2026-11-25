@@ -1087,11 +1087,8 @@ impl MetricsTap {
     }
 
     fn forward(&self, point: &DataPoint) {
-        // No event system was handed a sender.
-        if self.forward.get().is_none() {
-            return;
-        }
         let now_millis = timestamp();
+        // From install, since the XDP and supermajority wait points come before the event system.
         self.latch(point, now_millis);
         if !self.forwarding.load(Ordering::Relaxed) || !crate::metric_events::carried(point.name) {
             return;
@@ -2615,10 +2612,15 @@ mod tests {
     }
 
     #[test]
-    fn test_nothing_is_latched_without_an_event_system() {
+    fn test_points_before_the_event_system_are_latched() {
         let tap = MetricsTap::default();
         tap.forward(&named(XDP_NETWORK_CONFIG, &[]));
-        assert!(tap.latched_points().is_empty());
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        tap.forward_to(sender);
+        let latched = tap.latched_points();
+        assert_eq!(latched.len(), 1);
+        assert_eq!(latched[0].0.name, XDP_NETWORK_CONFIG);
+        assert!(receiver.is_empty());
     }
 
     #[test]
