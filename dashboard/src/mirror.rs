@@ -13,13 +13,16 @@ use {
             BLOCK_MISSING, BlockEvent, EpochEvent, FinalizationEvent, GossipPeerEvent,
             INFO_FULL_SET, LedgerSlotEvent, MessageVersionsEvent, NodeInfoEvent, OUTCOME_FAILED,
             OUTCOME_SUCCEEDED, PATH_BYTES, ROLE_ROOT, SlotClockEvent, SlotHistoryEvent,
-            SlotStatusEvent, StartProgressEvent, TxOutcomeEvent, ValidatorInfoEvent, unpack_addr,
-            unpack_path, unpack_str,
+            SlotStatusEvent, TxOutcomeEvent, ValidatorInfoEvent, unpack_addr, unpack_path,
+            unpack_str,
         },
         snapshot,
         source::{
             BankView, Banks, Commitment, CostFacts, EpochStakeView, FeeTotals, PeerRow, RankEntry,
             RankRows, Ranks, Source, VoteRow,
+        },
+        startup::{
+            GossipStake, GossipValidator, PhaseTiming, ReportedTimings, SharedReported, phase_name,
         },
         validator_info::ValidatorInfo,
         versions::TxVersions,
@@ -30,7 +33,9 @@ use {
     },
     solana_clock::{Clock, Epoch, Slot},
     solana_core::{
-        bank_state_events::VoteAccountEvent, replay_stage::events::BankFrozenEvent,
+        bank_state_events::VoteAccountEvent,
+        replay_stage::events::BankFrozenEvent,
+        start_events::{StartProgressEvent, SupermajorityWaitEvent},
         validator::ValidatorStartProgress,
     },
     solana_epoch_schedule::EpochSchedule,
@@ -87,6 +92,7 @@ impl Shared {
 /// The streams whose events arrive as sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetStream {
+    Wait,
     Peers,
     Info,
     History,
@@ -619,6 +625,7 @@ struct State {
     /// Each validator's info, with the slot it was read at.
     info: HashMap<Pubkey, (Slot, ValidatorInfo)>,
     pending_info: Option<PendingSet<ValidatorInfoEvent>>,
+    pending_wait: Option<PendingSet<SupermajorityWaitEvent>>,
     /// Entries not yet handed to the collector.
     info_changes: Vec<(Pubkey, ValidatorInfo)>,
     ledger: BTreeMap<Slot, LedgerSlot>,
@@ -636,8 +643,9 @@ struct State {
 pub struct Mirror {
     state: RwLock<State>,
     start_progress: StartProgress,
-    /// The publishing validator's process id, 0 until its node info arrives.
+    /// The publishing validator's process id, 0 until its node info or start progress arrives.
     validator_pid: std::sync::atomic::AtomicU32,
+    reported: SharedReported,
 }
 
 impl Mirror {
@@ -646,6 +654,25 @@ impl Mirror {
             state: RwLock::new(State::default()),
             start_progress,
             validator_pid: std::sync::atomic::AtomicU32::new(0),
+            reported: SharedReported::default(),
+        }
+    }
+
+    /// The validator's start as its events report it, for the startup publisher.
+    pub fn reported(&self) -> SharedReported {
+        self.reported.clone()
+    }
+
+    /// Whether a start progress event has arrived.
+    pub fn progress_reported(&self) -> bool {
+        self.reported.read().unwrap().timings.is_some()
+    }
+
+    fn note_pid(&self, pid: i32) {
+        if let Ok(pid) = u32::try_from(pid) {
+            crate::host_stats::read_process(pid);
+            self.validator_pid
+                .store(pid, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -680,6 +707,7 @@ impl Mirror {
     pub fn reset_set(&self, stream: SetStream) {
         let mut state = self.state.write().unwrap();
         match stream {
+            SetStream::Wait => state.pending_wait = None,
             SetStream::Peers => state.pending_peers = None,
             SetStream::Info => state.pending_info = None,
             SetStream::History => state.pending_history = None,
@@ -700,21 +728,19 @@ impl Mirror {
 
     pub fn apply_node(&self, event: &NodeInfoEvent) {
         // The validator's memory and threads, not this process's.
-        if let Ok(pid) = u32::try_from(event.pid) {
-            crate::host_stats::read_process(pid);
-            self.validator_pid
-                .store(pid, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.note_pid(event.pid);
         self.state.write().unwrap().node = Some(Node::from(event));
     }
 
     pub fn apply_progress(&self, event: &StartProgressEvent) {
+        // The validator's memory and threads during start, before its node info.
+        self.note_pid(event.pid);
         let progress = match event.phase {
             1 => ValidatorStartProgress::SearchingForRpcService,
+            // The download ends before the event system exists.
             2 => ValidatorStartProgress::DownloadingSnapshot {
                 slot: event.slot,
-                rpc_addr: unpack_addr(&event.rpc_addr)
-                    .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+                rpc_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             },
             3 => ValidatorStartProgress::CleaningBlockStore,
             4 => ValidatorStartProgress::CleaningAccounts,
@@ -732,7 +758,76 @@ impl Mirror {
             10 => ValidatorStartProgress::Running,
             _ => ValidatorStartProgress::Initializing,
         };
+        let len = usize::from(event.taken_len).min(event.taken_phases.len());
+        let taken = event.taken_phases[..len]
+            .iter()
+            .zip(&event.taken_ns)
+            .filter_map(|(phase, nanos)| {
+                Some(PhaseTiming {
+                    phase: phase_name(*phase)?.to_string(),
+                    elapsed_nanos: *nanos,
+                })
+            })
+            .collect();
+        // Timings first, so the publisher never pairs a new phase with the old timings.
+        let mut reported = self.reported.write().unwrap();
+        reported.readings = true;
+        reported.timings = Some(ReportedTimings {
+            phase: phase_name(event.phase).unwrap_or("initializing"),
+            phase_elapsed_nanos: event.phase_elapsed_ns,
+            at_ns: event.timestamp_ns,
+            taken,
+            replay_origin: event.has_replay_origin.then_some(event.replay_origin),
+        });
+        drop(reported);
         *self.start_progress.write().unwrap() = progress;
+    }
+
+    /// A whole check of the supermajority wait, with names where validator info has arrived.
+    pub fn apply_wait(&self, event: &SupermajorityWaitEvent) {
+        let mut state = self.state.write().unwrap();
+        let Some(parts) = PendingSet::add(
+            &mut state.pending_wait,
+            event.generation,
+            event.index,
+            event.count,
+            event.clone(),
+        ) else {
+            return;
+        };
+        let mut validators: Vec<GossipValidator> = parts
+            .iter()
+            .map(|part| {
+                let identity = Pubkey::new_from_array(part.identity);
+                GossipValidator {
+                    identity: identity.to_string(),
+                    name: state
+                        .info
+                        .get(&identity)
+                        .and_then(|(_, info)| info.name.clone()),
+                    version: part.has_version.then(|| unpack_str(&part.version)),
+                    stake: part.activated_stake,
+                    seen: part.seen,
+                }
+            })
+            .collect();
+        drop(state);
+        validators.sort_by(|a, b| {
+            b.stake
+                .cmp(&a.stake)
+                .then_with(|| a.identity.cmp(&b.identity))
+        });
+        let seen = validators
+            .iter()
+            .filter(|validator| validator.seen)
+            .fold(0u64, |sum, validator| sum.saturating_add(validator.stake));
+        self.reported.write().unwrap().gossip = Some(GossipStake {
+            slot: event.slot,
+            shred_version: event.shred_version,
+            total: event.total_activated_stake,
+            seen,
+            validators,
+        });
     }
 
     pub fn apply_status(&self, event: &SlotStatusEvent) {
@@ -1502,6 +1597,110 @@ mod tests {
             source::Direct,
         },
     };
+
+    fn wait_part(
+        generation: u64,
+        index: u32,
+        count: u32,
+        stake: u64,
+        seen: bool,
+    ) -> SupermajorityWaitEvent {
+        let mut version = [0u8; solana_core::start_events::VERSION_BYTES];
+        version[..5].copy_from_slice(b"4.5.0");
+        SupermajorityWaitEvent {
+            pid: 1,
+            tid: 1,
+            timestamp_ns: 0,
+            generation,
+            index,
+            count,
+            slot: 77,
+            shred_version: 9,
+            online_stake: 30,
+            total_activated_stake: 60,
+            identity: Pubkey::new_unique().to_bytes(),
+            activated_stake: stake,
+            seen,
+            has_version: seen,
+            version,
+        }
+    }
+
+    #[test]
+    fn test_start_progress_carries_the_validators_timings() {
+        let progress = Arc::new(RwLock::new(ValidatorStartProgress::Initializing));
+        let mirror = Mirror::new(progress.clone());
+        let mut taken_phases = [0u8; solana_core::start_events::PHASES];
+        let mut taken_ns = [0u64; solana_core::start_events::PHASES];
+        taken_phases[0] = 5;
+        taken_ns[0] = 90;
+        mirror.apply_progress(&StartProgressEvent {
+            pid: 0,
+            tid: 0,
+            timestamp_ns: 42,
+            phase: 6,
+            slot: 150,
+            max_slot: 200,
+            gossip_stake_percent: 0,
+            phase_elapsed_ns: 7,
+            has_replay_origin: true,
+            replay_origin: 100,
+            taken_len: 1,
+            taken_phases,
+            taken_ns,
+        });
+        assert_eq!(
+            *progress.read().unwrap(),
+            ValidatorStartProgress::ProcessingLedger {
+                slot: 150,
+                max_slot: 200
+            }
+        );
+        assert!(mirror.progress_reported());
+        let timings = mirror.reported().read().unwrap().timings.clone().unwrap();
+        assert_eq!(timings.phase, "processing_ledger");
+        assert_eq!((timings.phase_elapsed_nanos, timings.at_ns), (7, 42));
+        assert_eq!(timings.replay_origin, Some(100));
+        assert_eq!(timings.taken.len(), 1);
+        assert_eq!(timings.taken[0].phase, "loading_ledger");
+        assert_eq!(timings.taken[0].elapsed_nanos, 90);
+    }
+
+    #[test]
+    fn test_a_whole_wait_check_rebuilds_the_wait_panel() {
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Initializing)));
+        let parts = [
+            wait_part(3, 0, 3, 10, true),
+            wait_part(3, 1, 3, 30, false),
+            wait_part(3, 2, 3, 20, true),
+        ];
+        // A part of an older check is dropped by the newer one.
+        mirror.apply_wait(&wait_part(2, 0, 3, 99, true));
+        mirror.apply_wait(&parts[0]);
+        mirror.apply_wait(&parts[1]);
+        assert!(mirror.reported().read().unwrap().gossip.is_none());
+        mirror.apply_wait(&parts[2]);
+        let gossip = mirror.reported().read().unwrap().gossip.clone().unwrap();
+        assert_eq!((gossip.slot, gossip.shred_version), (77, 9));
+        assert_eq!((gossip.total, gossip.seen), (60, 30));
+        let stakes: Vec<_> = gossip
+            .validators
+            .iter()
+            .map(|v| (v.stake, v.seen))
+            .collect();
+        assert_eq!(stakes, [(30, false), (20, true), (10, true)]);
+        assert_eq!(gossip.validators[1].version.as_deref(), Some("4.5.0"));
+        assert_eq!(gossip.validators[0].version, None);
+    }
+
+    #[test]
+    fn test_a_resubscribed_wait_drops_its_partial_check() {
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Initializing)));
+        mirror.apply_wait(&wait_part(4, 0, 2, 10, true));
+        mirror.reset_set(SetStream::Wait);
+        mirror.apply_wait(&wait_part(4, 1, 2, 20, true));
+        assert!(mirror.reported().read().unwrap().gossip.is_none());
+    }
 
     #[test]
     fn test_the_mirror_answers_as_the_validator_does() {

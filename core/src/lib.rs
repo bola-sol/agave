@@ -38,6 +38,7 @@ pub mod sigverify;
 pub mod sigverify_stage;
 pub mod snapshot_packager_service;
 pub mod staked_nodes_updater_service;
+pub mod start_events;
 pub mod stats_reporter_service;
 pub mod system_monitor_service;
 pub mod tpu;
