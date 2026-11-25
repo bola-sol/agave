@@ -459,20 +459,28 @@ metric_row! {
         fields [online_stake = "online_stake", total_activated_stake = "total_activated_stake"];
 }
 
+/// Every datapoint a metric stream carries.
+static CARRIED: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        [
+            MetricSlot::POINTS,
+            MetricLeader::POINTS,
+            MetricVotor::POINTS,
+            MetricTpu::POINTS,
+            MetricNet::POINTS,
+            MetricAccounts::POINTS,
+            MetricGossip::POINTS,
+            MetricOnce::POINTS,
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect()
+    });
+
 /// Whether a metric stream carries the datapoint.
 pub fn carried(name: &str) -> bool {
-    [
-        MetricSlot::POINTS,
-        MetricLeader::POINTS,
-        MetricVotor::POINTS,
-        MetricTpu::POINTS,
-        MetricNet::POINTS,
-        MetricAccounts::POINTS,
-        MetricGossip::POINTS,
-        MetricOnce::POINTS,
-    ]
-    .iter()
-    .any(|points| points.contains(&name))
+    CARRIED.contains(name)
 }
 
 #[cfg(test)]

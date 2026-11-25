@@ -257,6 +257,10 @@ pub fn read_process(pid: u32) {
     PROCESS.store(pid, std::sync::atomic::Ordering::Relaxed);
 }
 
+pub fn reading_self() -> bool {
+    PROCESS.load(std::sync::atomic::Ordering::Relaxed) == 0
+}
+
 /// `/proc/self`, or the process `read_process` named.
 pub fn proc_dir() -> String {
     match PROCESS.load(std::sync::atomic::Ordering::Relaxed) {

@@ -92,24 +92,20 @@ fn stream<E: Event>(
 }
 
 /// What decides whether an event changed: everything but its header.
-trait Keyed {
-    fn key(&self) -> Vec<u8>;
+trait Keyed: Clone + PartialEq {
+    fn unstamped(&self) -> Self;
 }
 
 macro_rules! keyed {
     ($($event:ty),*) => {$(
         impl Keyed for $event {
-            fn key(&self) -> Vec<u8> {
-                format!(
-                    "{:?}",
-                    Self {
-                        pid: 0,
-                        tid: 0,
-                        timestamp_ns: 0,
-                        ..self.clone()
-                    }
-                )
-                .into_bytes()
+            fn unstamped(&self) -> Self {
+                Self {
+                    pid: 0,
+                    tid: 0,
+                    timestamp_ns: 0,
+                    ..self.clone()
+                }
             }
         }
     )*};
@@ -126,7 +122,7 @@ keyed!(
 /// Sends an event when its content changes, when its stream turns on, and every [`RESEND`].
 struct Resent<E: Event> {
     publisher: Publisher<E>,
-    sent: Option<(Vec<u8>, Instant)>,
+    sent: Option<(E, Instant)>,
 }
 
 impl<E: Event + Keyed> Resent<E> {
@@ -146,7 +142,7 @@ impl<E: Event + Keyed> Resent<E> {
     }
 
     fn offer(&mut self, event: E, now: Instant) {
-        let key = event.key();
+        let key = event.unstamped();
         let due = self
             .sent
             .as_ref()
@@ -180,12 +176,17 @@ pub struct EventOutput {
     info: Publisher<ValidatorInfoEvent>,
     info_sent: Option<(u64, Instant)>,
     finalization: Publisher<FinalizationEvent>,
-    /// The newest frozen bank read for finalization and validator info changes.
-    frozen_read_to: Option<solana_clock::Slot>,
+    /// Frozen banks already read for finalization and validator info changes; `None` while both
+    /// streams are off.
+    frozen_seen: Option<std::collections::BTreeSet<solana_clock::Slot>>,
+    /// The full validator info scan, run off this thread.
+    info_scan: Option<crossbeam_channel::Receiver<InfoScan>>,
     outcomes: Publisher<TxOutcomeEvent>,
     versions: Publisher<MessageVersionsEvent>,
     /// Frozen banks whose blocks are not yet full, held for their transactions' results.
     held: std::collections::BTreeMap<solana_clock::Slot, Arc<dyn BankView>>,
+    /// Blocks already read, so a bank still in bank forks is not read again.
+    blocks_read: std::collections::BTreeSet<solana_clock::Slot>,
     admitted: Publisher<AdmittedEvent>,
     /// The epoch, generation and time of the last whole rank maps.
     admitted_sent: Option<(solana_clock::Epoch, u64, Instant)>,
@@ -217,10 +218,12 @@ impl EventOutput {
             info: stream(event_system, VALIDATOR_INFO_STREAM, 8192)?,
             info_sent: None,
             finalization: stream(event_system, FINALIZATION_STREAM, 1024)?,
-            frozen_read_to: None,
+            frozen_seen: None,
+            info_scan: None,
             outcomes: stream(event_system, TX_OUTCOME_STREAM, 65_536)?,
             versions: stream(event_system, MESSAGE_VERSIONS_STREAM, 256)?,
             held: std::collections::BTreeMap::new(),
+            blocks_read: std::collections::BTreeSet::new(),
             admitted: stream(event_system, ADMITTED_STREAM, 1024)?,
             admitted_sent: None,
             history: stream(event_system, SLOT_HISTORY_STREAM, 256)?,
@@ -249,13 +252,14 @@ impl EventOutput {
             .name("solEvtDash".to_string())
             .spawn(move || {
                 while !exit.load(Ordering::Relaxed) {
-                    self.tick(src.as_ref(), &start_progress);
+                    self.tick(&src, &start_progress);
                     thread::sleep(TICK);
                 }
             })
     }
 
-    fn tick(&mut self, src: &dyn Source, start_progress: &StartProgress) {
+    fn tick(&mut self, held_src: &Arc<dyn Source>, start_progress: &StartProgress) {
+        let src = held_src.as_ref();
         let now = Instant::now();
         self.send_ledger(src);
         self.send_blocks(src);
@@ -263,7 +267,7 @@ impl EventOutput {
         self.send_history(src, now);
         self.send_blocks_read(src);
         self.send_peers(src, now);
-        self.send_info(src, now);
+        self.send_info(held_src, now);
         self.send_frozen_reads(src);
         if self.progress.enabled() {
             let progress = *start_progress.read().unwrap();
@@ -314,12 +318,17 @@ impl EventOutput {
             self.ledger_sent.clear();
             return;
         }
-        let highest = src
-            .highest_slot()
-            .max(src.cluster_tip().unwrap_or_default());
-        let from = highest.saturating_sub(LEDGER_WINDOW);
-        self.ledger_sent = self.ledger_sent.split_off(&from);
-        for slot in from..=highest {
+        // Under the tip for the slots arriving, and under bank forks' highest for the slots replay
+        // is completing, which trail the tip far while a node catches up.
+        let replaying = src.highest_slot();
+        let tip = replaying.max(src.cluster_tip().unwrap_or_default());
+        let window = |top: solana_clock::Slot| top.saturating_sub(LEDGER_WINDOW)..=top;
+        self.ledger_sent = self
+            .ledger_sent
+            .split_off(&replaying.saturating_sub(LEDGER_WINDOW));
+        let slots: std::collections::BTreeSet<solana_clock::Slot> =
+            window(replaying).chain(window(tip)).collect();
+        for slot in slots {
             let (first_sent, full_sent) = self.ledger_sent.get(&slot).copied().unwrap_or_default();
             if full_sent {
                 continue;
@@ -394,10 +403,25 @@ impl EventOutput {
         publish_paced(&mut self.peers, &events);
     }
 
-    /// Every validator info entry, at turn-on and every few minutes.
-    fn send_info(&mut self, src: &dyn Source, now: Instant) {
+    /// Every validator info entry, at turn-on and every ten minutes. The scan can take minutes on
+    /// a real cluster, so it runs on a thread of its own and goes out when it finishes.
+    fn send_info(&mut self, src: &Arc<dyn Source>, now: Instant) {
         if !self.info.is_enabled() {
             self.info_sent = None;
+            self.info_scan = None;
+            return;
+        }
+        if let Some(scan) = &self.info_scan {
+            match scan.try_recv() {
+                Ok((slot, entries)) => {
+                    self.info_scan = None;
+                    let generation = self.info_sent.map_or(0, |(generation, _)| generation);
+                    let events = info_events(INFO_FULL_SET, generation, slot, &entries);
+                    publish_paced(&mut self.info, &events);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.info_scan = None,
+            }
             return;
         }
         let generation = match self.info_sent {
@@ -406,9 +430,17 @@ impl EventOutput {
             None => 1,
         };
         self.info_sent = Some((generation, now));
-        let (slot, entries) = src.validator_info_all();
-        let events = info_events(INFO_FULL_SET, generation, slot, &entries);
-        publish_paced(&mut self.info, &events);
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let src = src.clone();
+        if thread::Builder::new()
+            .name("solEvtInfo".to_string())
+            .spawn(move || {
+                let _ = sender.send(src.validator_info_all());
+            })
+            .is_ok()
+        {
+            self.info_scan = Some(receiver);
+        }
     }
 
     /// Each new frozen bank's finalization reading and the validator info entries it changed.
@@ -416,14 +448,21 @@ impl EventOutput {
         let finalization_on = self.finalization.is_enabled();
         let info_on = self.info.is_enabled();
         if !finalization_on && !info_on {
-            self.frozen_read_to = None;
+            self.frozen_seen = None;
             return;
         }
         let banks = src.banks();
-        let read_to = *self.frozen_read_to.get_or_insert(banks.highest_slot);
-        let mut newest = read_to;
-        for (slot, bank) in banks.frozen.iter().filter(|(slot, _)| *slot > read_to) {
-            newest = newest.max(*slot);
+        // At turn-on the banks already frozen are taken as read.
+        let seen = self
+            .frozen_seen
+            .get_or_insert_with(|| banks.frozen.iter().map(|(slot, _)| *slot).collect());
+        let fresh: Vec<_> = banks
+            .frozen
+            .iter()
+            .filter(|(slot, _)| seen.insert(*slot))
+            .collect();
+        *seen = seen.split_off(&banks.root.slot());
+        for (slot, bank) in fresh {
             if finalization_on && let Some(event) = finalization_event(bank.as_ref()) {
                 let _ = self.finalization.publish(&event);
             }
@@ -437,7 +476,6 @@ impl EventOutput {
                 }
             }
         }
-        self.frozen_read_to = Some(newest);
     }
 
     /// Each frozen block's transactions once it is full, and our blocks' message versions.
@@ -446,17 +484,19 @@ impl EventOutput {
         let versions_on = self.versions.is_enabled();
         if !outcomes_on && !versions_on {
             self.held.clear();
+            self.blocks_read.clear();
             return;
         }
         let banks = src.banks();
-        let newest = self.held.keys().next_back().copied();
         for (slot, bank) in banks.frozen {
-            if newest.is_none_or(|newest| slot > newest) {
-                self.held.insert(slot, bank);
+            if !self.blocks_read.contains(&slot) {
+                self.held.entry(slot).or_insert(bank);
             }
         }
         // Bank forks drops a bank the root passes; a block not full by then is not read.
-        self.held = self.held.split_off(&banks.root.slot());
+        let root = banks.root.slot();
+        self.held = self.held.split_off(&root);
+        self.blocks_read = self.blocks_read.split_off(&root);
         let me = src.identity();
         let full: Vec<solana_clock::Slot> = self
             .held
@@ -468,15 +508,9 @@ impl EventOutput {
             let Some(bank) = self.held.remove(&slot) else {
                 continue;
             };
+            self.blocks_read.insert(slot);
             let ours = src.slot_leader(slot, bank.as_ref()) == Some(me);
-            if outcomes_on {
-                let outcomes = src
-                    .tx_outcomes(slot, bank.as_ref(), ours, &|_| true)
-                    .unwrap_or_default();
-                for event in outcome_events(slot, ours, &outcomes) {
-                    let _ = self.outcomes.publish(&event);
-                }
-            }
+            // Versions first: the subscriber reads a block as full once its outcomes arrive.
             if versions_on
                 && ours
                 && let Some(tally) = src.message_versions(slot)
@@ -491,6 +525,14 @@ impl EventOutput {
                     v0: tally.v0,
                     v1: tally.v1,
                 });
+            }
+            if outcomes_on {
+                let outcomes = src
+                    .tx_outcomes(slot, bank.as_ref(), ours, &|_| true)
+                    .unwrap_or_default();
+                for event in outcome_events(slot, ours, &outcomes) {
+                    let _ = self.outcomes.publish(&event);
+                }
             }
         }
     }
@@ -648,6 +690,12 @@ pub(crate) fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEven
     }
     Some(event)
 }
+
+/// The full validator info scan's result: the slot read at and every entry.
+type InfoScan = (
+    solana_clock::Slot,
+    Vec<(solana_pubkey::Pubkey, crate::validator_info::ValidatorInfo)>,
+);
 
 /// A block's outcomes, or one empty event where it had none.
 fn outcome_events(

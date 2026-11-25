@@ -144,7 +144,7 @@ fn main() -> ExitCode {
         let now = Instant::now();
         input.connect(now);
         input.drain();
-        // The collector starts once the node, its banks and the epoch have arrived.
+        // The collector starts once the mirror holds what it reads once; see `Mirror::ready`.
         if !attached && mirror.ready() {
             mirror.drop_backlog();
             match service.attach_source(mirror.clone()) {
