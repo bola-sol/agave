@@ -398,8 +398,6 @@ impl EventOutput {
         publish_paced(&mut self.peers, &events);
     }
 
-    /// Every validator info entry, at turn-on and every ten minutes. The scan can take minutes on
-    /// a real cluster, so it runs on a thread of its own and goes out when it finishes.
     /// Every name the in-process dashboard holds, which its own scan at attach filled and frozen
     /// banks keep current, so a subscriber that joins late waits at most `INFO_EVERY`.
     fn send_info(&mut self, now: Instant) {
