@@ -831,6 +831,10 @@ impl Mirror {
             info_changes: Vec::new(),
         });
         state.frozen.insert(event.slot, bank.clone());
+        // Its root may have come first.
+        if state.rooted_banks.get(&event.slot) == Some(&event.bank_id) {
+            Self::take_rooted(&mut state, bank.clone());
+        }
         state.notified.push((bank, std::time::Instant::now()));
         if state.notified.len() > NOTIFIED_KEPT {
             let excess = state.notified.len().saturating_sub(NOTIFIED_KEPT);
@@ -937,25 +941,13 @@ impl Mirror {
         }
         state.rooted.insert(slot);
         state.rooted_banks.insert(slot, bank_id);
-        // The rooted bank as it froze names its parent, so the slots between were skipped; without
-        // it nothing is inferred, as a gap in the events is not a skip.
         let frozen = state
             .frozen
             .get(&slot)
             .filter(|bank| bank.event.bank_id == bank_id)
             .cloned();
         if let Some(bank) = frozen {
-            for skipped in bank.event.parent_slot.saturating_add(1)..slot {
-                let event = missing_block(skipped);
-                state.blocks.insert(skipped, event);
-            }
-            if state
-                .root_bank
-                .as_ref()
-                .is_none_or(|held| held.event.slot <= slot)
-            {
-                state.root_bank = Some(bank);
-            }
+            Self::take_rooted(&mut state, bank);
         }
         let block = state
             .footers
@@ -1229,6 +1221,23 @@ impl Mirror {
         state.schedules.insert(info.epoch, Arc::new(leaders));
         while state.schedules.len() > EPOCHS_KEPT {
             state.schedules.pop_first();
+        }
+    }
+
+    /// A rooted bank as it froze: it names its parent, so the slots between were skipped, and it is
+    /// the root unless a newer one is held. Without it nothing is inferred, as a gap in the events
+    /// is not a skip.
+    fn take_rooted(state: &mut State, bank: Arc<FrozenBank>) {
+        let slot = bank.event.slot;
+        for skipped in bank.event.parent_slot.saturating_add(1)..slot {
+            state.blocks.insert(skipped, missing_block(skipped));
+        }
+        if state
+            .root_bank
+            .as_ref()
+            .is_none_or(|held| held.event.slot <= slot)
+        {
+            state.root_bank = Some(bank);
         }
     }
 
@@ -1696,7 +1705,11 @@ impl Source for Mirror {
         if read.is_none() && own.is_none() && self.own_uncovered(&state, slot) {
             return Block::Pending;
         }
-        let held = own.or(read).or_else(|| state.blocks.get(&slot));
+        let own_read = own.filter(|event| event.kind != BLOCK_OPAQUE);
+        let held = own_read
+            .or(read)
+            .or(own)
+            .or_else(|| state.blocks.get(&slot));
         // Ours, unread at its root, waits for this epoch's set like a block not sent.
         if held.is_some_and(|event| event.kind == BLOCK_OPAQUE) && own.is_none() {
             drop(state);
@@ -2575,6 +2588,21 @@ mod tests {
         mirror.apply_rooted(22, 5);
         mirror.apply_block(&footer_of(22, 5, 220));
         assert!(matches!(mirror.block(22, 30), Block::Footer(facts) if facts.close_nanos == 220));
+    }
+
+    #[test]
+    fn test_a_freeze_after_its_root_still_names_the_skips() {
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
+        mirror.apply_rooted(9, 7);
+        mirror.apply_frozen(&BankFrozenEvent {
+            slot: 9,
+            parent_slot: 6,
+            bank_id: 7,
+            ..empty_frozen()
+        });
+        assert!(matches!(mirror.block(7, 20), Block::Missing));
+        assert!(matches!(mirror.block(8, 20), Block::Missing));
+        assert_eq!(mirror.root_bank().slot(), 9);
     }
 
     #[test]
