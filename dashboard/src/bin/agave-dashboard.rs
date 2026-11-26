@@ -36,7 +36,7 @@ Usage: agave-dashboard --ledger <DIR> [OPTIONS]
   --history-dir <DIR>    Where the page's history is written and read back after a restart
   --poll-ms <MS>         How often the event streams are read [default: 5]
   --report-secs <SECS>   How often the streams' counts are logged [default: 10]
-  --help                 Print this";
+  -h, --help             Print this";
 
 const DEFAULT_PORT: u16 = 10999;
 
@@ -61,8 +61,20 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, St
     let mut report_secs = 10u64;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
-        match arg.as_str() {
+        // `--flag=value` as well as `--flag value`.
+        let (flag, mut inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => {
+                (flag.to_string(), Some(value.to_string()))
+            }
+            _ => (arg, None),
+        };
+        let mut value = |name: &str| {
+            inline
+                .take()
+                .or_else(|| args.next().filter(|next| !next.starts_with("--")))
+                .ok_or(format!("{name} needs a value"))
+        };
+        match flag.as_str() {
             "--help" | "-h" => return Ok(None),
             "--ledger" => ledger = Some(PathBuf::from(value("--ledger")?)),
             "--port" => {
@@ -338,6 +350,18 @@ mod tests {
         assert!(parsed(&["--ledger", "/l", "--events-dir", "/l/events"]).is_err());
         assert!(parsed(&["--ledger", "/l", "--leave-handles"]).is_err());
         assert!(parsed(&["--ledger"]).is_err());
+        assert!(parsed(&["--ledger", "--port", "3011"]).is_err());
+        assert!(parsed(&["--ledger", "/l", "--port", "ten"]).is_err());
+        assert!(parsed(&["--ledger", "/l", "--bind-address", "::1"]).is_err());
         assert_eq!(parsed(&["--help"]), Ok(None));
+    }
+
+    #[test]
+    fn test_a_value_can_follow_an_equals_sign() {
+        let args = parsed(&["--ledger=/ledger", "--port=3011"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(args.ledger, PathBuf::from("/ledger"));
+        assert_eq!(args.listen_addr.port(), 3011);
     }
 }
