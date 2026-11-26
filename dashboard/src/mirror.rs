@@ -625,6 +625,8 @@ struct LedgerSlot {
 struct State {
     node: Option<Node>,
     status: Option<SlotStatusEvent>,
+    /// The newest slot replay began a bank for.
+    begun: Slot,
     epoch: Option<Arc<EpochFacts>>,
     root: Option<SlotClockEvent>,
     working: Option<SlotClockEvent>,
@@ -900,14 +902,12 @@ impl Mirror {
     }
 
     pub fn apply_status(&self, event: &SlotStatusEvent) {
+        self.state.write().unwrap().status = Some(event.clone());
+    }
+
+    pub fn apply_begun(&self, slot: Slot) {
         let mut state = self.state.write().unwrap();
-        // Bank forks keeps the root and drops the banks below it.
-        state.frozen = state.frozen.split_off(&event.root);
-        let floor = event.root.saturating_sub(LEDGER_KEPT);
-        state.rooted = state.rooted.split_off(&floor);
-        let highest = event.highest_slot.max(event.cluster_tip);
-        state.ledger = state.ledger.split_off(&highest.saturating_sub(LEDGER_KEPT));
-        state.status = Some(event.clone());
+        state.begun = state.begun.max(slot);
     }
 
     pub fn apply_frozen(&self, event: &BankFrozenEvent) {
@@ -1024,6 +1024,11 @@ impl Mirror {
 
     pub fn apply_rooted(&self, slot: Slot) {
         let mut state = self.state.write().unwrap();
+        if state.rooted.last().is_none_or(|root| slot > *root) {
+            // Bank forks keeps the root and drops the banks below it.
+            state.frozen = state.frozen.split_off(&slot);
+            state.rooted = state.rooted.split_off(&slot.saturating_sub(LEDGER_KEPT));
+        }
         state.rooted.insert(slot);
         // A root already in the history, as one read after it, is left alone.
         if let Some(history) = state.shared.history.as_mut()
@@ -1109,7 +1114,17 @@ impl Mirror {
     }
 
     pub fn apply_ledger(&self, event: &LedgerSlotEvent) {
-        self.state.write().unwrap().ledger.insert(
+        let mut state = self.state.write().unwrap();
+        if state
+            .ledger
+            .last_key_value()
+            .is_none_or(|(highest, _)| event.slot > *highest)
+        {
+            state.ledger = state
+                .ledger
+                .split_off(&event.slot.saturating_sub(LEDGER_KEPT));
+        }
+        state.ledger.insert(
             event.slot,
             LedgerSlot {
                 first_shred_ms: event.first_shred_ms,
@@ -1282,10 +1297,7 @@ impl Mirror {
     /// Bank forks' highest slot is never below a bank it holds, and frozen banks arrive ahead of
     /// the status that reports it.
     fn highest_of(state: &State) -> Slot {
-        let reported = state
-            .status
-            .as_ref()
-            .map_or(0, |status| status.highest_slot);
+        let reported = state.begun;
         let frozen = state.frozen.keys().next_back().copied().unwrap_or(0);
         let working = state.working.as_ref().map_or(0, |clock| clock.slot);
         reported.max(frozen).max(working)
@@ -1413,12 +1425,16 @@ impl Source for Mirror {
             .as_ref()
             .map_or("development", |node| node.cluster)
     }
+    /// Votor's newest certificate, or the highest slot with shreds where that is higher.
     fn cluster_tip(&self) -> Option<Slot> {
         let state = self.state.read().unwrap();
-        state
-            .status
-            .as_ref()
-            .and_then(|status| status.has_cluster_tip.then_some(status.cluster_tip))
+        let certificate = state.status.as_ref().and_then(|status| {
+            status
+                .has_certificate_slot
+                .then_some(status.certificate_slot)
+        });
+        let shredded = state.ledger.last_key_value().map(|(slot, _)| *slot);
+        certificate.into_iter().chain(shredded).max()
     }
     fn shred_version(&self) -> u16 {
         let state = self.state.read().unwrap();
@@ -1566,16 +1582,15 @@ impl Source for Mirror {
         state.info_changes = changes;
         Some(banks)
     }
+    /// Under alpenglow the root is confirmed and finalized at once.
     fn commitment(&self) -> Commitment {
         let state = self.state.read().unwrap();
-        state
-            .status
-            .as_ref()
-            .map_or_else(Commitment::default, |status| Commitment {
-                root: status.root,
-                confirmed: status.confirmed,
-                finalized: status.finalized,
-            })
+        let root = state.rooted.last().copied().unwrap_or(0);
+        Commitment {
+            root,
+            confirmed: root,
+            finalized: root,
+        }
     }
     fn first_shred_time(&self, slot: Slot) -> Option<u64> {
         let state = self.state.read().unwrap();
@@ -1767,7 +1782,8 @@ mod tests {
         crate::{events::ROLE_WORKING, fixture::fixture, source::Direct},
         solana_core::{
             bank_state_events::{epoch_event, node_event},
-            node_events::output::{clock_event, status_event},
+            node_events::output::clock_event,
+            set_events::status_event,
         },
     };
 
@@ -1932,6 +1948,49 @@ mod tests {
     }
 
     #[test]
+    fn test_the_root_and_tip_come_from_slot_events_shreds_and_the_certificate() {
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
+        let shred = |slot| LedgerSlotEvent {
+            pid: 0,
+            tid: 0,
+            timestamp_ns: 0,
+            slot,
+            has_parent: false,
+            parent_slot: 0,
+            first_shred_ms: 1,
+            full: false,
+        };
+        let status = |certificate_slot| SlotStatusEvent {
+            pid: 0,
+            tid: 0,
+            timestamp_ns: 0,
+            has_certificate_slot: true,
+            certificate_slot,
+            lowest_slot: 2,
+        };
+        assert_eq!(mirror.cluster_tip(), None);
+        mirror.apply_ledger(&shred(10));
+        mirror.apply_ledger(&shred(12));
+        mirror.apply_status(&status(11));
+        assert_eq!(mirror.cluster_tip(), Some(12));
+        mirror.apply_status(&status(20));
+        assert_eq!(mirror.cluster_tip(), Some(20));
+        assert_eq!(mirror.lowest_slot(), 2);
+
+        mirror.apply_rooted(5);
+        mirror.apply_rooted(3);
+        let root = Commitment {
+            root: 5,
+            confirmed: 5,
+            finalized: 5,
+        };
+        assert_eq!(mirror.commitment(), root);
+        mirror.apply_begun(9);
+        mirror.apply_begun(7);
+        assert_eq!(mirror.highest_slot(), 9);
+    }
+
+    #[test]
     fn test_a_kept_catch_up_time_counts_only_for_its_process() {
         assert_eq!(recorded_millis("41 1700 1800\n", "41 1700"), Some(1_800));
         // The same id reused by a later process.
@@ -1952,7 +2011,13 @@ mod tests {
             direct.root_bank().as_bank().unwrap(),
             &vote_account,
         ));
-        mirror.apply_status(&status_event(&harness.reader()));
+        mirror.apply_status(&status_event(
+            &harness.ctx.highest_finalized,
+            &harness.ctx.blockstore,
+        ));
+        // What replay's slot events carry.
+        mirror.apply_rooted(direct.commitment().root);
+        mirror.apply_begun(direct.highest_slot());
         let working = direct.working_bank();
         mirror.apply_epoch(&epoch_event(working.as_bank().unwrap(), &vote_account));
         mirror.apply_clock(&clock_event(

@@ -24,6 +24,7 @@ use {
         },
         resource_limits::{ResourceLimitError, adjust_nofile_limit},
         sample_performance_service::SamplePerformanceService,
+        set_events::SetEvents,
         snapshot_packager_service::SnapshotPackagerService,
         start_events::{StartProgressEvents, SupermajorityWaitEvents},
         stats_reporter_service::StatsReporterService,
@@ -734,6 +735,7 @@ pub struct Validator {
     accounts_background_service: AccountsBackgroundService,
     xdp_transmitter: Option<Transmitter>,
     bank_state_events: BankStateEvents,
+    set_events: SetEvents,
     node_events: NodeEvents,
     start_progress_events: StartProgressEvents,
     // This runtime is used to run the client owned by SendTransactionService.
@@ -1918,6 +1920,14 @@ impl Validator {
             exit.clone(),
         )
         .map_err(ValidatorError::Other)?;
+        let set_events = SetEvents::new(
+            &event_system,
+            cluster_info.clone(),
+            blockstore.clone(),
+            highest_finalized.clone(),
+            exit.clone(),
+        )
+        .map_err(ValidatorError::Other)?;
         let node_events = NodeEvents::new(
             &event_system,
             Reader::new(
@@ -1984,6 +1994,7 @@ impl Validator {
             accounts_background_service,
             xdp_transmitter,
             bank_state_events,
+            set_events,
             node_events,
             start_progress_events,
             _tpu_client_next_runtime: tpu_client_next_runtime,
@@ -2148,6 +2159,7 @@ impl Validator {
         self.tpu.join().expect("tpu");
         self.tvu.join().expect("tvu");
         self.bank_state_events.join().expect("bank_state_events");
+        self.set_events.join().expect("set_events");
         self.node_events.join().expect("node_events");
         self.start_progress_events
             .join()

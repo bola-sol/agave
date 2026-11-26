@@ -485,7 +485,7 @@ pub fn history_events(history: &SlotHistory, generation: u64) -> Vec<SlotHistory
 
 /// Publishes in batches with a pause between, so a set larger than the stream's capacity arrives
 /// whole when the subscriber drains within the pauses.
-fn publish_paced<E: agave_event_system::Event>(
+pub(crate) fn publish_paced<E: agave_event_system::Event>(
     publisher: &mut Publisher<E>,
     events: &[E],
     exit: &AtomicBool,
@@ -504,7 +504,7 @@ fn publish_paced<E: agave_event_system::Event>(
 }
 
 /// Everything but the header, which decides whether an event changed.
-trait Unstamped: Clone + PartialEq {
+pub(crate) trait Unstamped: Clone + PartialEq {
     fn unstamped(&self) -> Self;
 }
 
@@ -523,23 +523,27 @@ macro_rules! unstamped {
     )*};
 }
 
-unstamped!(NodeInfoEvent, EpochEvent);
+unstamped!(
+    NodeInfoEvent,
+    EpochEvent,
+    crate::node_events::types::SlotStatusEvent
+);
 
 /// Sends an event when it changes, when its stream turns on, and with each full set.
-struct Latest<E: agave_event_system::Event + Unstamped> {
+pub(crate) struct Latest<E: agave_event_system::Event + Unstamped> {
     publisher: Publisher<E>,
     sent: Option<E>,
 }
 
 impl<E: agave_event_system::Event + Unstamped> Latest<E> {
-    fn new(publisher: Publisher<E>) -> Self {
+    pub(crate) fn new(publisher: Publisher<E>) -> Self {
         Self {
             publisher,
             sent: None,
         }
     }
 
-    fn enabled(&mut self) -> bool {
+    pub(crate) fn enabled(&mut self) -> bool {
         let on = self.publisher.is_enabled();
         if !on {
             self.sent = None;
@@ -547,7 +551,7 @@ impl<E: agave_event_system::Event + Unstamped> Latest<E> {
         on
     }
 
-    fn offer(&mut self, event: E, due: bool) {
+    pub(crate) fn offer(&mut self, event: E, due: bool) {
         let key = event.unstamped();
         if due || self.sent.as_ref() != Some(&key) {
             let _ = self.publisher.publish(&event);
@@ -556,7 +560,7 @@ impl<E: agave_event_system::Event + Unstamped> Latest<E> {
     }
 }
 
-fn publisher<E: agave_event_system::Event>(
+pub(crate) fn publisher<E: agave_event_system::Event>(
     event_system: &EventSystem,
     name: StreamName,
     capacity: usize,

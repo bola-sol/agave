@@ -220,22 +220,6 @@ impl Fixture {
         }
     }
 
-    /// The node events' reader over the same handles.
-    pub fn reader(&self) -> solana_core::node_events::reader::Reader {
-        let ctx = &self.ctx;
-        solana_core::node_events::reader::Reader::new(
-            ctx.cluster_info.clone(),
-            ctx.bank_forks.clone(),
-            ctx.block_commitment_cache.clone(),
-            ctx.blockstore.clone(),
-            ctx.leader_schedule_cache.clone(),
-            ctx.vote_account,
-            ctx.highest_finalized.clone(),
-            ctx.account_paths.clone(),
-            ctx.snapshot_config.clone(),
-        )
-    }
-
     pub fn meters(&self) -> Meters {
         // A tap of its own rather than the process-wide one, which would carry
         // whatever the rest of the suite measured.

@@ -15,16 +15,13 @@ use {
         },
         reader::Reader,
         types::{
-            ADDR_ALPENGLOW, ADDR_BYTES, ADDR_GOSSIP, ADDR_RPC, ADDR_SERVE_REPAIR_UDP,
-            ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC, ADDR_TPU_VOTE_UDP,
-            ADDR_TVU_UDP, ADDRS, BITMAP_BYTES, BLOCK_FOOTER, BLOCK_MISSING, BLOCK_OPAQUE,
-            BLOCK_STREAM, BlockEvent, FINALIZATION_RANKS, FINALIZATION_STREAM, FinalizationEvent,
-            GOSSIP_PEER_STREAM, GossipPeerEvent, ICON_BYTES, INFO_CHANGE, INFO_FULL_SET,
-            LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM, MessageVersionsEvent,
-            NAME_BYTES, OUTCOME_FAILED, OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN, OWN_BLOCK_STREAM,
-            OwnBlockEvent, OwnSetPlace, ROLE_ROOT, ROLE_WORKING, SLOT_CLOCK_STREAM,
-            SLOT_STATUS_STREAM, SlotClockEvent, SlotStatusEvent, TX_OUTCOME_STREAM, TxOutcomeEvent,
-            VALIDATOR_INFO_STREAM, ValidatorInfoEvent, pack_addr, pack_str,
+            BITMAP_BYTES, BLOCK_FOOTER, BLOCK_MISSING, BLOCK_OPAQUE, BLOCK_STREAM, BlockEvent,
+            FINALIZATION_RANKS, FINALIZATION_STREAM, FinalizationEvent, ICON_BYTES, INFO_CHANGE,
+            INFO_FULL_SET, LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM,
+            MessageVersionsEvent, NAME_BYTES, OUTCOME_FAILED, OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN,
+            OWN_BLOCK_STREAM, OwnBlockEvent, OwnSetPlace, ROLE_ROOT, ROLE_WORKING,
+            SLOT_CLOCK_STREAM, SlotClockEvent, TX_OUTCOME_STREAM, TxOutcomeEvent,
+            VALIDATOR_INFO_STREAM, ValidatorInfoEvent, pack_str,
         },
     },
     agave_event_system::{
@@ -107,7 +104,7 @@ macro_rules! keyed {
     )*};
 }
 
-keyed!(SlotStatusEvent, SlotClockEvent);
+keyed!(SlotClockEvent);
 
 /// Sends an event when its content changes, when its stream turns on, and every [`RESEND`].
 struct Resent<E: Event> {
@@ -146,8 +143,6 @@ impl<E: Event + Keyed> Resent<E> {
 
 /// Slots below the highest whose blockstore records are watched.
 const LEDGER_WINDOW: u64 = 64;
-/// How often the gossip table goes out whole.
-const PEERS_EVERY: Duration = Duration::from_secs(15);
 /// How often our blocks this epoch go out whole, besides at turn-on and a new epoch or identity.
 const OWN_EVERY: Duration = Duration::from_secs(10);
 /// How often every validator info entry goes out; changes go out as banks freeze.
@@ -176,8 +171,6 @@ type InfoScan = JoinHandle<(
 )>;
 
 pub(crate) struct EventOutput {
-    peers: Publisher<GossipPeerEvent>,
-    peers_sent: Option<(u64, Instant)>,
     info: Publisher<ValidatorInfoEvent>,
     info_sent: Option<(u64, Instant)>,
     /// Every name, scanned at turn-on and kept current from frozen banks, sent whole every
@@ -209,7 +202,6 @@ pub(crate) struct EventOutput {
     /// Our blocks this epoch read so far; `None` while the stream is off or the schedule unknown.
     own: Option<OwnBlocks>,
     own_generation: u64,
-    status: Resent<SlotStatusEvent>,
     root: Resent<SlotClockEvent>,
     working: Resent<SlotClockEvent>,
 }
@@ -221,8 +213,6 @@ impl EventOutput {
             return Err(io::Error::other("no publishers"));
         };
         Ok(Self {
-            peers: stream(event_system, GOSSIP_PEER_STREAM, 16_384)?,
-            peers_sent: None,
             info: stream(event_system, VALIDATOR_INFO_STREAM, 8192)?,
             info_sent: None,
             info_cache: ValidatorInfoCache::default(),
@@ -243,7 +233,6 @@ impl EventOutput {
             own_blocks: stream(event_system, OWN_BLOCK_STREAM, 1024)?,
             own: None,
             own_generation: 0,
-            status: Resent::new(stream(event_system, SLOT_STATUS_STREAM, 256)?),
             working: Resent::new(working),
             root: Resent::new(root),
         })
@@ -274,30 +263,22 @@ impl EventOutput {
         self.send_blocks(src, root_bank.as_ref(), now);
         self.send_own_blocks(src, root_bank.as_ref(), now);
         self.send_blocks_read(src);
-        self.send_peers(src, now);
         self.send_info(src, now);
         self.send_frozen_reads(src);
-        let wants_banks = [
-            self.status.enabled(),
-            self.root.enabled(),
-            self.working.enabled(),
-        ];
+        let wants_banks = [self.root.enabled(), self.working.enabled()];
         if !wants_banks.contains(&true) {
             return;
-        }
-        if wants_banks[0] {
-            self.status.offer(status_event(src), now);
         }
         let working = src.working_bank();
         let identity = src.identity();
         let vote_account = src.vote_account();
-        if wants_banks[2] {
+        if wants_banks[1] {
             self.working.offer(
                 clock_event(ROLE_WORKING, working.as_ref(), &identity, &vote_account),
                 now,
             );
         }
-        if wants_banks[1] {
+        if wants_banks[0] {
             self.root.offer(
                 clock_event(ROLE_ROOT, root_bank.as_ref(), &identity, &vote_account),
                 now,
@@ -352,52 +333,6 @@ impl EventOutput {
     }
 
     /// The gossip table whole, with each peer's advertised snapshots.
-    fn send_peers(&mut self, src: &Reader, now: Instant) {
-        if !self.peers.is_enabled() {
-            self.peers_sent = None;
-            return;
-        }
-        let generation = match self.peers_sent {
-            Some((_, at)) if now.duration_since(at) < PEERS_EVERY => return,
-            Some((generation, _)) => generation.saturating_add(1),
-            None => 1,
-        };
-        self.peers_sent = Some((generation, now));
-        let peers = src.all_peers();
-        let keys: Vec<solana_pubkey::Pubkey> = peers.iter().map(|(peer, _)| peer.pubkey).collect();
-        let snapshots = src.snapshot_slots(&keys);
-        let (pid, tid, timestamp_ns) = header();
-        let count = u32::try_from(peers.len()).unwrap_or(u32::MAX);
-        let events: Vec<GossipPeerEvent> = peers
-            .iter()
-            .zip(snapshots)
-            .zip(0u32..)
-            .map(
-                |(((peer, heard_ms), (full, incremental)), index)| GossipPeerEvent {
-                    pid,
-                    tid,
-                    timestamp_ns,
-                    generation,
-                    index,
-                    count,
-                    pubkey: peer.pubkey.to_bytes(),
-                    client: pack_str(&peer.client),
-                    version: pack_str(&peer.version),
-                    wallclock: peer.wallclock,
-                    outset: peer.outset,
-                    shred_version: peer.shred_version,
-                    addrs: pack_addrs(peer),
-                    heard_ms: *heard_ms,
-                    has_full_snapshot: full.is_some(),
-                    full_snapshot: full.unwrap_or(0),
-                    has_incremental_snapshot: incremental.is_some(),
-                    incremental_snapshot: incremental.unwrap_or(0),
-                },
-            )
-            .collect();
-        publish_paced(&mut self.peers, &events);
-    }
-
     /// Every name, scanned off this thread at turn-on and kept current from frozen banks, so a
     /// subscriber that joins late waits at most `INFO_EVERY`.
     fn send_info(&mut self, src: &Reader, now: Instant) {
@@ -764,27 +699,6 @@ pub fn own_block_events(
         .collect()
 }
 
-fn pack_addrs(peer: &super::bank_view::PeerRow) -> [u8; ADDRS * ADDR_BYTES] {
-    let mut addrs = [0u8; ADDRS * ADDR_BYTES];
-    for (at, addr) in [
-        (ADDR_GOSSIP, peer.gossip),
-        (ADDR_RPC, peer.rpc),
-        (ADDR_TVU_UDP, peer.tvu_udp),
-        (ADDR_TPU_QUIC, peer.tpu_quic),
-        (ADDR_TPU_FORWARDS_QUIC, peer.tpu_forwards_quic),
-        (ADDR_TPU_VOTE_UDP, peer.tpu_vote_udp),
-        (ADDR_TPU_VOTE_QUIC, peer.tpu_vote_quic),
-        (ADDR_SERVE_REPAIR_UDP, peer.serve_repair_udp),
-        (ADDR_ALPENGLOW, peer.alpenglow),
-    ] {
-        let start = at.saturating_mul(ADDR_BYTES);
-        if let Some(slot) = addrs.get_mut(start..start.saturating_add(ADDR_BYTES)) {
-            slot.copy_from_slice(&pack_addr(addr));
-        }
-    }
-    addrs
-}
-
 pub fn info_events(
     reason: u8,
     generation: u64,
@@ -967,24 +881,6 @@ pub fn block_event(slot: solana_clock::Slot, block: Block) -> BlockEvent {
 fn header() -> (i32, i32, u64) {
     let (tid, pid) = cached_thread_and_process_id();
     (pid, tid, monotonic_timestamp_ns())
-}
-
-pub fn status_event(src: &Reader) -> SlotStatusEvent {
-    let (pid, tid, timestamp_ns) = header();
-    let commitment = src.commitment();
-    let tip = src.cluster_tip();
-    SlotStatusEvent {
-        pid,
-        tid,
-        timestamp_ns,
-        root: commitment.root,
-        confirmed: commitment.confirmed,
-        finalized: commitment.finalized,
-        highest_slot: src.highest_slot(),
-        has_cluster_tip: tip.is_some(),
-        cluster_tip: tip.unwrap_or(0),
-        lowest_slot: src.lowest_slot(),
-    }
 }
 
 pub fn clock_event(
