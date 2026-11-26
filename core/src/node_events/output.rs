@@ -187,7 +187,7 @@ type InfoScan = JoinHandle<(
     Vec<(solana_pubkey::Pubkey, ValidatorInfo)>,
 )>;
 
-pub struct EventOutput {
+pub(crate) struct EventOutput {
     peers: Publisher<GossipPeerEvent>,
     peers_sent: Option<(u64, Instant)>,
     info: Publisher<ValidatorInfoEvent>,
@@ -198,6 +198,8 @@ pub struct EventOutput {
     /// The scan running at turn-on.
     info_scan: Option<InfoScan>,
     info_scanned: bool,
+    /// The running scan began before the stream last turned off.
+    info_scan_stale: bool,
     catch_up: CatchUp,
     finalization: Publisher<FinalizationEvent>,
     /// Frozen banks already read for finalization and validator info changes; `None` while both
@@ -233,7 +235,7 @@ pub struct EventOutput {
 }
 
 impl EventOutput {
-    pub fn new(event_system: &EventSystem) -> io::Result<Self> {
+    pub(crate) fn new(event_system: &EventSystem) -> io::Result<Self> {
         let mut clock = publishers::<SlotClockEvent>(event_system, SLOT_CLOCK_STREAM, 256, 2)?;
         let (Some(working), Some(root)) = (clock.pop(), clock.pop()) else {
             return Err(io::Error::other("no publishers"));
@@ -246,6 +248,7 @@ impl EventOutput {
             info_cache: ValidatorInfoCache::default(),
             info_scan: None,
             info_scanned: false,
+            info_scan_stale: false,
             catch_up: CatchUp::default(),
             finalization: stream(event_system, FINALIZATION_STREAM, 1024)?,
             frozen_seen: None,
@@ -274,9 +277,13 @@ impl EventOutput {
     }
 
     /// Runs on its own thread until `exit`.
-    pub fn spawn(mut self, src: Arc<Reader>, exit: Arc<AtomicBool>) -> io::Result<JoinHandle<()>> {
+    pub(crate) fn spawn(
+        mut self,
+        src: Arc<Reader>,
+        exit: Arc<AtomicBool>,
+    ) -> io::Result<JoinHandle<()>> {
         thread::Builder::new()
-            .name("solEvtDash".to_string())
+            .name("solEvtNode".to_string())
             .spawn(move || {
                 while !exit.load(Ordering::Relaxed) {
                     self.tick(&src);
@@ -437,35 +444,56 @@ impl EventOutput {
         if !self.info.is_enabled() {
             self.info_sent = None;
             self.info_cache = ValidatorInfoCache::default();
-            self.info_scan = None;
             self.info_scanned = false;
+            // A running scan is left to finish and is replaced at the next turn-on.
+            self.info_scan_stale = self.info_scan.is_some();
             return;
         }
-        if self.info_scan.as_ref().is_some_and(JoinHandle::is_finished) {
-            self.info_scanned = true;
-            if let Some(Ok((slot, entries))) = self.info_scan.take().map(JoinHandle::join) {
-                self.info_cache.merge(slot, entries);
-            }
-        } else if self.info_scan.is_none() && !self.info_scanned {
-            let bank = src.bank_forks.read().unwrap().root_bank();
-            self.info_scan = thread::Builder::new()
-                .name("solEvtInfo".to_string())
-                .spawn(move || (bank.slot(), super::info::scan_all(&bank)))
-                .ok();
+        if !self.info_scanned {
+            self.read_info_scan(src);
+        }
+        // A full set waits for the scan.
+        if !self.info_scanned || self.info_cache.is_empty() {
+            return;
         }
         let generation = match self.info_sent {
             Some((_, at)) if now.duration_since(at) < INFO_EVERY => return,
             Some((generation, _)) => generation.saturating_add(1),
             None => 1,
         };
-        // Tried again next tick until the scan has read some.
-        if self.info_cache.is_empty() {
-            return;
-        }
         let (slot, entries) = self.info_cache.entries();
         let events = info_events(INFO_FULL_SET, generation, slot, &entries);
         publish_paced(&mut self.info, &events);
         self.info_sent = Some((generation, now));
+    }
+
+    /// Starts the scan of the root bank off this thread, one at a time and not joined at exit,
+    /// and takes its result with the writes of the banks frozen above that root.
+    fn read_info_scan(&mut self, src: &Reader) {
+        match &self.info_scan {
+            Some(scan) if !scan.is_finished() => return,
+            Some(_) => {
+                let result = self.info_scan.take().map(JoinHandle::join);
+                if !std::mem::take(&mut self.info_scan_stale) {
+                    self.info_scanned = true;
+                    if let Some(Ok((root, entries))) = result {
+                        self.info_cache.merge(root, entries);
+                        for (slot, bank) in src.banks().frozen {
+                            if slot > root {
+                                self.info_cache.merge(slot, bank.validator_info_changed());
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+            None => {}
+        }
+        let bank = src.bank_forks.read().unwrap().root_bank();
+        self.info_scan = thread::Builder::new()
+            .name("solEvtInfo".to_string())
+            .spawn(move || (bank.slot(), super::info::scan_all(&bank)))
+            .ok();
     }
 
     /// Each new frozen bank's finalization reading and the validator info entries it changed.
@@ -857,7 +885,7 @@ pub fn info_events(
 
 /// What the finalization share reads of a frozen bank: its ranked accounts' last votes against
 /// the newest.
-pub fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEvent> {
+pub(crate) fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEvent> {
     if !bank.is_alpenglow() {
         return None;
     }
@@ -1265,7 +1293,7 @@ pub fn clock_event(
 }
 
 /// Publishes the datapoints the forwarder hands over, each on its row's stream.
-pub struct MetricOutput {
+pub(crate) struct MetricOutput {
     slot: Publisher<MetricSlot>,
     leader: Publisher<MetricLeader>,
     votor: Publisher<MetricVotor>,
@@ -1277,7 +1305,7 @@ pub struct MetricOutput {
 }
 
 impl MetricOutput {
-    pub fn new(event_system: &EventSystem) -> io::Result<Self> {
+    pub(crate) fn new(event_system: &EventSystem) -> io::Result<Self> {
         Ok(Self {
             slot: stream(event_system, METRIC_SLOT_STREAM, 4096)?,
             // Workers report every 20 ms each.
@@ -1293,11 +1321,14 @@ impl MetricOutput {
     }
 
     /// Runs on its own thread until `exit`, turning forwarding on while any stream is.
-    pub fn spawn(mut self, exit: Arc<AtomicBool>) -> io::Result<JoinHandle<()>> {
+    pub(crate) fn spawn(mut self, exit: Arc<AtomicBool>) -> io::Result<Option<JoinHandle<()>>> {
         // Bounded, so a stalled publisher drops points rather than holding memory.
         let (sender, points) = crossbeam_channel::bounded(METRIC_QUEUE);
         let tap = MetricForward::global().clone();
-        tap.forward_to(sender);
+        if !tap.forward_to(sender) {
+            log::warn!("node events: another validator in this process publishes the metrics");
+            return Ok(None);
+        }
         thread::Builder::new()
             .name("solEvtMetric".to_string())
             .spawn(move || {
@@ -1326,6 +1357,7 @@ impl MetricOutput {
                 }
                 tap.set_forwarding(false);
             })
+            .map(Some)
     }
 
     fn enabled(&mut self) -> bool {

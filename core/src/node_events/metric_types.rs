@@ -1,6 +1,5 @@
-//! The metrics datapoints the dashboard reads, as typed events: one stream per row of the
-//! events list, one variant per datapoint, one field per field the tap reads. Test branch only.
-//! Values pass through as the datapoint reports them.
+//! Metrics datapoints as typed events: one stream per row of the events list, one variant per
+//! datapoint, one field per field a reader uses. Values pass through as the datapoint reports them.
 
 use {
     agave_event_system::{event, stream_name::StreamName},

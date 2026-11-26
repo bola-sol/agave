@@ -1,6 +1,6 @@
 //! Validator display names from on-chain `ValidatorInfo` config accounts,
 //! found by owner through the secondary index and kept current from each
-//! slot's writes. Without the index the dashboard shows pubkeys.
+//! slot's writes. Without the index no names are read.
 
 use {
     serde::{Deserialize, Serialize},
@@ -90,7 +90,7 @@ impl ValidatorInfoCache {
             match serde_json::to_string(&self.displays()) {
                 Ok(json) => Arc::from(json),
                 Err(err) => {
-                    log::error!("dashboard: failed to encode the display table: {err}");
+                    log::error!("node events: failed to encode the display table: {err}");
                     Arc::from("null")
                 }
             }
@@ -144,8 +144,8 @@ pub fn scan_all(bank: &Bank) -> Vec<(Pubkey, ValidatorInfo)> {
     // validator, which takes hours and cannot be interrupted.
     if !bank.account_indexes_include_key(&config_id) {
         log::info!(
-            "dashboard: the config program is excluded from the account index, so validator names \
-             are unavailable and the dashboard will show pubkeys"
+            "node events: the config program is excluded from the account index, so validator \
+             names are unavailable"
         );
         return Vec::new();
     }
@@ -157,7 +157,7 @@ pub fn scan_all(bank: &Bank) -> Vec<(Pubkey, ValidatorInfo)> {
     ) {
         Ok(accounts) => accounts,
         Err(err) => {
-            log::warn!("dashboard: could not read validator info accounts: {err}");
+            log::warn!("node events: could not read validator info accounts: {err}");
             return Vec::new();
         }
     };
@@ -166,9 +166,9 @@ pub fn scan_all(bank: &Bank) -> Vec<(Pubkey, ValidatorInfo)> {
     // index never built answers none rather than failing.
     if accounts.is_empty() {
         log::info!(
-            "dashboard: found no validator info accounts. Start the validator with \
-             --account-index program-id --account-index-include-key {config_id} to show validator \
-             names instead of pubkeys"
+            "node events: found no validator info accounts. Start the validator with \
+             --account-index program-id --account-index-include-key {config_id} to read validator \
+             names"
         );
     }
 

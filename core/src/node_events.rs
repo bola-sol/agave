@@ -1,4 +1,4 @@
-//! The node's state as event streams, for a dashboard in its own process: banks, ledger, gossip,
+//! The node's state as event streams, for a monitor in its own process: banks, ledger, gossip,
 //! validator info, the node's catch-up and the metrics datapoints.
 
 pub mod bank_view;
@@ -37,7 +37,7 @@ impl NodeEvents {
         let events = EventOutput::new(event_system)?.spawn(Arc::new(reader), exit.clone())?;
         let metrics = MetricOutput::new(event_system)?.spawn(exit)?;
         Ok(Self {
-            threads: vec![events, metrics],
+            threads: std::iter::once(events).chain(metrics).collect(),
         })
     }
 

@@ -1,4 +1,4 @@
-//! When the node caught up with the cluster after starting, as the dashboard reads it.
+//! When the node caught up with the cluster after starting.
 
 use {
     super::reader::Reader,
@@ -6,29 +6,31 @@ use {
     std::time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// How far behind the cluster's tip, in blocks, still counts as in step.
-const IN_STEP_SLOTS: u64 = 4;
+/// The tip counts the slot still arriving, so a node in step reads a slot or two behind it.
+pub const IN_STEP_SLOTS: u64 = 4;
 /// Parents walked down from the tip before the rest of the distance is counted in slots.
 const BEHIND_WALK_BLOCKS: u64 = 32;
 const CHECK_EVERY: Duration = Duration::from_secs(1);
 
 /// Latched once: the node trailed the cluster, then came within `IN_STEP_SLOTS` of its tip. A node
-/// in step at its first reading never trailed and has no catch-up time.
+/// in step at its first reading never trailed and has no catch-up time. Checked no more after the
+/// first reading in step.
 #[derive(Debug, Default)]
-pub struct CatchUp {
+pub(crate) struct CatchUp {
     trailed: bool,
+    in_step: bool,
     /// Unix milliseconds, 0 before.
     caught_up_ms: u64,
     checked: Option<Instant>,
 }
 
 impl CatchUp {
-    pub fn caught_up_ms(&self) -> u64 {
+    pub(crate) fn caught_up_ms(&self) -> u64 {
         self.caught_up_ms
     }
 
-    pub fn check(&mut self, reader: &Reader, now: Instant) {
-        if self.caught_up_ms != 0
+    pub(crate) fn check(&mut self, reader: &Reader, now: Instant) {
+        if self.in_step
             || self
                 .checked
                 .is_some_and(|at| now.duration_since(at) < CHECK_EVERY)
@@ -52,12 +54,15 @@ impl CatchUp {
     }
 
     fn observe(&mut self, behind: u64, now_ms: u64) {
-        if self.caught_up_ms != 0 {
+        if self.in_step {
             return;
         }
         if behind > IN_STEP_SLOTS {
             self.trailed = true;
-        } else if self.trailed {
+            return;
+        }
+        self.in_step = true;
+        if self.trailed {
             self.caught_up_ms = now_ms.max(1);
         }
     }
@@ -94,7 +99,10 @@ mod tests {
     fn test_a_node_that_never_trailed_has_no_catch_up_time() {
         let mut catch_up = CatchUp::default();
         catch_up.observe(1, 100);
-        catch_up.observe(0, 200);
+        assert!(catch_up.in_step);
+        // A later stall and recovery is not a catch-up after starting.
+        catch_up.observe(50, 200);
+        catch_up.observe(0, 300);
         assert_eq!(catch_up.caught_up_ms(), 0);
     }
 

@@ -1,5 +1,5 @@
-//! Streams the dashboard publishes from inside the validator, so a dashboard in a process of its
-//! own can rebuild what this one reads. Test branch only. Timestamps are monotonic nanoseconds.
+//! The node event types, from which a process of its own can rebuild the node's state.
+//! Timestamps are monotonic nanoseconds.
 
 use {
     agave_event_system::{event, stream_name::StreamName},
@@ -41,7 +41,7 @@ pub const ADDR_ALPENGLOW: usize = 8;
 pub const ADDRS: usize = 9;
 pub const ADDR_BYTES: usize = 18;
 
-/// The node: keys, build, contact, and the paths a dashboard reads disks and snapshots from.
+/// The node: keys, build, contact, and the paths of its ledger, accounts and snapshots.
 #[event]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeInfoEvent {

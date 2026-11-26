@@ -96,10 +96,7 @@ fn json_or_null<T: Serialize>(value: &T) -> Arc<str> {
 /// Stakes and gossip versions move slowly; the schedule's leader conditions read them.
 const LEADER_TRAITS_EVERY: Duration = Duration::from_secs(10);
 
-/// The tip counts the slot still arriving, so a node in step reads a slot or two behind it.
-const IN_STEP_SLOTS: u64 = 4;
-/// Parents walked down from the tip before the rest of the distance is counted in slots.
-const BEHIND_WALK_BLOCKS: u64 = 32;
+use solana_core::node_events::catch_up::{IN_STEP_SLOTS, walk_behind};
 const SNAPSHOT_READ: Duration = Duration::from_secs(1);
 
 /// Replies to requests, encoded by the collector and handed out by the server as they stand.
@@ -821,14 +818,16 @@ impl Collector {
         let cluster_tip = self.src.cluster_tip();
         self.cluster_tip = cluster_tip;
         // Measured against the cluster's tip, not this node's own view, which
-        // lags when replay lags.
-        let behind_cluster = cluster_tip.map(|tip| {
-            walk_behind(
-                |slot| self.src.parent_of(slot),
-                tip,
-                self.last_completed_slot,
-            )
-        });
+        // lags when replay lags. Not before a completed slot is known, which would read as far behind.
+        let behind_cluster = cluster_tip
+            .filter(|_| self.last_completed_slot > 0)
+            .map(|tip| {
+                walk_behind(
+                    |slot| self.src.parent_of(slot),
+                    tip,
+                    self.last_completed_slot,
+                )
+            });
         self.mark_caught_cluster(behind_cluster);
         self.collect_leaders(&root_bank, highest_slot);
         self.collect_slot_levels(&root_bank, &frozen);
@@ -2362,21 +2361,6 @@ impl Collector {
             self.metrics_tap.stake_in_gossip(),
         );
     }
-}
-
-/// Blocks on the tip's chain that replay has yet to complete, so slots the cluster skipped are not
-/// distance. Past the walk, or below a slot whose parent is unknown, the rest is counted in slots.
-fn walk_behind(parent_of: impl Fn(Slot) -> Option<Slot>, tip: Slot, completed: Slot) -> u64 {
-    let mut slot = tip;
-    let mut blocks = 0u64;
-    while slot > completed && blocks < BEHIND_WALK_BLOCKS {
-        let Some(parent) = parent_of(slot) else {
-            break;
-        };
-        blocks = blocks.saturating_add(1);
-        slot = parent;
-    }
-    blocks.saturating_add(slot.saturating_sub(completed))
 }
 
 fn measure_replay_rate(window: &VecDeque<(Instant, Slot)>) -> Option<f64> {
