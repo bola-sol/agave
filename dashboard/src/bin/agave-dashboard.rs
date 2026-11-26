@@ -124,9 +124,12 @@ fn hangup_ignored() -> bool {
         .is_some_and(|mask| mask & 1 != 0)
 }
 
-/// Sets `stop` on SIGTERM, SIGINT or SIGHUP, so a closed terminal also drops the subscribers.
-/// SIGHUP is left alone when it was ignored at start, so `nohup` keeps it running.
-fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<thread::JoinHandle<()>> {
+/// Sets `stop` and `signalled` on SIGTERM, SIGINT or SIGHUP, so a closed terminal also drops the
+/// subscribers. SIGHUP is left alone when it was ignored at start, so `nohup` keeps it running.
+fn watch_signals(
+    stop: Arc<AtomicBool>,
+    signalled: Arc<AtomicBool>,
+) -> std::io::Result<thread::JoinHandle<()>> {
     let watch_hangup = !hangup_ignored();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -160,6 +163,7 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<thread::JoinHandle<()
                     _ = int.recv() => log::info!("events: SIGINT"),
                     _ = hangup => log::info!("events: SIGHUP"),
                 }
+                signalled.store(true, Ordering::Relaxed);
                 stop.store(true, Ordering::Relaxed);
             });
         })
@@ -197,7 +201,9 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-    if let Err(err) = watch_signals(exit.clone()) {
+    // A signal also cancels a start again that is under way.
+    let signalled = Arc::new(AtomicBool::new(false));
+    if let Err(err) = watch_signals(exit.clone(), signalled.clone()) {
         eprintln!("signals: {err}");
         return ExitCode::FAILURE;
     }
@@ -273,7 +279,7 @@ fn main() -> ExitCode {
     if service.join().is_err() {
         log::error!("events: a dashboard thread panicked");
     }
-    if restart {
+    if restart && !signalled.load(Ordering::Relaxed) {
         let mut argv = std::env::args_os();
         let program = argv.next().unwrap_or_else(|| "agave-dashboard".into());
         let err = Command::new(program).args(argv).exec();
