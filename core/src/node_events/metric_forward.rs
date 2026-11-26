@@ -9,7 +9,7 @@ use {
     std::{
         sync::{
             Arc, Mutex, MutexGuard, OnceLock, PoisonError,
-            atomic::{AtomicBool, AtomicU64, Ordering},
+            atomic::{AtomicBool, Ordering},
         },
         time::{SystemTime, UNIX_EPOCH},
     },
@@ -31,7 +31,6 @@ struct Latched {
 pub struct MetricForward {
     forward: OnceLock<Sender<(DataPoint, u64)>>,
     forwarding: AtomicBool,
-    forward_drops: AtomicU64,
     latched: Mutex<Latched>,
 }
 
@@ -52,23 +51,18 @@ impl MetricForward {
         }
     }
 
-    /// Hands every point a metric stream carries to `sender` while forwarding is on. Set once; a
-    /// second call is ignored.
-    pub fn forward_to(&self, sender: Sender<(DataPoint, u64)>) {
-        let _ = self.forward.set(sender);
+    /// Hands every point a metric stream carries to `sender` while forwarding is on. Set once;
+    /// whether this call set it.
+    pub(crate) fn forward_to(&self, sender: Sender<(DataPoint, u64)>) -> bool {
+        self.forward.set(sender).is_ok()
     }
 
-    pub fn set_forwarding(&self, on: bool) {
+    pub(crate) fn set_forwarding(&self, on: bool) {
         self.forwarding.store(on, Ordering::Relaxed);
     }
 
-    /// Points the forwarding queue had no room for.
-    pub fn forward_drops(&self) -> u64 {
-        self.forward_drops.load(Ordering::Relaxed)
-    }
-
     /// Points sent once an hour, a run or an epoch, with when each was observed.
-    pub fn latched_points(&self) -> Vec<(DataPoint, u64)> {
+    pub(crate) fn latched_points(&self) -> Vec<(DataPoint, u64)> {
         let latched = locked(&self.latched);
         latched
             .once
@@ -85,12 +79,9 @@ impl MetricForward {
         if !self.forwarding.load(Ordering::Relaxed) || !carried(point.name) {
             return;
         }
-        let sent = self
-            .forward
-            .get()
-            .is_some_and(|sender| sender.try_send((point.clone(), now_millis)).is_ok());
-        if !sent {
-            self.forward_drops.fetch_add(1, Ordering::Relaxed);
+        // A full queue costs the point.
+        if let Some(sender) = self.forward.get() {
+            let _ = sender.try_send((point.clone(), now_millis));
         }
     }
 

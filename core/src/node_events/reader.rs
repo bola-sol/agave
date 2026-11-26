@@ -25,16 +25,16 @@ use {
 
 /// The validator's handles the node events read.
 pub struct Reader {
-    pub cluster_info: Arc<ClusterInfo>,
-    pub bank_forks: Arc<RwLock<BankForks>>,
-    pub block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
-    pub blockstore: Arc<Blockstore>,
-    pub leader_schedule_cache: Arc<LeaderScheduleCache>,
-    pub vote_account: Pubkey,
+    cluster_info: Arc<ClusterInfo>,
+    pub(crate) bank_forks: Arc<RwLock<BankForks>>,
+    block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+    blockstore: Arc<Blockstore>,
+    leader_schedule_cache: Arc<LeaderScheduleCache>,
+    vote_account: Pubkey,
     /// Votor's newest finalization certificate.
-    pub highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
-    pub account_paths: Vec<PathBuf>,
-    pub snapshot_config: Option<SnapshotConfig>,
+    highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
+    account_paths: Vec<PathBuf>,
+    snapshot_config: Option<SnapshotConfig>,
     /// The working and root banks without bank forks' lock.
     sharable_banks: SharableBanks,
 }
