@@ -1,7 +1,7 @@
 //! Fee payers whose transactions fail in our blocks, against the same payers in other leaders'
 //! blocks, for this epoch and the last.
 
-pub use solana_core::node_events::blocks::{TxOutcome, tx_outcomes};
+pub use crate::blocks::{TxOutcome, tx_outcomes};
 use {
     crate::{
         produced::{BlockFees, TopFeePayer, TopFeeTransaction},
@@ -453,8 +453,8 @@ fn tally_outcomes(
 mod tests {
     use {
         super::*,
+        crate::blocks::base_fee,
         solana_compute_budget_interface::ComputeBudgetInstruction,
-        solana_core::node_events::blocks::base_fee,
         solana_keypair::Keypair,
         solana_message::{VersionedMessage, compiled_instruction::CompiledInstruction, legacy},
         solana_runtime::genesis_utils::{GenesisConfigInfo, create_genesis_config},

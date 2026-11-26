@@ -1,7 +1,7 @@
 //! What the dashboard reads of the validator, as plain values. [`Direct`] reads a running
 //! validator in process; a mirror rebuilt from event streams can stand in for it.
 
-pub use solana_core::node_events::bank_view::*;
+pub use crate::bank_view::*;
 use {
     crate::{context::DashboardContext, snapshot, validator_info::ValidatorInfo, versions},
     agave_snapshots::snapshot_config::SnapshotConfig,

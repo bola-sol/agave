@@ -1723,6 +1723,22 @@ mod tests {
         solana_core::node_events::output::{clock_event, epoch_event, node_event, status_event},
     };
 
+    fn block_event(slot: Slot, block: Block) -> BlockEvent {
+        use solana_core::node_events::blocks as published;
+        let block = match block {
+            Block::Footer(facts) => published::Block::Footer(Box::new(published::FooterFacts {
+                close_nanos: facts.close_nanos,
+                notar_bitmap: facts.notar_bitmap,
+                skip_bitmap: facts.skip_bitmap,
+                fast: facts.fast,
+            })),
+            Block::Missing => published::Block::Missing,
+            Block::Pending => published::Block::Pending,
+            Block::Opaque => published::Block::Opaque,
+        };
+        solana_core::node_events::output::block_event(slot, block)
+    }
+
     fn wait_part(
         generation: u64,
         index: u32,
@@ -1839,17 +1855,17 @@ mod tests {
         assert_eq!(mirror.caught_up_millis(), Some(1_234));
         mirror.apply_status(&status_event(&harness.reader()));
         let working = direct.working_bank();
-        mirror.apply_epoch(&epoch_event(working.as_ref(), &vote_account));
+        mirror.apply_epoch(&epoch_event(working.as_bank().unwrap(), &vote_account));
         mirror.apply_clock(&clock_event(
             ROLE_WORKING,
-            working.as_ref(),
+            working.as_bank().unwrap(),
             &identity,
             &vote_account,
         ));
         let root = direct.root_bank();
         mirror.apply_clock(&clock_event(
             ROLE_ROOT,
-            root.as_ref(),
+            root.as_bank().unwrap(),
             &identity,
             &vote_account,
         ));
@@ -1920,11 +1936,24 @@ mod tests {
             total_stake: 9_999,
             ranks: Arc::new(RankRows::new(entries.clone())),
         };
-        let mut events = admitted_events(0, 1, &view);
+        let published = solana_core::node_events::bank_view::EpochStakeView {
+            total_stake: view.total_stake,
+            ranks: Arc::new(solana_core::node_events::bank_view::RankRows::new(
+                entries
+                    .iter()
+                    .map(|entry| solana_core::node_events::bank_view::RankEntry {
+                        vote: entry.vote,
+                        identity: entry.identity,
+                        stake: entry.stake,
+                    })
+                    .collect(),
+            )),
+        };
+        let mut events = admitted_events(0, 1, &published);
         assert_eq!(events.len(), 3);
         // Out of order, and a stale generation's part left over.
         events.reverse();
-        mirror.apply_admitted(&admitted_events(0, 0, &view)[0]);
+        mirror.apply_admitted(&admitted_events(0, 0, &published)[0]);
         for event in &events {
             mirror.apply_admitted(event);
         }
@@ -2037,7 +2066,7 @@ mod tests {
         use solana_core::node_events::output::info_events;
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let key = Pubkey::new_unique();
-        let named = |name: &str| ValidatorInfo {
+        let named = |name: &str| solana_core::node_events::info::ValidatorInfo {
             name: Some(name.to_string()),
             icon_url: None,
         };
@@ -2048,7 +2077,16 @@ mod tests {
             mirror.apply_info(&event);
         }
         let (_, entries) = mirror.validator_info_all();
-        assert_eq!(entries, vec![(key, named("new"))]);
+        assert_eq!(
+            entries,
+            vec![(
+                key,
+                ValidatorInfo {
+                    name: Some("new".to_string()),
+                    icon_url: None,
+                }
+            )]
+        );
     }
 
     #[test]
@@ -2186,7 +2224,7 @@ mod tests {
                     Block::Pending => Block::Pending,
                     Block::Opaque => Block::Opaque,
                 };
-                solana_core::node_events::output::block_event(*slot, block)
+                block_event(*slot, block)
             })
             .collect();
         solana_core::node_events::output::own_block_events((epoch, me), generation, 20, &blocks)
@@ -2200,7 +2238,7 @@ mod tests {
         // Ours, but in the epoch before the root's.
         assert!(matches!(mirror.block(5, 40), Block::Opaque));
         // A block sent at its root answers while the set is awaited.
-        mirror.apply_block(&solana_core::node_events::output::block_event(5, footer(7)));
+        mirror.apply_block(&block_event(5, footer(7)));
         assert!(matches!(mirror.block(5, 20), Block::Footer(_)));
         assert!(matches!(mirror.block(4, 20), Block::Pending));
         mirror.set_own_blocks_connected(false, false);
@@ -2267,7 +2305,7 @@ mod tests {
 
     #[test]
     fn test_a_block_comes_back_whole_through_an_own_set() {
-        let block = solana_core::node_events::output::block_event(4, footer(3));
+        let block = block_event(4, footer(3));
         let place = crate::events::OwnSetPlace {
             pid: block.pid,
             tid: block.tid,
@@ -2286,10 +2324,7 @@ mod tests {
     fn test_a_slot_past_the_newest_block_sent_waits_for_it_a_while() {
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         assert!(matches!(mirror.block(9, 20), Block::Opaque));
-        mirror.apply_block(&solana_core::node_events::output::block_event(
-            10,
-            Block::Missing,
-        ));
+        mirror.apply_block(&block_event(10, Block::Missing));
         assert!(matches!(mirror.block(9, 20), Block::Opaque));
         assert!(matches!(mirror.block(11, 20), Block::Pending));
         std::thread::sleep(BLOCKS_STALE);

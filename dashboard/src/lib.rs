@@ -4,6 +4,9 @@
 //! holds.
 
 pub mod admin_socket;
+pub mod bank_view;
+pub mod blocks;
+pub mod catch_up;
 pub mod certs;
 pub mod collect;
 pub mod config;
@@ -35,10 +38,11 @@ pub mod tips;
 pub mod turns;
 pub mod udp_drops;
 pub mod validator_info;
+pub mod versions;
 
 pub use {
     config::DashboardConfig,
     context::DashboardContext,
     service::DashboardService,
-    solana_core::node_events::{metric_types as metric_events, types as events, versions},
+    solana_core::node_events::{metric_types as metric_events, types as events},
 };
