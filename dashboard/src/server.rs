@@ -171,7 +171,7 @@ async fn handle(
     // same-origin with the dashboard.
     if !host_is_allowed(&head, allowed_hosts) {
         log::debug!(
-            "dashboard: refusing host {:?}; add it with --dashboard-allowed-host",
+            "dashboard: refusing host {:?}; add it with --allowed-host",
             for_logging(header(&head, "host").unwrap_or("(absent)"))
         );
         return refuse(socket, head_len, 421, b"unrecognised host").await;
