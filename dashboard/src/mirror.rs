@@ -511,6 +511,8 @@ struct State {
     status: Option<SlotStatusEvent>,
     /// The newest slot replay began a bank for.
     begun: Slot,
+    /// The newest rooted bank whose freeze arrived, kept until a newer one does.
+    root_bank: Option<Arc<FrozenBank>>,
     epoch: Option<Arc<EpochFacts>>,
     votes: Arc<HashMap<Pubkey, VoteRow>>,
     /// Each epoch's turn leaders.
@@ -574,8 +576,9 @@ pub struct Mirror {
     reported: SharedReported,
     /// The file the catch-up time is kept in, under the history dir.
     caught_up_file: std::sync::OnceLock<PathBuf>,
-    /// The validator process and the catch-up time recorded for it, once read.
-    caught_up: std::sync::Mutex<Option<(String, Option<u64>)>>,
+    /// The validator's process id, its process key and the catch-up time recorded for it, read
+    /// once per process.
+    caught_up: std::sync::Mutex<Option<(u32, String, Option<u64>)>>,
 }
 
 impl Mirror {
@@ -636,14 +639,13 @@ impl Mirror {
     /// rank map, and the slot history.
     pub fn ready(&self) -> bool {
         let state = self.state.read().unwrap();
-        let (Some(epoch), Some(working)) = (state.epoch.as_ref(), Self::working_slot(&state))
-        else {
+        let (Some(epoch), Some(working)) = (state.epoch.as_ref(), Self::working_of(&state)) else {
             return false;
         };
-        let this_epoch = epoch.schedule.get_epoch(working);
+        let this_epoch = epoch.schedule.get_epoch(working.event.slot);
         state.node.is_some()
             && state.status.is_some()
-            && Self::root_slot(&state).is_some()
+            && Self::root_of(&state).is_some()
             && !state.votes.is_empty()
             && state.schedules.contains_key(&this_epoch)
             && (!epoch.alpenglow || state.shared.stakes.contains_key(&this_epoch))
@@ -931,17 +933,30 @@ impl Mirror {
             state.rooted_banks = state
                 .rooted_banks
                 .split_off(&slot.saturating_sub(LEDGER_KEPT));
-            if let Some(root) = newest {
-                // An ancestor rooted with it may follow and replace its skip.
-                for skipped in root.saturating_add(1)..slot {
-                    let event = missing_block(skipped);
-                    state.blocks.entry(skipped).or_insert(event);
-                }
-            }
             state.blocks_to = Some((slot, std::time::Instant::now()));
         }
         state.rooted.insert(slot);
         state.rooted_banks.insert(slot, bank_id);
+        // The rooted bank as it froze names its parent, so the slots between were skipped; without
+        // it nothing is inferred, as a gap in the events is not a skip.
+        let frozen = state
+            .frozen
+            .get(&slot)
+            .filter(|bank| bank.event.bank_id == bank_id)
+            .cloned();
+        if let Some(bank) = frozen {
+            for skipped in bank.event.parent_slot.saturating_add(1)..slot {
+                let event = missing_block(skipped);
+                state.blocks.insert(skipped, event);
+            }
+            if state
+                .root_bank
+                .as_ref()
+                .is_none_or(|held| held.event.slot <= slot)
+            {
+                state.root_bank = Some(bank);
+            }
+        }
         let block = state
             .footers
             .remove(&(slot, bank_id))
@@ -1217,24 +1232,29 @@ impl Mirror {
         }
     }
 
-    /// The root: the newest rooted slot whose freeze arrived.
-    fn root_slot(state: &State) -> Option<Slot> {
-        state
-            .rooted
-            .iter()
-            .rev()
-            .find(|slot| state.frozen.contains_key(slot))
-            .copied()
+    /// The root: the newest rooted bank whose freeze arrived.
+    fn root_of(state: &State) -> Option<&Arc<FrozenBank>> {
+        state.root_bank.as_ref()
     }
 
-    /// The working bank: the newest frozen one.
-    fn working_slot(state: &State) -> Option<Slot> {
-        state.frozen.keys().next_back().copied()
+    /// The working bank: the newest frozen one, or the root where none is held above it.
+    fn working_of(state: &State) -> Option<&Arc<FrozenBank>> {
+        state
+            .frozen
+            .values()
+            .next_back()
+            .filter(|bank| {
+                state
+                    .root_bank
+                    .as_ref()
+                    .is_none_or(|root| bank.event.slot >= root.event.slot)
+            })
+            .or(state.root_bank.as_ref())
     }
 
     /// A held frozen bank as the root or working bank reads: today's vote accounts and epoch
     /// facts, and no parent. An empty bank where none is held.
-    fn head(state: &State, slot: Option<Slot>) -> Arc<dyn BankView> {
+    fn head(state: &State, bank: Option<&Arc<FrozenBank>>) -> Arc<dyn BankView> {
         let epoch = state
             .epoch
             .clone()
@@ -1243,9 +1263,7 @@ impl Mirror {
             .node
             .as_ref()
             .map_or_else(Default::default, |node| (node.identity, node.vote_account));
-        let event = slot
-            .and_then(|slot| state.frozen.get(&slot))
-            .map_or_else(empty_frozen, |bank| bank.event.clone());
+        let event = bank.map_or_else(empty_frozen, |bank| bank.event.clone());
         Arc::new(FrozenBank {
             event,
             epoch,
@@ -1503,22 +1521,29 @@ impl Source for Mirror {
     }
     fn caught_up_millis(&self) -> Option<u64> {
         let file = self.caught_up_file.get()?;
-        let process = self.validator_process()?;
+        let pid = self.validator_pid()?;
         let mut caught_up = self.caught_up.lock().unwrap();
-        if let Some((read_for, millis)) = caught_up.as_ref()
-            && *read_for == process
+        if let Some((read_for, _, millis)) = caught_up.as_ref()
+            && *read_for == pid
         {
             return *millis;
         }
+        let Some(process) = self.validator_process() else {
+            *caught_up = Some((pid, String::new(), None));
+            return None;
+        };
         let millis = std::fs::read_to_string(file)
             .ok()
             .and_then(|text| recorded_millis(&text, &process));
-        *caught_up = Some((process, millis));
+        *caught_up = Some((pid, process, millis));
         millis
     }
     fn record_caught_up(&self, at_millis: u64) {
-        let (Some(file), Some(process)) = (self.caught_up_file.get(), self.validator_process())
-        else {
+        let (Some(file), Some(pid), Some(process)) = (
+            self.caught_up_file.get(),
+            self.validator_pid(),
+            self.validator_process(),
+        ) else {
             return;
         };
         if let Err(err) = std::fs::write(file, format!("{process} {at_millis}\n")) {
@@ -1527,7 +1552,7 @@ impl Source for Mirror {
                 file.display()
             );
         }
-        *self.caught_up.lock().unwrap() = Some((process, Some(at_millis)));
+        *self.caught_up.lock().unwrap() = Some((pid, process, Some(at_millis)));
     }
     fn global_addresses_only(&self) -> bool {
         let state = self.state.read().unwrap();
@@ -1539,8 +1564,8 @@ impl Source for Mirror {
     fn banks(&self) -> Banks {
         let state = self.state.read().unwrap();
         Banks {
-            root: Self::head(&state, Self::root_slot(&state)),
-            working: Self::head(&state, Self::working_slot(&state)),
+            root: Self::head(&state, Self::root_of(&state)),
+            working: Self::head(&state, Self::working_of(&state)),
             highest_slot: Self::highest_of(&state),
             frozen: state
                 .frozen
@@ -1551,11 +1576,11 @@ impl Source for Mirror {
     }
     fn root_bank(&self) -> Arc<dyn BankView> {
         let state = self.state.read().unwrap();
-        Self::head(&state, Self::root_slot(&state))
+        Self::head(&state, Self::root_of(&state))
     }
     fn working_bank(&self) -> Arc<dyn BankView> {
         let state = self.state.read().unwrap();
-        Self::head(&state, Self::working_slot(&state))
+        Self::head(&state, Self::working_of(&state))
     }
     fn highest_slot(&self) -> Slot {
         Self::highest_of(&self.state.read().unwrap())
@@ -1665,12 +1690,22 @@ impl Source for Mirror {
             .blocks
             .get(&slot)
             .filter(|event| event.kind != BLOCK_OPAQUE);
+        // The ledger read of our own block answers before the events.
         let own = state.own.as_ref().and_then(|own| own.blocks.get(&slot));
         // Ours past the set's reach, unread at its root, waits for the next set.
         if read.is_none() && own.is_none() && self.own_uncovered(&state, slot) {
             return Block::Pending;
         }
-        let held = read.or(own).or_else(|| state.blocks.get(&slot));
+        let held = own.or(read).or_else(|| state.blocks.get(&slot));
+        // Ours, unread at its root, waits for this epoch's set like a block not sent.
+        if held.is_some_and(|event| event.kind == BLOCK_OPAQUE) && own.is_none() {
+            drop(state);
+            return if self.own_awaited(slot, root) {
+                Block::Pending
+            } else {
+                Block::Opaque
+            };
+        }
         let Some(event) = held else {
             // The validator holds a block back while it settles, so its root can run ahead.
             let behind = state
@@ -2060,7 +2095,10 @@ mod tests {
                 &vote_account,
             ));
         }
-        mirror.apply_rooted(direct.commitment().root, 0);
+        mirror.apply_rooted(
+            direct.commitment().root,
+            root.as_bank().unwrap().bank_id().into(),
+        );
         mirror.apply_begun(direct.highest_slot());
         // Not ready without the vote accounts, schedule and slot history.
         assert!(!mirror.ready());
@@ -2504,23 +2542,49 @@ mod tests {
             bank_id,
             ..block_event(slot, footer(close))
         };
+        let froze = |slot, parent_slot, bank_id| BankFrozenEvent {
+            slot,
+            parent_slot,
+            bank_id,
+            ..empty_frozen()
+        };
+        mirror.apply_frozen(&froze(10, 9, 1));
         mirror.apply_rooted(10, 1);
         // Slot 12 froze twice, on two forks; the second bank is the one rooted.
         mirror.apply_block(&footer_of(12, 2, 120));
         mirror.apply_block(&footer_of(12, 3, 121));
         mirror.apply_block(&footer_of(14, 4, 140));
+        mirror.apply_frozen(&froze(12, 10, 2));
+        mirror.apply_frozen(&froze(12, 10, 3));
+        mirror.apply_frozen(&froze(14, 12, 4));
+        mirror.apply_rooted(12, 3);
         mirror.apply_rooted(14, 4);
         assert!(matches!(mirror.block(11, 20), Block::Missing));
+        assert!(matches!(mirror.block(12, 20), Block::Footer(facts) if facts.close_nanos == 121));
         assert!(matches!(mirror.block(13, 20), Block::Missing));
         assert!(matches!(mirror.block(14, 20), Block::Footer(facts) if facts.close_nanos == 140));
-        // An ancestor's root arriving after its child's replaces the skip.
-        mirror.apply_rooted(12, 3);
-        assert!(matches!(mirror.block(12, 20), Block::Footer(facts) if facts.close_nanos == 121));
+        assert_eq!(mirror.root_bank().slot(), 14);
+        // A root whose freeze never arrived: the slots before it are not taken as skipped, and the
+        // root bank stays the last one held.
+        mirror.apply_rooted(20, 9);
+        assert!(matches!(mirror.block(17, 30), Block::Opaque));
+        assert!(matches!(mirror.block(20, 30), Block::Opaque));
+        assert_eq!(mirror.root_bank().slot(), 14);
+        assert_eq!(mirror.working_bank().slot(), 14);
         // Rooted before its footer arrived, then the footer.
-        mirror.apply_rooted(15, 5);
-        assert!(matches!(mirror.block(15, 20), Block::Opaque));
-        mirror.apply_block(&footer_of(15, 5, 150));
-        assert!(matches!(mirror.block(15, 20), Block::Footer(facts) if facts.close_nanos == 150));
+        mirror.apply_rooted(22, 5);
+        mirror.apply_block(&footer_of(22, 5, 220));
+        assert!(matches!(mirror.block(22, 30), Block::Footer(facts) if facts.close_nanos == 220));
+    }
+
+    #[test]
+    fn test_ours_rooted_unread_waits_for_the_set() {
+        let (mirror, _) = own_mirror();
+        // Slot 5 is ours, rooted with no footer and no set yet.
+        mirror.apply_rooted(5, 0);
+        assert!(matches!(mirror.block(5, 20), Block::Pending));
+        mirror.set_own_blocks_connected(false, false);
+        assert!(matches!(mirror.block(5, 20), Block::Opaque));
     }
 
     #[test]

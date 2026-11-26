@@ -4366,18 +4366,19 @@ impl ReplayStage {
                     bank.bank_id().into(),
                     true,
                 ));
-                let footer = completed_replay
-                    .replay_progress
-                    .read()
-                    .unwrap()
-                    .block_footer
-                    .clone();
-                frozen_output.frozen(
-                    &bank.clone_without_scheduler(),
-                    my_pubkey,
-                    footer.as_deref(),
-                    is_leader_block,
-                );
+                {
+                    let progress = completed_replay.replay_progress.read().unwrap();
+                    let footer = frozen_output
+                        .wants_footers()
+                        .then(|| progress.block_footer.as_deref())
+                        .flatten();
+                    frozen_output.frozen(
+                        &bank.clone_without_scheduler(),
+                        my_pubkey,
+                        footer,
+                        is_leader_block,
+                    );
+                }
 
                 let r_replay_stats = completed_replay.replay_stats.read().unwrap();
                 let r_replay_progress = completed_replay.replay_progress.read().unwrap();

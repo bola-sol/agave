@@ -160,6 +160,7 @@ struct SetLoop {
     status_sent: Option<Instant>,
     /// Our blocks this epoch read so far; `None` while the stream is off or the schedule unknown.
     own: Option<OwnBlocks>,
+    own_on: bool,
 }
 
 impl SetLoop {
@@ -193,8 +194,11 @@ impl SetLoop {
         blockstore: &Blockstore,
         exit: &AtomicBool,
     ) {
-        if !publisher.is_enabled() {
-            self.own = None;
+        let on = publisher.is_enabled();
+        let turned_on = on && !self.own_on;
+        self.own_on = on;
+        // What was read is kept while off, so turning on again needs no reread.
+        if !on {
             return;
         }
         let root_bank = bank_forks.read().unwrap().root_bank();
@@ -207,6 +211,9 @@ impl SetLoop {
         let Some(own) = self.own.as_mut() else {
             return;
         };
+        if turned_on {
+            own.resend();
+        }
         if let Some(events) = own.due(blockstore, root_bank.slot(), Instant::now()) {
             publish_paced(publisher, &events, exit);
         }

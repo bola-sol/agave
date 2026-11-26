@@ -216,6 +216,11 @@ impl FrozenOutput {
         }
     }
 
+    /// Whether the footer stream is on, so replay reads the footer only then.
+    pub(crate) fn wants_footers(&mut self) -> bool {
+        self.blocks.is_enabled()
+    }
+
     /// `footer` is the one replay read; ours comes from block creation.
     pub(crate) fn frozen(
         &mut self,
