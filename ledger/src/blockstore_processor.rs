@@ -1519,9 +1519,8 @@ pub fn confirm_slot(
                 let block_footer = match &marker {
                     VersionedBlockMarker::V1(marker) => marker.as_block_footer().cloned(),
                 };
-                if let Some(footer) = &block_footer {
-                    progress.block_footer = Some(Box::new(footer.clone()));
-                }
+                // Kept for replay's own readers; the entry notifier below takes a copy.
+                progress.block_footer = block_footer.map(Box::new);
                 if let Some(parent_bank) = bank.parent() {
                     let allow_initial_update_parent =
                         replay_starts_at_update_parent && marker.is_update_parent();
@@ -1549,8 +1548,8 @@ pub fn confirm_slot(
                                 );
                             }
                         })?;
-                    if let Some(block_footer) = block_footer
-                        && let Some(entry_notification_sender) = entry_notification_sender
+                    if let Some(entry_notification_sender) = entry_notification_sender
+                        && let Some(block_footer) = progress.block_footer.as_deref().cloned()
                         && let Err(err) = send_entry_notification(
                             entry_notification_sender,
                             EntryNotification::BlockFooter {

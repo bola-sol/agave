@@ -198,6 +198,8 @@ struct ConfigSet {
     accounts: HashMap<Pubkey, (Slot, AccountSharedData)>,
     /// The scan started at turn-on, and whether it finished.
     scan: Option<Scan>,
+    /// The running scan began before the stream last turned off, so its result is dropped.
+    scan_stale: bool,
     scanned: bool,
     /// Banks frozen while the scan ran, applied over its result.
     while_scanning: Vec<(Slot, Vec<(Pubkey, AccountSharedData)>)>,
@@ -311,14 +313,21 @@ impl FrozenReader {
         );
         let set = &mut self.config_set;
         if !configs_on {
-            // A running scan is left to finish and is dropped unread.
+            // A running scan is kept until it finishes, so no second one starts beside it.
             let scan = set.scan.take();
+            let stale = scan.is_some();
             *set = ConfigSet::default();
-            drop(scan);
+            set.scan = scan;
+            set.scan_stale = stale;
             return;
         }
         if !set.scanned {
             match &set.scan {
+                Some(scan) if scan.is_finished() && set.scan_stale => {
+                    set.scan = None;
+                    set.scan_stale = false;
+                    return;
+                }
                 None => {
                     let bank = bank_forks.read().unwrap().root_bank();
                     set.scan = Builder::new()

@@ -26,8 +26,8 @@ pub type OwnFooter = (Slot, BankId, BlockFooterV1);
 pub const OWN_SETTLED: u64 = 16;
 /// How often our blocks go out whole, besides at turn-on and at a new epoch or identity.
 const OWN_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
-/// Blocks read per tick.
-const OWN_READ_PER_TICK: usize = 64;
+/// Reading per tick, so an epoch of our blocks is read well inside a subscriber's wait for it.
+const OWN_READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
 
 pub fn block_event(slot: Slot, bank_id: BankId, block: &Block) -> BlockEvent {
     let (tid, pid) = cached_thread_and_process_id();
@@ -194,10 +194,21 @@ impl OwnBlocks {
         self.generation
     }
 
-    /// Reads up to `OWN_READ_PER_TICK` more of our slots up to `to`, from a ledger holding slots
-    /// from `lowest`; whether all are read.
-    fn read_to(&mut self, read: impl Fn(Slot) -> Block, to: Slot, lowest: Slot) -> bool {
-        for _ in 0..OWN_READ_PER_TICK {
+    /// Sends the set again at the next read, as for a subscriber turning the stream on.
+    pub(crate) fn resend(&mut self) {
+        self.sent = None;
+    }
+
+    /// Reads more of our slots up to `to` until `deadline`, from a ledger holding slots from
+    /// `lowest`; whether all are read.
+    fn read_to(
+        &mut self,
+        read: impl Fn(Slot) -> Block,
+        to: Slot,
+        lowest: Slot,
+        deadline: Instant,
+    ) -> bool {
+        while Instant::now() < deadline {
             let Some(slot) = self.leader_slots.get(self.next).copied() else {
                 break;
             };
@@ -225,6 +236,7 @@ impl OwnBlocks {
             |slot| read_block(blockstore, slot, root),
             to,
             blockstore.lowest_slot(),
+            now + OWN_READ_BUDGET,
         ) {
             return None;
         }
@@ -277,6 +289,10 @@ mod tests {
         assert_eq!(block_event(7, 0, &Block::Missing).kind, BLOCK_MISSING);
     }
 
+    fn far() -> Instant {
+        Instant::now() + std::time::Duration::from_secs(60)
+    }
+
     #[test]
     fn test_the_set_reads_to_the_settled_root_and_a_cleaned_slot_is_unread() {
         let mut own = OwnBlocks::with_slots((0, Pubkey::new_unique()), vec![4, 5, 30, 60], 0);
@@ -288,7 +304,7 @@ mod tests {
             }
         };
         // Slot 4 is below the ledger's first slot, so its skip is a clean; slot 60 is past 40.
-        assert!(own.read_to(read, 40, 5));
+        assert!(own.read_to(read, 40, 5, far()));
         let kinds: Vec<_> = own
             .events
             .iter()
@@ -298,7 +314,11 @@ mod tests {
             kinds,
             vec![(4, BLOCK_OPAQUE), (5, BLOCK_MISSING), (30, BLOCK_FOOTER)]
         );
-        assert!(own.read_to(read, 60, 5));
+        assert!(own.read_to(read, 60, 5, far()));
         assert_eq!(own.events.len(), 4);
+        // Past its deadline a read takes nothing more.
+        let mut late = OwnBlocks::with_slots((0, Pubkey::new_unique()), vec![4], 0);
+        assert!(!late.read_to(read, 40, 5, Instant::now()));
+        assert!(late.events.is_empty());
     }
 }
