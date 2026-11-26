@@ -10,7 +10,6 @@ use {
 pub const NODE_INFO_STREAM: StreamName = agave_event_system::stream_name!("node.info");
 pub const SLOT_STATUS_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_status");
 pub const EPOCH_STREAM: StreamName = agave_event_system::stream_name!("bank.epoch");
-pub const SLOT_CLOCK_STREAM: StreamName = agave_event_system::stream_name!("bank.slot_clock");
 pub const LEDGER_SLOT_STREAM: StreamName = agave_event_system::stream_name!("ledger.first_shred");
 pub const BLOCK_STREAM: StreamName = agave_event_system::stream_name!("ledger.reward_cert");
 pub const OWN_BLOCK_STREAM: StreamName = agave_event_system::stream_name!("ledger.own_reward_cert");
@@ -160,42 +159,6 @@ pub struct SlotHistoryEvent {
     pub first_word: u32,
     pub len: u16,
     pub words: [u64; HISTORY_WORDS],
-}
-
-pub const ROLE_ROOT: u8 = 0;
-pub const ROLE_WORKING: u8 = 1;
-
-/// The root or the working bank's own figures, sent as either moves.
-#[event]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SlotClockEvent {
-    pub pid: i32,
-    pub tid: i32,
-    pub timestamp_ns: u64,
-    /// `ROLE_ROOT` or `ROLE_WORKING`.
-    pub role: u8,
-    pub slot: Slot,
-    pub parent_slot: Slot,
-    pub epoch: Epoch,
-    pub frozen: bool,
-    pub block_height: u64,
-    pub clock_slot: Slot,
-    pub clock_epoch_start_timestamp: i64,
-    pub clock_epoch: Epoch,
-    pub clock_leader_schedule_epoch: Epoch,
-    pub clock_unix_timestamp: i64,
-    pub blockhash: [u8; 32],
-    pub transaction_count: u64,
-    pub non_vote_transaction_count: u64,
-    pub transaction_error_count: u64,
-    pub entries_count: u64,
-    pub block_cost: u64,
-    pub block_cost_limit: u64,
-    pub account_cost_limit: u64,
-    pub total_fees: u64,
-    pub priority_fees: u64,
-    pub identity_balance: u64,
-    pub vote_balance: u64,
 }
 
 /// A slot's blockstore record: when its first shred arrived, its parent, and whether it is full.
@@ -396,15 +359,14 @@ pub struct GossipPeerEvent {
     pub incremental_snapshot: Slot,
 }
 
-/// Bytes of a validator's name and icon address an info event holds.
-pub const NAME_BYTES: usize = 128;
-pub const ICON_BYTES: usize = 256;
+/// Bytes of config account data an info event holds: a validator info account's largest size.
+pub const CONFIG_DATA_BYTES: usize = 576 + 1 + (32 + 1) * 2;
 
 pub const INFO_FULL_SET: u8 = 0;
 pub const INFO_CHANGE: u8 = 1;
 
-/// One validator info entry: the whole set at turn-on and every few minutes, and each entry a
-/// frozen bank changed.
+/// One config program account, where validator names are kept: the whole set at turn-on and
+/// every minute, and each account a frozen bank changed.
 #[event]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorInfoEvent {
@@ -416,13 +378,11 @@ pub struct ValidatorInfoEvent {
     pub generation: u64,
     pub index: u32,
     pub count: u32,
-    /// The bank the entry was read from.
+    /// The bank the account was read from.
     pub slot: Slot,
-    pub identity: [u8; 32],
-    pub has_name: bool,
-    pub name: [u8; NAME_BYTES],
-    pub has_icon: bool,
-    pub icon: [u8; ICON_BYTES],
+    pub account: [u8; 32],
+    pub data_len: u16,
+    pub data: [u8; CONFIG_DATA_BYTES],
 }
 
 /// Ranks a finalization event's bitmaps hold.

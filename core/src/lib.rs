@@ -22,6 +22,7 @@ pub mod drop_bank_service;
 pub mod epoch_specs;
 pub mod fetch_stage;
 pub mod forwarding_stage;
+pub mod frozen_bank_events;
 pub mod gen_keys;
 pub mod next_leader;
 pub mod node_events;

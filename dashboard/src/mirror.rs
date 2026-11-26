@@ -12,9 +12,8 @@ use {
             ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, AdmittedEvent, BITMAP_BYTES, BLOCK_FOOTER,
             BLOCK_MISSING, BlockEvent, EpochEvent, FinalizationEvent, GossipPeerEvent,
             INFO_FULL_SET, LedgerSlotEvent, MessageVersionsEvent, NodeInfoEvent, OUTCOME_FAILED,
-            OUTCOME_SUCCEEDED, OwnBlockEvent, PATH_BYTES, ROLE_ROOT, SlotClockEvent,
-            SlotHistoryEvent, SlotStatusEvent, TxOutcomeEvent, ValidatorInfoEvent, unpack_addr,
-            unpack_path, unpack_str,
+            OUTCOME_SUCCEEDED, OwnBlockEvent, PATH_BYTES, SlotHistoryEvent, SlotStatusEvent,
+            TxOutcomeEvent, ValidatorInfoEvent, unpack_addr, unpack_path, unpack_str,
         },
         snapshot,
         source::{
@@ -270,14 +269,9 @@ fn peer_row(event: &GossipPeerEvent) -> PeerRow {
     }
 }
 
-fn info_of(event: &ValidatorInfoEvent) -> (Pubkey, ValidatorInfo) {
-    (
-        Pubkey::new_from_array(event.identity),
-        ValidatorInfo {
-            name: event.has_name.then(|| unpack_str(&event.name)),
-            icon_url: event.has_icon.then(|| unpack_str(&event.icon)),
-        },
-    )
+/// The identity and name a config account holds, where it is a validator info account.
+fn info_of(event: &ValidatorInfoEvent) -> Option<(Pubkey, ValidatorInfo)> {
+    crate::validator_info::parse(event.data.get(..usize::from(event.data_len))?)
 }
 
 /// What every bank of one epoch shares.
@@ -318,138 +312,14 @@ impl From<&EpochEvent> for EpochFacts {
     }
 }
 
-/// A bank rebuilt from its slot clock event and the epoch's facts.
-pub struct MirrorBank {
-    clock: SlotClockEvent,
-    epoch: Arc<EpochFacts>,
-    identity: Pubkey,
-    vote_account: Pubkey,
-    votes: Arc<HashMap<Pubkey, VoteRow>>,
-    shared: Shared,
-}
-
-impl BankView for MirrorBank {
-    fn slot(&self) -> Slot {
-        self.clock.slot
-    }
-    fn epoch(&self) -> Epoch {
-        self.clock.epoch
-    }
-    fn epoch_schedule(&self) -> &EpochSchedule {
-        &self.epoch.schedule
-    }
-    fn is_alpenglow(&self) -> bool {
-        self.epoch.alpenglow
-    }
-    fn parent_slot(&self) -> Slot {
-        self.clock.parent_slot
-    }
-    fn parent(&self) -> Option<Arc<dyn BankView>> {
-        None
-    }
-    fn is_frozen(&self) -> bool {
-        self.clock.frozen
-    }
-    fn block_height(&self) -> u64 {
-        self.clock.block_height
-    }
-    fn clock(&self) -> Clock {
-        Clock {
-            slot: self.clock.clock_slot,
-            epoch_start_timestamp: self.clock.clock_epoch_start_timestamp,
-            epoch: self.clock.clock_epoch,
-            leader_schedule_epoch: self.clock.clock_leader_schedule_epoch,
-            unix_timestamp: self.clock.clock_unix_timestamp,
-        }
-    }
-    fn ns_per_slot_at_slot(&self, _slot: Slot) -> u128 {
-        u128::from(self.epoch.ns_per_slot)
-    }
-    fn last_blockhash(&self) -> Hash {
-        Hash::new_from_array(self.clock.blockhash)
-    }
-    fn get_lamports_per_signature(&self) -> u64 {
-        self.epoch.lamports_per_signature
-    }
-    fn transaction_count(&self) -> u64 {
-        self.clock.transaction_count
-    }
-    fn non_vote_transaction_count_since_restart(&self) -> u64 {
-        self.clock.non_vote_transaction_count
-    }
-    fn transaction_error_count(&self) -> u64 {
-        self.clock.transaction_error_count
-    }
-    fn transaction_entries_count(&self) -> u64 {
-        self.clock.entries_count
-    }
-    fn get_balance(&self, key: &Pubkey) -> u64 {
-        if *key == self.identity {
-            self.clock.identity_balance
-        } else if *key == self.vote_account {
-            self.clock.vote_balance
-        } else {
-            0
-        }
-    }
-    fn cost(&self) -> CostFacts {
-        CostFacts {
-            block_cost: self.clock.block_cost,
-            block_limit: self.clock.block_cost_limit,
-            account_limit: self.clock.account_cost_limit,
-        }
-    }
-    fn fees(&self) -> FeeTotals {
-        FeeTotals {
-            total: self.clock.total_fees,
-            priority: self.clock.priority_fees,
-        }
-    }
-    fn vote_row(&self, vote: &Pubkey) -> Option<VoteRow> {
-        self.votes.get(vote).cloned()
-    }
-    fn for_each_vote_row(&self, each: &mut dyn FnMut(&VoteRow)) {
-        for row in self.votes.values() {
-            each(row);
-        }
-    }
-    fn rank_map(&self, slot: Slot) -> Option<Arc<dyn Ranks>> {
-        self.shared.rank_map(&self.epoch.schedule, slot)
-    }
-    fn epoch_stakes(&self, epoch: Epoch) -> Option<EpochStakeView> {
-        self.shared.stakes.get(&epoch).cloned()
-    }
-    fn epoch_stakes_from_slot(&self, slot: Slot) -> Option<EpochStakeView> {
-        self.epoch_stakes(self.epoch.schedule.get_epoch(slot))
-    }
-    fn vat_ticket_short(&self, vote: &Pubkey) -> Option<u64> {
-        (*vote == self.vote_account)
-            .then_some(self.epoch.ticket_short)
-            .flatten()
-    }
-    fn minimum_vote_account_balance_for_vat(&self) -> u64 {
-        self.epoch.minimum_vat_balance
-    }
-    fn get_minimum_balance_for_rent_exemption(&self, _len: usize) -> u64 {
-        self.epoch.vote_account_rent
-    }
-    fn get_slot_history(&self) -> Option<SlotHistory> {
-        self.shared.history.as_deref().cloned()
-    }
-    fn account_data(&self, key: &Pubkey) -> Option<Vec<u8>> {
-        (*key == crate::collect::VOTE_REWARD_ACCOUNT && !self.epoch.vote_reward.is_empty())
-            .then(|| self.epoch.vote_reward.clone())
-    }
-    fn validator_info_changed(&self) -> Vec<(Pubkey, ValidatorInfo)> {
-        Vec::new()
-    }
-}
-
 /// A frozen bank rebuilt from `replay.bank_frozen`.
 #[derive(Clone)]
 pub struct FrozenBank {
     event: BankFrozenEvent,
     epoch: Arc<EpochFacts>,
+    /// Ours, whose balances the event carries.
+    identity: Pubkey,
+    vote_account: Pubkey,
     votes: Arc<HashMap<Pubkey, VoteRow>>,
     shared: Shared,
     /// The parent as it froze, without its own parent.
@@ -493,7 +363,10 @@ impl BankView for FrozenBank {
     fn clock(&self) -> Clock {
         Clock {
             slot: self.event.slot,
-            ..Clock::default()
+            epoch_start_timestamp: self.event.clock_epoch_start_timestamp,
+            epoch: self.event.epoch,
+            leader_schedule_epoch: self.event.clock_leader_schedule_epoch,
+            unix_timestamp: self.event.clock_unix_timestamp,
         }
     }
     fn ns_per_slot_at_slot(&self, _slot: Slot) -> u128 {
@@ -519,8 +392,14 @@ impl BankView for FrozenBank {
     fn transaction_entries_count(&self) -> u64 {
         self.event.transaction_entry_count
     }
-    fn get_balance(&self, _key: &Pubkey) -> u64 {
-        0
+    fn get_balance(&self, key: &Pubkey) -> u64 {
+        if *key == self.identity {
+            self.event.identity_balance
+        } else if *key == self.vote_account {
+            self.event.vote_balance
+        } else {
+            0
+        }
     }
     fn cost(&self) -> CostFacts {
         CostFacts {
@@ -592,8 +471,10 @@ impl BankView for FrozenBank {
     fn epoch_stakes_from_slot(&self, slot: Slot) -> Option<EpochStakeView> {
         self.epoch_stakes(self.epoch.schedule.get_epoch(slot))
     }
-    fn vat_ticket_short(&self, _vote: &Pubkey) -> Option<u64> {
-        None
+    fn vat_ticket_short(&self, vote: &Pubkey) -> Option<u64> {
+        (*vote == self.vote_account)
+            .then_some(self.epoch.ticket_short)
+            .flatten()
     }
     fn minimum_vote_account_balance_for_vat(&self) -> u64 {
         self.epoch.minimum_vat_balance
@@ -628,8 +509,6 @@ struct State {
     /// The newest slot replay began a bank for.
     begun: Slot,
     epoch: Option<Arc<EpochFacts>>,
-    root: Option<SlotClockEvent>,
-    working: Option<SlotClockEvent>,
     votes: Arc<HashMap<Pubkey, VoteRow>>,
     /// Each epoch's turn leaders.
     schedules: BTreeMap<Epoch, Arc<Vec<Pubkey>>>,
@@ -748,13 +627,14 @@ impl Mirror {
     /// rank map, and the slot history.
     pub fn ready(&self) -> bool {
         let state = self.state.read().unwrap();
-        let (Some(epoch), Some(working)) = (state.epoch.as_ref(), state.working.as_ref()) else {
+        let (Some(epoch), Some(working)) = (state.epoch.as_ref(), Self::working_slot(&state))
+        else {
             return false;
         };
-        let this_epoch = working.epoch;
+        let this_epoch = epoch.schedule.get_epoch(working);
         state.node.is_some()
             && state.status.is_some()
-            && state.root.is_some()
+            && Self::root_slot(&state).is_some()
             && !state.votes.is_empty()
             && state.schedules.contains_key(&this_epoch)
             && (!epoch.alpenglow || state.shared.stakes.contains_key(&this_epoch))
@@ -923,9 +803,15 @@ impl Mirror {
                 ..FrozenBank::clone(parent)
             })
         });
+        let (identity, vote_account) = state
+            .node
+            .as_ref()
+            .map_or_else(Default::default, |node| (node.identity, node.vote_account));
         let bank = Arc::new(FrozenBank {
             event: event.clone(),
             epoch,
+            identity,
+            vote_account,
             votes: state.votes.clone(),
             shared: state.shared.clone(),
             parent,
@@ -991,7 +877,9 @@ impl Mirror {
     pub fn apply_info(&self, event: &ValidatorInfoEvent) {
         let mut state = self.state.write().unwrap();
         if event.reason != INFO_FULL_SET {
-            let (identity, info) = info_of(event);
+            let Some((identity, info)) = info_of(event) else {
+                return;
+            };
             state.info.insert(identity, (event.slot, info.clone()));
             state.info_changes.push((identity, info));
             return;
@@ -1005,8 +893,8 @@ impl Mirror {
         ) else {
             return;
         };
-        for part in &parts {
-            let (identity, info) = info_of(part);
+        for (part, (identity, info)) in parts.iter().filter_map(|part| Some((part, info_of(part)?)))
+        {
             // A change read from a newer bank while the scan ran stays.
             if state
                 .info
@@ -1219,15 +1107,6 @@ impl Mirror {
         self.state.write().unwrap().epoch = Some(Arc::new(EpochFacts::from(event)));
     }
 
-    pub fn apply_clock(&self, event: &SlotClockEvent) {
-        let mut state = self.state.write().unwrap();
-        if event.role == ROLE_ROOT {
-            state.root = Some(event.clone());
-        } else {
-            state.working = Some(event.clone());
-        }
-    }
-
     /// A complete vote account set, or the set with changes applied.
     pub fn apply_votes<'a>(&self, accounts: impl Iterator<Item = &'a VoteAccountEvent>) {
         let rows = accounts
@@ -1279,18 +1158,46 @@ impl Mirror {
         }
     }
 
-    fn bank(&self, state: &State, clock: Option<&SlotClockEvent>) -> Arc<dyn BankView> {
-        let node = state.node.as_ref();
-        Arc::new(MirrorBank {
-            clock: clock.cloned().unwrap_or_else(empty_clock),
-            epoch: state
-                .epoch
-                .clone()
-                .unwrap_or_else(|| Arc::new(EpochFacts::from(&empty_epoch()))),
-            identity: node.map_or_else(Pubkey::default, |node| node.identity),
-            vote_account: node.map_or_else(Pubkey::default, |node| node.vote_account),
+    /// The root: the newest rooted slot whose freeze arrived.
+    fn root_slot(state: &State) -> Option<Slot> {
+        state
+            .rooted
+            .iter()
+            .rev()
+            .find(|slot| state.frozen.contains_key(slot))
+            .copied()
+    }
+
+    /// The working bank: the newest frozen one.
+    fn working_slot(state: &State) -> Option<Slot> {
+        state.frozen.keys().next_back().copied()
+    }
+
+    /// A held frozen bank as the root or working bank reads: today's vote accounts and epoch
+    /// facts, and no parent. An empty bank where none is held.
+    fn head(state: &State, slot: Option<Slot>) -> Arc<dyn BankView> {
+        let epoch = state
+            .epoch
+            .clone()
+            .unwrap_or_else(|| Arc::new(EpochFacts::from(&empty_epoch())));
+        let (identity, vote_account) = state
+            .node
+            .as_ref()
+            .map_or_else(Default::default, |node| (node.identity, node.vote_account));
+        let event = slot
+            .and_then(|slot| state.frozen.get(&slot))
+            .map_or_else(empty_frozen, |bank| bank.event.clone());
+        Arc::new(FrozenBank {
+            event,
+            epoch,
+            identity,
+            vote_account,
             votes: state.votes.clone(),
             shared: state.shared.clone(),
+            parent: None,
+            finalization: None,
+            expects_finalization: false,
+            info_changes: Vec::new(),
         })
     }
 
@@ -1299,8 +1206,7 @@ impl Mirror {
     fn highest_of(state: &State) -> Slot {
         let reported = state.begun;
         let frozen = state.frozen.keys().next_back().copied().unwrap_or(0);
-        let working = state.working.as_ref().map_or(0, |clock| clock.slot);
-        reported.max(frozen).max(working)
+        reported.max(frozen)
     }
 
     /// Whether `slot` is ours in the root's epoch and that epoch's own block set is still awaited.
@@ -1346,32 +1252,32 @@ impl Mirror {
     }
 }
 
-fn empty_clock() -> SlotClockEvent {
-    SlotClockEvent {
+fn empty_frozen() -> BankFrozenEvent {
+    BankFrozenEvent {
         pid: 0,
         tid: 0,
         timestamp_ns: 0,
-        role: 0,
         slot: 0,
+        bank_id: 0,
         parent_slot: 0,
-        epoch: 0,
-        frozen: false,
-        block_height: 0,
-        clock_slot: 0,
-        clock_epoch_start_timestamp: 0,
-        clock_epoch: 0,
-        clock_leader_schedule_epoch: 0,
-        clock_unix_timestamp: 0,
+        leader: [0u8; 32],
         blockhash: [0u8; 32],
         transaction_count: 0,
         non_vote_transaction_count: 0,
-        transaction_error_count: 0,
-        entries_count: 0,
+        failed_transaction_count: 0,
+        transaction_entry_count: 0,
         block_cost: 0,
         block_cost_limit: 0,
         account_cost_limit: 0,
-        total_fees: 0,
-        priority_fees: 0,
+        total_fee: 0,
+        priority_fee: 0,
+        block_height: 0,
+        transaction_count_total: 0,
+        non_vote_transaction_count_total: 0,
+        epoch: 0,
+        clock_epoch_start_timestamp: 0,
+        clock_unix_timestamp: 0,
+        clock_leader_schedule_epoch: 0,
         identity_balance: 0,
         vote_balance: 0,
     }
@@ -1532,8 +1438,8 @@ impl Source for Mirror {
     fn banks(&self) -> Banks {
         let state = self.state.read().unwrap();
         Banks {
-            root: self.bank(&state, state.root.as_ref()),
-            working: self.bank(&state, state.working.as_ref()),
+            root: Self::head(&state, Self::root_slot(&state)),
+            working: Self::head(&state, Self::working_slot(&state)),
             highest_slot: Self::highest_of(&state),
             frozen: state
                 .frozen
@@ -1544,11 +1450,11 @@ impl Source for Mirror {
     }
     fn root_bank(&self) -> Arc<dyn BankView> {
         let state = self.state.read().unwrap();
-        self.bank(&state, state.root.as_ref())
+        Self::head(&state, Self::root_slot(&state))
     }
     fn working_bank(&self) -> Arc<dyn BankView> {
         let state = self.state.read().unwrap();
-        self.bank(&state, state.working.as_ref())
+        Self::head(&state, Self::working_slot(&state))
     }
     fn highest_slot(&self) -> Slot {
         Self::highest_of(&self.state.read().unwrap())
@@ -1779,10 +1685,9 @@ impl Source for Mirror {
 mod tests {
     use {
         super::*,
-        crate::{events::ROLE_WORKING, fixture::fixture, source::Direct},
+        crate::{fixture::fixture, source::Direct},
         solana_core::{
             bank_state_events::{epoch_event, node_event},
-            node_events::output::clock_event,
             set_events::status_event,
         },
     };
@@ -2015,24 +1920,28 @@ mod tests {
             &harness.ctx.highest_finalized,
             &harness.ctx.blockstore,
         ));
-        // What replay's slot events carry.
+        mirror.apply_epoch(&epoch_event(
+            direct.working_bank().as_bank().unwrap(),
+            &vote_account,
+        ));
+        // What replay's events carry: the root and the newest frozen bank as each froze, then
+        // the root and the highest slot begun.
+        let root = direct.root_bank();
+        let working = direct
+            .banks()
+            .frozen
+            .into_iter()
+            .max_by_key(|(slot, _)| *slot)
+            .map_or_else(|| root.clone(), |(_, bank)| bank);
+        for bank in [&root, &working] {
+            mirror.apply_frozen(&BankFrozenEvent::new(
+                bank.as_bank().unwrap(),
+                &identity,
+                &vote_account,
+            ));
+        }
         mirror.apply_rooted(direct.commitment().root);
         mirror.apply_begun(direct.highest_slot());
-        let working = direct.working_bank();
-        mirror.apply_epoch(&epoch_event(working.as_bank().unwrap(), &vote_account));
-        mirror.apply_clock(&clock_event(
-            ROLE_WORKING,
-            working.as_bank().unwrap(),
-            &identity,
-            &vote_account,
-        ));
-        let root = direct.root_bank();
-        mirror.apply_clock(&clock_event(
-            ROLE_ROOT,
-            root.as_bank().unwrap(),
-            &identity,
-            &vote_account,
-        ));
         // Not ready without the vote accounts, schedule and slot history.
         assert!(!mirror.ready());
 
@@ -2131,26 +2040,9 @@ mod tests {
 
     fn frozen(slot: Slot) -> BankFrozenEvent {
         BankFrozenEvent {
-            pid: 0,
-            tid: 0,
-            timestamp_ns: 0,
             slot,
-            bank_id: 0,
             parent_slot: slot.saturating_sub(1),
-            leader: [0u8; 32],
-            blockhash: [0u8; 32],
-            transaction_count: 0,
-            non_vote_transaction_count: 0,
-            failed_transaction_count: 0,
-            transaction_entry_count: 0,
-            block_cost: 0,
-            block_cost_limit: 0,
-            account_cost_limit: 0,
-            total_fee: 0,
-            priority_fee: 0,
-            block_height: 0,
-            transaction_count_total: 0,
-            non_vote_transaction_count_total: 0,
+            ..empty_frozen()
         }
     }
 
@@ -2214,17 +2106,26 @@ mod tests {
 
     #[test]
     fn test_a_full_info_set_leaves_a_newer_change_alone() {
-        use solana_core::node_events::output::info_events;
+        use solana_core::frozen_bank_events::config_events;
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
-        let key = Pubkey::new_unique();
-        let named = |name: &str| solana_core::node_events::info::ValidatorInfo {
-            name: Some(name.to_string()),
-            icon_url: None,
+        let (key, account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let named = |name: &str| {
+            [(
+                account,
+                crate::validator_info::info_account(key, &format!(r#"{{"name":"{name}"}}"#)),
+            )]
         };
-        for event in info_events(crate::events::INFO_CHANGE, 1, 20, &[(key, named("new"))]) {
+        for event in config_events(crate::events::INFO_CHANGE, 1, 20, &named("new")) {
             mirror.apply_info(&event);
         }
-        for event in info_events(INFO_FULL_SET, 1, 10, &[(key, named("old"))]) {
+        // An account that is not a validator's info.
+        let other = solana_account::AccountSharedData::new(1, 8, &solana_sdk_ids::config::id());
+        for event in config_events(
+            INFO_FULL_SET,
+            1,
+            10,
+            &[named("old")[0].clone(), (Pubkey::new_unique(), other)],
+        ) {
             mirror.apply_info(&event);
         }
         let (_, entries) = mirror.validator_info_all();
