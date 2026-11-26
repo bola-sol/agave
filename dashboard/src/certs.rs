@@ -2,23 +2,16 @@
 //! validator's was, read from the reward certificates alpenglow leaders write
 //! into their block footers.
 
+pub use solana_core::node_events::blocks::{Block, FooterFacts, carried_fast, read_block};
 use {
     crate::source::{BankView, Source},
     agave_votor_messages::reward_certificate::NUM_SLOTS_FOR_REWARD,
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_entry::block_component::{
-        BlockComponent, BlockFooterV1, VersionedBlockFooter, VersionedBlockMarker,
-    },
-    solana_ledger::{blockstore::Blockstore, shred::DATA_SHREDS_PER_FEC_BLOCK},
     solana_pubkey::Pubkey,
     solana_signer_store::{Decoded, decode},
     std::collections::{BTreeMap, HashMap},
 };
-
-/// The footer sits in the second to last FEC set; the last one closes the
-/// block. Reading from there costs two sets of shreds whatever the block holds.
-const FOOTER_SPAN: u64 = 2 * DATA_SHREDS_PER_FEC_BLOCK as u64;
 
 /// Slots from the epoch's first over which the cluster pays out stake
 /// rewards, when every validator misses votes.
@@ -558,41 +551,6 @@ impl Tally {
     }
 }
 
-/// What the dashboard reads of a block footer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FooterFacts {
-    /// The leader's close time, unix nanoseconds.
-    pub close_nanos: u64,
-    pub notar_bitmap: Option<Vec<u8>>,
-    pub skip_bitmap: Option<Vec<u8>>,
-    /// Whether the finalization certificate it carries is the fast one.
-    pub fast: Option<bool>,
-}
-
-impl From<&BlockFooterV1> for FooterFacts {
-    fn from(footer: &BlockFooterV1) -> Self {
-        Self {
-            close_nanos: footer.block_producer_time_nanos,
-            notar_bitmap: footer
-                .notar_reward_cert
-                .as_ref()
-                .map(|cert| cert.bitmap().to_vec()),
-            skip_bitmap: footer
-                .skip_reward_cert
-                .as_ref()
-                .map(|cert| cert.to_bitmap().to_vec()),
-            fast: carried_fast(footer),
-        }
-    }
-}
-
-pub enum Block {
-    Footer(Box<FooterFacts>),
-    Missing,
-    Pending,
-    Opaque,
-}
-
 /// What a walk read: the last slot, our marks, and when each block's leader closed it.
 #[derive(Debug, Default)]
 pub struct Walked {
@@ -681,15 +639,6 @@ fn footer_reading(bank: &dyn BankView, slot: Slot, footer: &FooterFacts) -> Foot
     }
 }
 
-/// A fast certificate is one notarize aggregate; a slow one adds the notarize aggregate to its
-/// finalize votes.
-fn carried_fast(footer: &BlockFooterV1) -> Option<bool> {
-    footer
-        .block_final_cert
-        .as_ref()
-        .map(|cert| cert.notar_aggregate.is_none())
-}
-
 /// The share of the slot's rank map stake set in `bitmap`, in basis points.
 fn notarized_share(bank: &dyn BankView, slot: Slot, bitmap: &[u8]) -> Option<u16> {
     let map = bank.rank_map(slot)?;
@@ -709,42 +658,6 @@ fn rank_of(bank: &dyn BankView, vote_account: &Pubkey, slot: Slot) -> Option<(us
     let map = bank.rank_map(slot)?;
     let rank = map.rank_of(vote_account)?;
     Some((usize::from(rank), map.len()))
-}
-
-pub(crate) fn read_block(blockstore: &Blockstore, slot: Slot, root: Slot) -> Block {
-    if slot > root {
-        return Block::Pending;
-    }
-    // Blockstore roots are written before bank forks' root moves, so a slot up to the root that
-    // is not one was skipped.
-    if !blockstore.is_root(slot) {
-        return Block::Missing;
-    }
-    let meta = match blockstore.meta(slot) {
-        Ok(Some(meta)) if meta.is_full() => meta,
-        // Rooted but not held, as a downloaded snapshot's slot.
-        _ => return Block::Opaque,
-    };
-    let Some(last) = meta.last_index else {
-        return Block::Opaque;
-    };
-    let start = last.saturating_add(1).saturating_sub(FOOTER_SPAN);
-    let Ok((components, _, _)) = blockstore.get_slot_components_with_shred_info(slot, start, false)
-    else {
-        return Block::Opaque;
-    };
-    components
-        .into_iter()
-        .rev()
-        .find_map(|component| match component {
-            BlockComponent::BlockMarker(VersionedBlockMarker::V1(marker)) => marker
-                .as_block_footer()
-                .map(|VersionedBlockFooter::V1(footer)| footer.clone()),
-            BlockComponent::EntryBatch(_) => None,
-        })
-        .map_or(Block::Opaque, |footer| {
-            Block::Footer(Box::new(FooterFacts::from(&footer)))
-        })
 }
 
 /// Takes each certificate's bitmap. Neither means nobody was paid; `None` where one could not
@@ -814,10 +727,12 @@ pub fn median_of(mut counts: Vec<u64>) -> Option<u64> {
 mod tests {
     use {
         super::*,
-        solana_entry::block_component::BlockFinalizationCert,
+        solana_entry::block_component::{
+            BlockComponent, BlockFinalizationCert, BlockFooterV1, VersionedBlockMarker,
+        },
         solana_keypair::Keypair,
         solana_ledger::{
-            blockstore::make_slot_entries,
+            blockstore::{Blockstore, make_slot_entries},
             get_tmp_ledger_path_auto_delete,
             shred::{ProcessShredsStats, Shredder},
         },

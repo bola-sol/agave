@@ -18,6 +18,7 @@ use {
             verify_blockstore_root_with_vote_history,
         },
         forwarding_stage::ForwardingClientConfig,
+        node_events::{NodeEvents, metric_forward::MetricForward, reader::Reader},
         repair::{
             self, repair_handler::RepairHandlerType, serve_repair_service::ServeRepairService,
         },
@@ -749,6 +750,7 @@ pub struct Validator {
     xdp_transmitter: Option<Transmitter>,
     bank_notification_relay: Option<JoinHandle<()>>,
     bank_state_events: BankStateEvents,
+    node_events: NodeEvents,
     start_progress_events: StartProgressEvents,
     // This runtime is used to run the client owned by SendTransactionService.
     // We don't wait for its JoinHandle here because ownership and shutdown
@@ -809,6 +811,8 @@ impl Validator {
         xdp_transmit_setup: Option<XdpTransmitSetup>,
         exit: Arc<AtomicBool>,
     ) -> Result<Self> {
+        // First, as the system monitor reports the XDP setup once at its start.
+        MetricForward::install();
         #[cfg(debug_assertions)]
         const DEBUG_ASSERTION_STATUS: &str = "enabled";
         #[cfg(not(debug_assertions))]
@@ -1963,6 +1967,22 @@ impl Validator {
             exit.clone(),
         )
         .map_err(ValidatorError::Other)?;
+        let node_events = NodeEvents::new(
+            &event_system,
+            Reader::new(
+                cluster_info.clone(),
+                bank_forks.clone(),
+                block_commitment_cache.clone(),
+                blockstore.clone(),
+                leader_schedule_cache.clone(),
+                *vote_account,
+                highest_finalized.clone(),
+                config.account_paths.clone(),
+                Some(config.snapshot_config.clone()),
+            ),
+            exit.clone(),
+        )
+        .map_err(|err| ValidatorError::Other(format!("Failed to start the node events: {err}")))?;
 
         *admin_rpc_service_post_init.write().unwrap() = Some(AdminRpcRequestMetadataPostInit {
             event_system: event_system.clone(),
@@ -2017,6 +2037,7 @@ impl Validator {
             xdp_transmitter,
             bank_notification_relay,
             bank_state_events,
+            node_events,
             start_progress_events,
             _tpu_client_next_runtime: tpu_client_next_runtime,
         })
@@ -2185,6 +2206,7 @@ impl Validator {
         self.tpu.join().expect("tpu");
         self.tvu.join().expect("tvu");
         self.bank_state_events.join().expect("bank_state_events");
+        self.node_events.join().expect("node_events");
         self.start_progress_events
             .join()
             .expect("start_progress_events");

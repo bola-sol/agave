@@ -840,9 +840,6 @@ pub fn execute(
                 dashboard_banks.map(|(_, receiver)| receiver),
             )
             .map_err(|err| format!("failed to start the dashboard collector: {err}"))?;
-        dashboard_service
-            .publish_events(validator.event_system())
-            .map_err(|err| format!("failed to start the dashboard's event streams: {err}"))?;
     }
 
     if let Some(filename) = init_complete_file {

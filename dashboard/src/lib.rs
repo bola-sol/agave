@@ -9,15 +9,12 @@ pub mod collect;
 pub mod config;
 pub mod context;
 pub mod event_input;
-pub mod event_output;
-pub mod events;
 #[cfg(test)]
 pub(crate) mod fixture;
 pub mod geoip;
 pub mod history;
 pub mod host_stats;
 pub mod meters;
-pub mod metric_events;
 pub mod metrics_tap;
 pub mod mirror;
 pub mod net_ifaces;
@@ -38,6 +35,10 @@ pub mod tips;
 pub mod turns;
 pub mod udp_drops;
 pub mod validator_info;
-pub mod versions;
 
-pub use {config::DashboardConfig, context::DashboardContext, service::DashboardService};
+pub use {
+    config::DashboardConfig,
+    context::DashboardContext,
+    service::DashboardService,
+    solana_core::node_events::{metric_types as metric_events, types as events, versions},
+};

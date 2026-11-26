@@ -70,6 +70,7 @@ arc-swap = { workspace = true }
 arrayvec = { workspace = true }
 bincode = { workspace = true }
 bitvec = { workspace = true }
+bv = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["default", "serde"] }
 crossbeam-channel = { workspace = true }
@@ -91,6 +92,7 @@ rts-alloc = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
+serde_json = { workspace = true }
 shaq = { workspace = true }
 signal-hook = { workspace = true }
 slab = { workspace = true }
@@ -102,7 +104,9 @@ solana-bls-signatures = { workspace = true }
 solana-client = { workspace = true }
 solana-clock = { workspace = true }
 solana-cluster-type = { workspace = true }
+solana-compute-budget-instruction = { workspace = true }
 solana-compute-budget-interface = { workspace = true }
+solana-config-interface = { workspace = true }
 solana-connection-cache = { workspace = true }
 solana-cost-model = { workspace = true }
 solana-ed25519-program = { workspace = true }
@@ -171,6 +175,7 @@ solana-unified-scheduler-pool = { workspace = true }
 solana-validator-exit = { workspace = true }
 solana-version = { workspace = true }
 solana-vote = { workspace = true }
+solana-vote-interface = { workspace = true }
 solana-vote-program = { workspace = true }
 static_assertions = { workspace = true }
 strum = { workspace = true, features = ["derive"] }

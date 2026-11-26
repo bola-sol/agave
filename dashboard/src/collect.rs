@@ -593,7 +593,6 @@ pub struct Collector {
     cluster_charts_made: u64,
     /// Unix milliseconds this node caught up with the cluster, where it had to.
     caught_up_millis: Option<u64>,
-    caught_up_shared: Arc<AtomicU64>,
     /// The previous epoch's skipped percent, by the epoch it was read in.
     previous_skips: Option<(Epoch, Option<f64>)>,
     subscribers: usize,
@@ -659,8 +658,6 @@ pub struct CollectorShared {
     pub startup: Arc<Mutex<StartupPublisher>>,
     pub metrics_tap: Arc<MetricsTap>,
     pub failed_total: Arc<AtomicU64>,
-    /// Unix milliseconds the node caught up with the cluster, 0 before; for the event streams.
-    pub caught_up: Arc<AtomicU64>,
 }
 
 impl Collector {
@@ -697,7 +694,6 @@ impl Collector {
             startup,
             metrics_tap,
             failed_total,
-            caught_up,
         } = shared;
         let now = Instant::now();
         Self {
@@ -745,7 +741,6 @@ impl Collector {
             leader_traits_at: now.checked_sub(LEADER_TRAITS_EVERY).unwrap_or(now),
             cluster_charts_made: 0,
             caught_up_millis: None,
-            caught_up_shared: caught_up,
             previous_skips: None,
             subscribers: 0,
             tips,
@@ -2281,7 +2276,6 @@ impl Collector {
                 .set_live_from(self.last_completed_slot.saturating_add(1));
         }
         self.caught_up_millis = Some(at_millis);
-        self.caught_up_shared.store(at_millis, Ordering::Relaxed);
         self.publisher.publish(
             TOPIC_SUMMARY,
             "caught_up_time_nanos",
