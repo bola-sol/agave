@@ -3,7 +3,6 @@
 
 pub mod bank_view;
 pub mod blocks;
-pub mod catch_up;
 pub mod info;
 pub mod metric_forward;
 pub mod metric_types;

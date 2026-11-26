@@ -36,14 +36,13 @@ pub trait Source: Send + Sync {
     fn rpc_node_count(&self, peers: &[(PeerRow, u64)]) -> usize;
     /// Whether gossip accepts only globally routable addresses.
     fn global_addresses_only(&self) -> bool;
-    /// Unix milliseconds the node caught up with the cluster, where another process reported it.
+    /// Unix milliseconds this validator process caught up with the cluster, as recorded by an
+    /// earlier run of the dashboard.
     fn caught_up_millis(&self) -> Option<u64> {
         None
     }
-    /// Whether `caught_up_millis` comes from another process, which is then waited for.
-    fn reports_caught_up(&self) -> bool {
-        false
-    }
+    /// Keeps the catch-up time for a later run of the dashboard against the same process.
+    fn record_caught_up(&self, _at_millis: u64) {}
     fn banks(&self) -> Banks;
     fn root_bank(&self) -> Arc<dyn BankView>;
     fn working_bank(&self) -> Arc<dyn BankView>;

@@ -72,8 +72,6 @@ pub struct NodeInfoEvent {
     pub incremental_snapshot_interval: u64,
     /// Gossip accepts only globally routable addresses, which the RPC node count follows.
     pub global_addresses_only: bool,
-    /// Unix milliseconds the node caught up with the cluster, 0 before.
-    pub caught_up_ms: u64,
 }
 
 /// Where the node stands: commitment, the highest slot, the tip and the ledger's floor.
@@ -493,6 +491,31 @@ pub fn pack_addr(addr: Option<SocketAddr>) -> [u8; ADDR_BYTES] {
         packed[16..].copy_from_slice(&addr.port().to_be_bytes());
     }
     packed
+}
+
+/// A contact's addresses in `ADDR_*` order.
+pub fn pack_contact(
+    contact: &solana_gossip::contact_info::ContactInfo,
+) -> [u8; ADDRS * ADDR_BYTES] {
+    use solana_gossip::contact_info::Protocol;
+    let mut addrs = [0u8; ADDRS * ADDR_BYTES];
+    for (at, addr) in [
+        (ADDR_GOSSIP, contact.gossip()),
+        (ADDR_RPC, contact.rpc()),
+        (ADDR_TVU_UDP, contact.tvu(Protocol::UDP)),
+        (ADDR_TPU_QUIC, contact.tpu(Protocol::QUIC)),
+        (ADDR_TPU_FORWARDS_QUIC, contact.tpu_forwards(Protocol::QUIC)),
+        (ADDR_TPU_VOTE_UDP, contact.tpu_vote(Protocol::UDP)),
+        (ADDR_TPU_VOTE_QUIC, contact.tpu_vote(Protocol::QUIC)),
+        (ADDR_SERVE_REPAIR_UDP, contact.serve_repair(Protocol::UDP)),
+        (ADDR_ALPENGLOW, contact.alpenglow()),
+    ] {
+        let start = at.saturating_mul(ADDR_BYTES);
+        if let Some(slot) = addrs.get_mut(start..start.saturating_add(ADDR_BYTES)) {
+            slot.copy_from_slice(&pack_addr(addr));
+        }
+    }
+    addrs
 }
 
 pub fn unpack_addr(packed: &[u8]) -> Option<SocketAddr> {
