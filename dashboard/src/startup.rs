@@ -10,7 +10,7 @@ use {
     crossbeam_channel::Receiver,
     serde::Serialize,
     solana_clock::Slot,
-    solana_core::validator::{GossipReady, ValidatorStartProgress},
+    solana_core::validator::ValidatorStartProgress,
     solana_gossip::{
         cluster_info::ClusterInfo, contact_info::ContactInfo,
         crds_gossip_pull::CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS,
@@ -28,6 +28,11 @@ use {
 pub const KEY_STARTUP_PROGRESS: &str = "startup_progress";
 pub const KEY_GOSSIP_STAKE: &str = "gossip_stake";
 
+/// Gossip and bank forks, as an in-process host sends them before the supermajority wait.
+pub type GossipReady = (
+    Arc<ClusterInfo>,
+    Arc<RwLock<solana_runtime::bank_forks::BankForks>>,
+);
 pub type GossipReadyReceiver = Receiver<GossipReady>;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

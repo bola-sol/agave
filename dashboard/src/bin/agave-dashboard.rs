@@ -1,8 +1,4 @@
-//! The dashboard page fed only from the validator's event streams, in its own process.
-//! Test branch only.
-//!
-//! Usage: agave-dashboard-events --events-dir <ledger>/events [--port 3011] [--poll-ms 5]
-//!        [--report-secs 10] [--history-dir <dir>] [--leave-handles]
+//! The dashboard page in its own process, fed from the validator's event streams.
 //!
 //! When the validator it reads exits or is replaced, it starts itself again from argv[0], since
 //! the mirror and the collector hold the old validator's state.
@@ -14,7 +10,7 @@ use {
     },
     solana_core::validator::ValidatorStartProgress,
     std::{
-        net::{Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         os::unix::process::CommandExt,
         path::{Path, PathBuf},
         process::{Command, ExitCode},
@@ -28,33 +24,58 @@ use {
     tokio::signal::unix::{SignalKind, signal},
 };
 
+const USAGE: &str = "\
+Usage: agave-dashboard --ledger <DIR> [OPTIONS]
+
+  --ledger <DIR>         The validator's ledger: its events/ and admin.rpc are read
+  --port <PORT>          Port to serve the page on [default: 10999]
+  --bind-address <HOST>  Address to serve on [default: 127.0.0.1]; any other address exposes
+                         validator internals to anyone who can reach it
+  --allowed-host <HOST>  A host name the page answers to besides IP addresses and localhost,
+                         such as a proxy's; repeatable
+  --history-dir <DIR>    Where the page's history is written and read back after a restart
+  --poll-ms <MS>         How often the event streams are read [default: 5]
+  --report-secs <SECS>   How often the streams' counts are logged [default: 10]
+  --help                 Print this";
+
+const DEFAULT_PORT: u16 = 10999;
+
+#[derive(Debug, PartialEq, Eq)]
 struct Args {
-    events_dir: PathBuf,
-    port: u16,
+    ledger: PathBuf,
+    listen_addr: SocketAddr,
+    allowed_hosts: Vec<String>,
+    history_dir: Option<PathBuf>,
     poll: Duration,
     report: Duration,
-    leave_handles: bool,
-    history_dir: Option<PathBuf>,
 }
 
-fn parse_args() -> Result<Args, String> {
-    let mut events_dir = None;
-    let mut port = 3011u16;
+/// `None` for `--help`.
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, String> {
+    let mut ledger = None;
+    let mut port = DEFAULT_PORT;
+    let mut bind_address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let mut allowed_hosts = Vec::new();
+    let mut history_dir = None;
     let mut poll_ms = 5u64;
     let mut report_secs = 10u64;
-    let mut leave_handles = false;
-    let mut history_dir = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
-            "--events-dir" => events_dir = Some(PathBuf::from(value("--events-dir")?)),
-            "--history-dir" => history_dir = Some(PathBuf::from(value("--history-dir")?)),
+            "--help" | "-h" => return Ok(None),
+            "--ledger" => ledger = Some(PathBuf::from(value("--ledger")?)),
             "--port" => {
                 port = value("--port")?
                     .parse()
                     .map_err(|err| format!("--port: {err}"))?
             }
+            "--bind-address" => {
+                bind_address = solana_net_utils::parse_host(&value("--bind-address")?)
+                    .map_err(|err| format!("--bind-address: {err}"))?
+            }
+            "--allowed-host" => allowed_hosts.push(value("--allowed-host")?),
+            "--history-dir" => history_dir = Some(PathBuf::from(value("--history-dir")?)),
             "--poll-ms" => {
                 poll_ms = value("--poll-ms")?
                     .parse()
@@ -65,18 +86,17 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|err| format!("--report-secs: {err}"))?
             }
-            "--leave-handles" => leave_handles = true,
-            other => return Err(format!("unknown argument {other}")),
+            other => return Err(format!("unknown argument {other}\n\n{USAGE}")),
         }
     }
-    Ok(Args {
-        events_dir: events_dir.ok_or("--events-dir is required")?,
-        port,
+    Ok(Some(Args {
+        ledger: ledger.ok_or(format!("--ledger is required\n\n{USAGE}"))?,
+        listen_addr: SocketAddr::new(bind_address, port),
+        allowed_hosts,
+        history_dir,
         poll: Duration::from_millis(poll_ms.max(1)),
         report: Duration::from_secs(report_secs.max(1)),
-        leave_handles,
-        history_dir,
-    })
+    }))
 }
 
 /// Sets `stop` on SIGTERM, SIGINT or SIGHUP, so a closed terminal also drops the subscribers.
@@ -108,8 +128,12 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<thread::JoinHandle<()
 
 fn main() -> ExitCode {
     agave_logger::setup_with_default("info");
-    let args = match parse_args() {
-        Ok(args) => args,
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(Some(args)) => args,
+        Ok(None) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
         Err(err) => {
             eprintln!("{err}");
             return ExitCode::FAILURE;
@@ -118,12 +142,14 @@ fn main() -> ExitCode {
 
     let exit = Arc::new(AtomicBool::new(false));
     let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
-    let config = DashboardConfig {
-        allowed_hosts: vec!["localhost".to_string(), "127.0.0.1".to_string()],
-        history_dir: args.history_dir.clone(),
-        ..DashboardConfig::new(addr)
-    };
+    let addr = args.listen_addr;
+    let mut config = DashboardConfig::new(addr);
+    // Added to the defaults rather than replacing them, so a proxied page stays reachable on the
+    // box it runs on.
+    config
+        .allowed_hosts
+        .extend(args.allowed_hosts.iter().cloned());
+    config.history_dir = args.history_dir.clone();
     let mut service =
         match DashboardService::start(config, start_progress.clone(), exit.clone(), None) {
             Ok(service) => service,
@@ -137,18 +163,14 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     log::info!(
-        "events dashboard on http://{addr}, reading {}",
-        args.events_dir.display()
+        "dashboard on http://{addr}, reading {}",
+        args.ledger.display()
     );
 
     let mirror = Arc::new(Mirror::new(start_progress.clone()));
     service.report_startup_from(mirror.reported());
-    let ledger = args
-        .events_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
-    let mut input = EventInput::new(args.events_dir, mirror.clone(), service.metrics_tap());
+    let ledger = args.ledger.clone();
+    let mut input = EventInput::new(ledger.join("events"), mirror.clone(), service.metrics_tap());
     let mut admin_read: Option<Instant> = None;
     let mut admin_pid = None;
     let mut attached = false;
@@ -201,10 +223,6 @@ fn main() -> ExitCode {
     }
 
     log::info!("\n{}", input.report());
-    if args.leave_handles && !restart {
-        log::info!("events: exiting without dropping the subscribers");
-        std::process::exit(0);
-    }
     input.disconnect();
     log::info!("events: subscribers dropped");
     if restart {
@@ -215,9 +233,7 @@ fn main() -> ExitCode {
     }
     if restart {
         let mut argv = std::env::args_os();
-        let program = argv
-            .next()
-            .unwrap_or_else(|| "agave-dashboard-events".into());
+        let program = argv.next().unwrap_or_else(|| "agave-dashboard".into());
         let err = Command::new(program).args(argv).exec();
         log::error!("events: could not start again: {err}");
         return ExitCode::FAILURE;
@@ -264,5 +280,64 @@ impl ValidatorWatch {
             Some(held) if held != pid => true,
             Some(_) => self.visible && !alive,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(args: &[&str]) -> Result<Option<Args>, String> {
+        parse_args(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn test_only_the_ledger_is_required() {
+        let args = parsed(&["--ledger", "/ledger"]).unwrap().unwrap();
+        assert_eq!(args.ledger, PathBuf::from("/ledger"));
+        assert_eq!(
+            args.listen_addr,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_PORT))
+        );
+        assert!(args.allowed_hosts.is_empty());
+        assert_eq!(args.history_dir, None);
+        assert!(parsed(&[]).unwrap_err().starts_with("--ledger is required"));
+    }
+
+    #[test]
+    fn test_each_flag_is_read() {
+        let args = parsed(&[
+            "--ledger",
+            "/ledger",
+            "--port",
+            "3011",
+            "--bind-address",
+            "10.0.0.2",
+            "--allowed-host",
+            "a.example",
+            "--allowed-host",
+            "b.example",
+            "--history-dir",
+            "/history",
+            "--poll-ms",
+            "0",
+            "--report-secs",
+            "30",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(args.listen_addr, "10.0.0.2:3011".parse().unwrap());
+        assert_eq!(args.allowed_hosts, ["a.example", "b.example"]);
+        assert_eq!(args.history_dir, Some(PathBuf::from("/history")));
+        assert_eq!(args.poll, Duration::from_millis(1));
+        assert_eq!(args.report, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_old_and_unknown_flags_are_refused() {
+        assert!(parsed(&["--ledger", "/l", "--events-dir", "/l/events"]).is_err());
+        assert!(parsed(&["--ledger", "/l", "--leave-handles"]).is_err());
+        assert!(parsed(&["--ledger"]).is_err());
+        assert_eq!(parsed(&["--help"]), Ok(None));
     }
 }
