@@ -19,7 +19,8 @@ use {
         },
         forwarding_stage::ForwardingClientConfig,
         ledger_events::LedgerSlotObserver,
-        node_events::{NodeEvents, metric_forward::MetricForward, reader::Reader},
+        metric_events::forward::MetricForward,
+        node_events::{NodeEvents, reader::Reader},
         repair::{
             self, repair_handler::RepairHandlerType, serve_repair_service::ServeRepairService,
         },

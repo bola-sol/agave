@@ -44,5 +44,5 @@ pub use {
     config::DashboardConfig,
     context::DashboardContext,
     service::DashboardService,
-    solana_core::node_events::{metric_types as metric_events, types as events},
+    solana_core::{metric_events::types as metric_events, node_events::types as events},
 };

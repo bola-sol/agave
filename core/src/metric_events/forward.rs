@@ -2,7 +2,7 @@
 //! sent once an hour, a run or an epoch to send again.
 
 use {
-    super::metric_types::carried,
+    super::types::carried,
     crossbeam_channel::Sender,
     solana_clock::Epoch,
     solana_metrics::datapoint::DataPoint,
@@ -16,7 +16,6 @@ use {
 };
 
 const XDP_NETWORK_CONFIG: &str = "xdp-network-config";
-const WFSM_GOSSIP: &str = "wfsm_gossip";
 const VOTE_ARRIVAL: &str = "consensus_vote_metrics";
 
 /// The newest point of each one-shot row, and every vote arrival point of the newest epoch.
@@ -87,7 +86,7 @@ impl MetricForward {
 
     fn latch(&self, point: &DataPoint, now_millis: u64) {
         match point.name {
-            XDP_NETWORK_CONFIG | WFSM_GOSSIP => {
+            XDP_NETWORK_CONFIG => {
                 let mut latched = locked(&self.latched);
                 latched.once.retain(|(held, _)| held.name != point.name);
                 latched.once.push((point.clone(), now_millis));
@@ -146,9 +145,8 @@ mod tests {
         let forward = MetricForward::default();
         let (sender, _receiver) = crossbeam_channel::unbounded();
         forward.forward_to(sender);
-        forward.observe(&named(WFSM_GOSSIP, &[("online_stake", "5i")]));
-        forward.observe(&named(WFSM_GOSSIP, &[("online_stake", "9i")]));
-        forward.observe(&named(XDP_NETWORK_CONFIG, &[]));
+        forward.observe(&named(XDP_NETWORK_CONFIG, &[("model", "5i")]));
+        forward.observe(&named(XDP_NETWORK_CONFIG, &[("model", "9i")]));
         for epoch in ["6i", "7i", "7i", "6i"] {
             forward.observe(&named(VOTE_ARRIVAL, &[("epoch", epoch)]));
         }
@@ -156,13 +154,10 @@ mod tests {
 
         let latched = forward.latched_points();
         let names: Vec<_> = latched.iter().map(|(point, _)| point.name).collect();
-        assert_eq!(
-            names,
-            [WFSM_GOSSIP, XDP_NETWORK_CONFIG, VOTE_ARRIVAL, VOTE_ARRIVAL]
-        );
-        assert_eq!(number_named(&latched[0].0, "online_stake"), Some(9));
+        assert_eq!(names, [XDP_NETWORK_CONFIG, VOTE_ARRIVAL, VOTE_ARRIVAL]);
+        assert_eq!(number_named(&latched[0].0, "model"), Some(9));
         assert!(
-            latched[2..]
+            latched[1..]
                 .iter()
                 .all(|(point, _)| number_named(point, "epoch") == Some(7))
         );

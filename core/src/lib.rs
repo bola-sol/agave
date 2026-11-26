@@ -26,6 +26,7 @@ pub mod forwarding_stage;
 pub mod frozen_bank_events;
 pub mod gen_keys;
 pub mod ledger_events;
+pub mod metric_events;
 pub mod next_leader;
 pub mod node_events;
 pub mod optimistic_confirmation_verifier;
