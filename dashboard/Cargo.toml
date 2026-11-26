@@ -18,8 +18,8 @@ rustdoc-args = ["--cfg=docsrs"]
 agave-unstable-api = []
 
 [[bin]]
-name = "agave-dashboard-events"
-path = "src/bin/agave-dashboard-events.rs"
+name = "agave-dashboard"
+path = "src/bin/agave-dashboard.rs"
 required-features = ["agave-unstable-api"]
 
 [dependencies]

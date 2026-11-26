@@ -997,7 +997,6 @@ impl MetricsTap {
         let observer = tap.clone();
         if !solana_metrics::set_datapoint_observer(Box::new(move |point| {
             observer.observe_at(point, timestamp());
-            solana_core::node_events::metric_forward::MetricForward::global().observe(point);
         })) {
             log::warn!("dashboard: something else is already watching metrics points");
         }

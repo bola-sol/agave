@@ -48,7 +48,7 @@ use {
     agave_xdp::transmitter::{Transmitter, TransmitterBuilder, XdpSender},
     anyhow::{Result, anyhow},
     arc_swap::ArcSwap,
-    crossbeam_channel::{Receiver, Sender, bounded, unbounded},
+    crossbeam_channel::{Receiver, bounded, unbounded},
     serde::{Deserialize, Serialize},
     solana_account::{ReadableAccount, WINCODE_CONFIG},
     solana_accounts_db::{
@@ -119,8 +119,7 @@ use {
     solana_rpc::{
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::{
-            BankNotificationSender, BankNotificationSenderConfig,
-            BankNotificationWithDependencyWork, OptimisticallyConfirmedBank,
+            BankNotificationSenderConfig, OptimisticallyConfirmedBank,
             OptimisticallyConfirmedBankTracker,
         },
         rpc::JsonRpcConfig,
@@ -147,7 +146,6 @@ use {
         snapshot_controller::SnapshotController,
         snapshot_utils,
         transaction_execution::TransactionStatusSender,
-        validated_block_finalization::ValidatedBlockFinalizationCert,
     },
     solana_send_transaction_service::send_transaction_service::Config as SendTransactionServiceConfig,
     solana_shred_version::compute_shred_version,
@@ -332,9 +330,6 @@ pub struct ValidatorLogConfig {
     pub logrotate_flag: Arc<AtomicBool>,
 }
 
-/// Gossip and bank forks, as sent before the supermajority wait.
-pub type GossipReady = (Arc<ClusterInfo>, Arc<RwLock<BankForks>>);
-
 pub struct ValidatorConfig {
     /// Log messages go to `stderr` if `None`
     pub log_config: Option<ValidatorLogConfig>,
@@ -419,11 +414,6 @@ pub struct ValidatorConfig {
     pub repair_handler_type: RepairHandlerType,
     // Thread niceness adjustment for snapshot packager service
     pub snapshot_packager_niceness_adj: i8,
-    /// Receive every bank notification replay sends, beside the RPC tracker.
-    pub extra_bank_notification_senders: Vec<BankNotificationSender>,
-    /// Handed gossip and bank forks before the supermajority wait, for a
-    /// reader that wants the wait's view of the cluster.
-    pub gossip_ready_sender: Option<Sender<GossipReady>>,
 }
 
 impl ValidatorConfig {
@@ -506,8 +496,6 @@ impl ValidatorConfig {
             delay_leader_block_for_pending_fork: true,
             repair_handler_type: RepairHandlerType::default(),
             snapshot_packager_niceness_adj: 0,
-            extra_bank_notification_senders: Vec::new(),
-            gossip_ready_sender: None,
         }
     }
 
@@ -736,10 +724,7 @@ pub struct Validator {
     pub blockstore: Arc<Blockstore>,
     /// Keep the event directory alive even when no admin RPC metadata or event
     /// producers retain a handle yet.
-    event_system: EventSystem,
-    pub block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
-    pub leader_schedule_cache: Arc<LeaderScheduleCache>,
-    pub highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
+    _event_system: EventSystem,
     geyser_plugin_service: Option<GeyserPluginService>,
     /// Held for the lifetime of the validator so the dispatch thread keeps
     /// running. `None` when no loaded plugin opted into contact info
@@ -748,7 +733,6 @@ pub struct Validator {
     blockstore_metric_report_service: BlockstoreMetricReportService,
     accounts_background_service: AccountsBackgroundService,
     xdp_transmitter: Option<Transmitter>,
-    bank_notification_relay: Option<JoinHandle<()>>,
     bank_state_events: BankStateEvents,
     node_events: NodeEvents,
     start_progress_events: StartProgressEvents,
@@ -1470,41 +1454,6 @@ impl Validator {
             (None, None, None, None, None, None, None)
         };
 
-        // Replay reports on one channel. Where the config names other receivers,
-        // a relay copies each notification to them and to the RPC tracker.
-        let (bank_notification_sender, bank_notification_relay) =
-            if config.extra_bank_notification_senders.is_empty() {
-                (bank_notification_sender, None)
-            } else {
-                let (should_send_parents, dependency_tracker) = match &bank_notification_sender {
-                    Some(rpc) => (rpc.should_send_parents, rpc.dependency_tracker.clone()),
-                    // Geyser hears of banks only through the RPC tracker.
-                    None => (false, None),
-                };
-                let mut subscribers = config.extra_bank_notification_senders.clone();
-                subscribers.extend(bank_notification_sender.map(|rpc| rpc.sender));
-                let (sender, receiver) = unbounded::<BankNotificationWithDependencyWork>();
-                let relay = Builder::new()
-                    .name("solBankNotifRly".to_string())
-                    .spawn(move || {
-                        for notification in receiver {
-                            // A full receiver misses this one rather than hold up the rest.
-                            for subscriber in &subscribers {
-                                let _ = subscriber.try_send(notification.clone());
-                            }
-                        }
-                    })
-                    .unwrap();
-                (
-                    Some(BankNotificationSenderConfig {
-                        sender,
-                        should_send_parents,
-                        dependency_tracker,
-                    }),
-                    Some(relay),
-                )
-            };
-
         // CompletedDataSetsService feeds two independent sinks: RPC signatureSubscribe
         // notifications (which need rpc_subscriptions) and the geyser deshred-transaction notifier
         // (which does not). Spawn it whenever either sink wants it, kept out of the rpc_addrs block
@@ -1653,10 +1602,6 @@ impl Validator {
                 bank_forks_r.migration_status(),
             )
         };
-
-        if let Some(sender) = &config.gossip_ready_sender {
-            let _ = sender.try_send((cluster_info.clone(), bank_forks.clone()));
-        }
 
         let waited_for_supermajority = wait_for_supermajority(
             config,
@@ -2026,16 +1971,12 @@ impl Validator {
             cluster_info,
             bank_forks,
             blockstore,
-            event_system,
-            block_commitment_cache,
-            leader_schedule_cache,
-            highest_finalized,
+            _event_system: event_system,
             geyser_plugin_service,
             _contact_info_notifier: contact_info_notifier,
             blockstore_metric_report_service,
             accounts_background_service,
             xdp_transmitter,
-            bank_notification_relay,
             bank_state_events,
             node_events,
             start_progress_events,
@@ -2053,11 +1994,6 @@ impl Validator {
             signal_hook::flag::register(libc::SIGUSR1, flag.clone())?;
         }
         Ok(flag)
-    }
-
-    /// The event system the validator's streams are published on.
-    pub fn event_system(&self) -> &EventSystem {
-        &self.event_system
     }
 
     /// Monitor registered signal handlers and the validator's exit flag
@@ -2210,9 +2146,6 @@ impl Validator {
         self.start_progress_events
             .join()
             .expect("start_progress_events");
-        if let Some(relay) = self.bank_notification_relay {
-            relay.join().expect("bank_notification_relay");
-        }
         // TSS can drain safely once its producers have stopped.
         if let Some(transaction_status_service) = self.transaction_status_service {
             transaction_status_service
