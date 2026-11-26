@@ -5,7 +5,6 @@ use {
     super::{
         bank_view::BankView,
         blocks::{Block, TxOutcome},
-        info::{ValidatorInfo, ValidatorInfoCache},
         metric_forward::MetricForward,
         metric_types::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -16,12 +15,9 @@ use {
         reader::Reader,
         types::{
             BITMAP_BYTES, BLOCK_FOOTER, BLOCK_MISSING, BLOCK_OPAQUE, BLOCK_STREAM, BlockEvent,
-            FINALIZATION_RANKS, FINALIZATION_STREAM, FinalizationEvent, ICON_BYTES, INFO_CHANGE,
-            INFO_FULL_SET, LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM,
-            MessageVersionsEvent, NAME_BYTES, OUTCOME_FAILED, OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN,
-            OWN_BLOCK_STREAM, OwnBlockEvent, OwnSetPlace, ROLE_ROOT, ROLE_WORKING,
-            SLOT_CLOCK_STREAM, SlotClockEvent, TX_OUTCOME_STREAM, TxOutcomeEvent,
-            VALIDATOR_INFO_STREAM, ValidatorInfoEvent, pack_str,
+            LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM, MessageVersionsEvent,
+            OUTCOME_FAILED, OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN, OWN_BLOCK_STREAM, OwnBlockEvent,
+            OwnSetPlace, TX_OUTCOME_STREAM, TxOutcomeEvent,
         },
     },
     agave_event_system::{
@@ -43,10 +39,6 @@ use {
 };
 
 const TICK: Duration = Duration::from_millis(200);
-/// A last vote this close to the newest one in the bank counts as carried.
-pub const NEAR_SLOTS: u64 = 3;
-/// Unchanged events go out again this often, so a late subscriber has them soon.
-const RESEND: Duration = Duration::from_secs(5);
 
 /// `publishers` publishers on a new stream.
 fn publishers<E: Event>(
@@ -84,69 +76,10 @@ fn stream<E: Event>(
         .ok_or_else(|| io::Error::other("no publisher"))
 }
 
-/// What decides whether an event changed: everything but its header.
-trait Keyed: Clone + PartialEq {
-    fn unstamped(&self) -> Self;
-}
-
-macro_rules! keyed {
-    ($($event:ty),*) => {$(
-        impl Keyed for $event {
-            fn unstamped(&self) -> Self {
-                Self {
-                    pid: 0,
-                    tid: 0,
-                    timestamp_ns: 0,
-                    ..self.clone()
-                }
-            }
-        }
-    )*};
-}
-
-keyed!(SlotClockEvent);
-
-/// Sends an event when its content changes, when its stream turns on, and every [`RESEND`].
-struct Resent<E: Event> {
-    publisher: Publisher<E>,
-    sent: Option<(E, Instant)>,
-}
-
-impl<E: Event + Keyed> Resent<E> {
-    fn new(publisher: Publisher<E>) -> Self {
-        Self {
-            publisher,
-            sent: None,
-        }
-    }
-
-    fn enabled(&mut self) -> bool {
-        let on = self.publisher.is_enabled();
-        if !on {
-            self.sent = None;
-        }
-        on
-    }
-
-    fn offer(&mut self, event: E, now: Instant) {
-        let key = event.unstamped();
-        let due = self
-            .sent
-            .as_ref()
-            .is_none_or(|(held, at)| *held != key || now.duration_since(*at) >= RESEND);
-        if due {
-            let _ = self.publisher.publish(&event);
-            self.sent = Some((key, now));
-        }
-    }
-}
-
 /// Slots below the highest whose blockstore records are watched.
 const LEDGER_WINDOW: u64 = 64;
 /// How often our blocks this epoch go out whole, besides at turn-on and a new epoch or identity.
 const OWN_EVERY: Duration = Duration::from_secs(10);
-/// How often every validator info entry goes out; changes go out as banks freeze.
-const INFO_EVERY: Duration = Duration::from_secs(60);
 /// How often points sent once an hour, a run or an epoch go again, for a subscriber that missed them.
 const LATCHED_EVERY: Duration = Duration::from_secs(60);
 /// Metrics points held for the publisher.
@@ -162,29 +95,7 @@ const SETTLE_NEAR: u64 = 16;
 /// Blocks read per tick behind the root.
 const BLOCKS_PER_TICK: u64 = 64;
 
-type InfoEntries = Vec<(solana_pubkey::Pubkey, ValidatorInfo)>;
-/// Every validator info entry at the root, then the entries each bank frozen above it changed.
-type InfoScan = JoinHandle<(
-    solana_clock::Slot,
-    InfoEntries,
-    Vec<(solana_clock::Slot, InfoEntries)>,
-)>;
-
 pub(crate) struct EventOutput {
-    info: Publisher<ValidatorInfoEvent>,
-    info_sent: Option<(u64, Instant)>,
-    /// Every name, scanned at turn-on and kept current from frozen banks, sent whole every
-    /// `INFO_EVERY`; empty while the stream is off.
-    info_cache: ValidatorInfoCache,
-    /// The scan running at turn-on.
-    info_scan: Option<InfoScan>,
-    info_scanned: bool,
-    /// The running scan began before the stream last turned off.
-    info_scan_stale: bool,
-    finalization: Publisher<FinalizationEvent>,
-    /// Frozen banks already read for finalization and validator info changes; `None` while both
-    /// streams are off.
-    frozen_seen: Option<std::collections::BTreeSet<solana_clock::Slot>>,
     outcomes: Publisher<TxOutcomeEvent>,
     versions: Publisher<MessageVersionsEvent>,
     /// Frozen banks whose blocks are not yet full, held for their transactions' results.
@@ -202,25 +113,11 @@ pub(crate) struct EventOutput {
     /// Our blocks this epoch read so far; `None` while the stream is off or the schedule unknown.
     own: Option<OwnBlocks>,
     own_generation: u64,
-    root: Resent<SlotClockEvent>,
-    working: Resent<SlotClockEvent>,
 }
 
 impl EventOutput {
     pub(crate) fn new(event_system: &EventSystem) -> io::Result<Self> {
-        let mut clock = publishers::<SlotClockEvent>(event_system, SLOT_CLOCK_STREAM, 256, 2)?;
-        let (Some(working), Some(root)) = (clock.pop(), clock.pop()) else {
-            return Err(io::Error::other("no publishers"));
-        };
         Ok(Self {
-            info: stream(event_system, VALIDATOR_INFO_STREAM, 8192)?,
-            info_sent: None,
-            info_cache: ValidatorInfoCache::default(),
-            info_scan: None,
-            info_scanned: false,
-            info_scan_stale: false,
-            finalization: stream(event_system, FINALIZATION_STREAM, 1024)?,
-            frozen_seen: None,
             outcomes: stream(event_system, TX_OUTCOME_STREAM, 65_536)?,
             versions: stream(event_system, MESSAGE_VERSIONS_STREAM, 256)?,
             held: std::collections::BTreeMap::new(),
@@ -233,8 +130,6 @@ impl EventOutput {
             own_blocks: stream(event_system, OWN_BLOCK_STREAM, 1024)?,
             own: None,
             own_generation: 0,
-            working: Resent::new(working),
-            root: Resent::new(root),
         })
     }
 
@@ -257,33 +152,11 @@ impl EventOutput {
     fn tick(&mut self, held_src: &Arc<Reader>) {
         let src = held_src.as_ref();
         let now = Instant::now();
-        // One root for the blocks and the root clock, so no root goes out ahead of its block.
         let root_bank = src.root_bank();
         self.send_ledger(src);
         self.send_blocks(src, root_bank.as_ref(), now);
         self.send_own_blocks(src, root_bank.as_ref(), now);
         self.send_blocks_read(src);
-        self.send_info(src, now);
-        self.send_frozen_reads(src);
-        let wants_banks = [self.root.enabled(), self.working.enabled()];
-        if !wants_banks.contains(&true) {
-            return;
-        }
-        let working = src.working_bank();
-        let identity = src.identity();
-        let vote_account = src.vote_account();
-        if wants_banks[1] {
-            self.working.offer(
-                clock_event(ROLE_WORKING, working.as_ref(), &identity, &vote_account),
-                now,
-            );
-        }
-        if wants_banks[0] {
-            self.root.offer(
-                clock_event(ROLE_ROOT, root_bank.as_ref(), &identity, &vote_account),
-                now,
-            );
-        }
     }
 }
 
@@ -333,113 +206,6 @@ impl EventOutput {
     }
 
     /// The gossip table whole, with each peer's advertised snapshots.
-    /// Every name, scanned off this thread at turn-on and kept current from frozen banks, so a
-    /// subscriber that joins late waits at most `INFO_EVERY`.
-    fn send_info(&mut self, src: &Reader, now: Instant) {
-        if !self.info.is_enabled() {
-            self.info_sent = None;
-            self.info_cache = ValidatorInfoCache::default();
-            self.info_scanned = false;
-            // A running scan is left to finish and is replaced at the next turn-on.
-            self.info_scan_stale = self.info_scan.is_some();
-            return;
-        }
-        if !self.info_scanned {
-            self.read_info_scan(src);
-        }
-        // A full set waits for the scan.
-        if !self.info_scanned || self.info_cache.is_empty() {
-            return;
-        }
-        let generation = match self.info_sent {
-            Some((_, at)) if now.duration_since(at) < INFO_EVERY => return,
-            Some((generation, _)) => generation.saturating_add(1),
-            None => 1,
-        };
-        let (slot, entries) = self.info_cache.entries();
-        let events = info_events(INFO_FULL_SET, generation, slot, &entries);
-        publish_paced(&mut self.info, &events);
-        self.info_sent = Some((generation, now));
-    }
-
-    /// Starts the scan of the root bank off this thread, one at a time and not joined at exit,
-    /// with the banks frozen above that root at the start, and takes its result.
-    fn read_info_scan(&mut self, src: &Reader) {
-        match &self.info_scan {
-            Some(scan) if !scan.is_finished() => return,
-            Some(_) => {
-                let result = self.info_scan.take().map(JoinHandle::join);
-                if !std::mem::take(&mut self.info_scan_stale) {
-                    self.info_scanned = true;
-                    if let Some(Ok((root, entries, above))) = result {
-                        self.info_cache.merge(root, entries);
-                        for (slot, changed) in above {
-                            self.info_cache.merge(slot, changed);
-                        }
-                    }
-                    return;
-                }
-            }
-            None => {}
-        }
-        let (bank, above) = {
-            let bank_forks = src.bank_forks.read().unwrap();
-            let bank = bank_forks.root_bank();
-            let above: Vec<_> = bank_forks
-                .frozen_banks()
-                .filter(|(slot, _)| *slot > bank.slot())
-                .map(|(_, frozen)| frozen)
-                .collect();
-            (bank, above)
-        };
-        self.info_scan = thread::Builder::new()
-            .name("solEvtInfo".to_string())
-            .spawn(move || {
-                let above = above
-                    .iter()
-                    .map(|frozen| (frozen.slot(), super::info::scan_slot(frozen)))
-                    .collect();
-                (bank.slot(), super::info::scan_all(&bank), above)
-            })
-            .ok();
-    }
-
-    /// Each new frozen bank's finalization reading and the validator info entries it changed.
-    fn send_frozen_reads(&mut self, src: &Reader) {
-        let finalization_on = self.finalization.is_enabled();
-        let info_on = self.info.is_enabled();
-        if !finalization_on && !info_on {
-            self.frozen_seen = None;
-            return;
-        }
-        let banks = src.banks();
-        // At turn-on the banks already frozen are taken as read.
-        let seen = self
-            .frozen_seen
-            .get_or_insert_with(|| banks.frozen.iter().map(|(slot, _)| *slot).collect());
-        let fresh: Vec<_> = banks
-            .frozen
-            .iter()
-            .filter(|(slot, _)| seen.insert(*slot))
-            .collect();
-        *seen = seen.split_off(&banks.root.slot());
-        for (slot, bank) in fresh {
-            if finalization_on && let Some(event) = finalization_event(bank.as_ref()) {
-                let _ = self.finalization.publish(&event);
-            }
-            if info_on {
-                let changed = bank.validator_info_changed();
-                if !changed.is_empty() {
-                    let generation = self.info_sent.map_or(0, |(generation, _)| generation);
-                    for event in info_events(INFO_CHANGE, generation, *slot, &changed) {
-                        let _ = self.info.publish(&event);
-                    }
-                    self.info_cache.merge(*slot, changed);
-                }
-            }
-        }
-    }
-
     /// Each frozen block's transactions once it is full, and our blocks' message versions.
     fn send_blocks_read(&mut self, src: &Reader) {
         let outcomes_on = self.outcomes.is_enabled();
@@ -699,77 +465,6 @@ pub fn own_block_events(
         .collect()
 }
 
-pub fn info_events(
-    reason: u8,
-    generation: u64,
-    slot: solana_clock::Slot,
-    entries: &[(solana_pubkey::Pubkey, ValidatorInfo)],
-) -> Vec<ValidatorInfoEvent> {
-    let (pid, tid, timestamp_ns) = header();
-    let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
-    entries
-        .iter()
-        .zip(0u32..)
-        .map(|((identity, info), index)| ValidatorInfoEvent {
-            pid,
-            tid,
-            timestamp_ns,
-            reason,
-            generation,
-            index,
-            count,
-            slot,
-            identity: identity.to_bytes(),
-            has_name: info.name.is_some(),
-            name: pack_str::<NAME_BYTES>(info.name.as_deref().unwrap_or_default()),
-            has_icon: info.icon_url.is_some(),
-            icon: pack_str::<ICON_BYTES>(info.icon_url.as_deref().unwrap_or_default()),
-        })
-        .collect()
-}
-
-/// What the finalization share reads of a frozen bank: its ranked accounts' last votes against
-/// the newest.
-pub(crate) fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEvent> {
-    if !bank.is_alpenglow() {
-        return None;
-    }
-    let ranks = bank.rank_map(bank.slot())?;
-    let mut votes: Vec<(usize, solana_clock::Slot)> = Vec::new();
-    bank.for_each_vote_row(&mut |row| {
-        if let (Some(rank), Some(last)) = (ranks.rank_of(&row.vote), row.last_voted_slot) {
-            votes.push((usize::from(rank), last));
-        }
-    });
-    let front = votes.iter().map(|(_, slot)| *slot).max()?;
-    let (pid, tid, timestamp_ns) = header();
-    let mut event = FinalizationEvent {
-        pid,
-        tid,
-        timestamp_ns,
-        slot: bank.slot(),
-        front,
-        ranks: u16::try_from(ranks.len().min(FINALIZATION_RANKS)).unwrap_or(0),
-        seen: [0u8; FINALIZATION_RANKS / 8],
-        carried: [0u8; FINALIZATION_RANKS / 8],
-    };
-    for (rank, slot) in votes {
-        let (byte, bit) = (rank / 8, rank % 8);
-        let mask = 1u8
-            .checked_shl(u32::try_from(bit).unwrap_or(0))
-            .unwrap_or(0);
-        if let Some(seen) = event.seen.get_mut(byte) {
-            *seen |= mask;
-        }
-        if front.saturating_sub(slot) <= NEAR_SLOTS
-            && let Some(carried) = event.carried.get_mut(byte)
-        {
-            *carried |= mask;
-        }
-    }
-    Some(event)
-}
-
 /// A block's outcomes, or one empty event where it had none.
 fn outcome_events(
     slot: solana_clock::Slot,
@@ -881,46 +576,6 @@ pub fn block_event(slot: solana_clock::Slot, block: Block) -> BlockEvent {
 fn header() -> (i32, i32, u64) {
     let (tid, pid) = cached_thread_and_process_id();
     (pid, tid, monotonic_timestamp_ns())
-}
-
-pub fn clock_event(
-    role: u8,
-    bank: &dyn BankView,
-    identity: &solana_pubkey::Pubkey,
-    vote_account: &solana_pubkey::Pubkey,
-) -> SlotClockEvent {
-    let (pid, tid, timestamp_ns) = header();
-    let clock = bank.clock();
-    let cost = bank.cost();
-    let fees = bank.fees();
-    SlotClockEvent {
-        pid,
-        tid,
-        timestamp_ns,
-        role,
-        slot: bank.slot(),
-        parent_slot: bank.parent_slot(),
-        epoch: bank.epoch(),
-        frozen: bank.is_frozen(),
-        block_height: bank.block_height(),
-        clock_slot: clock.slot,
-        clock_epoch_start_timestamp: clock.epoch_start_timestamp,
-        clock_epoch: clock.epoch,
-        clock_leader_schedule_epoch: clock.leader_schedule_epoch,
-        clock_unix_timestamp: clock.unix_timestamp,
-        blockhash: bank.last_blockhash().to_bytes(),
-        transaction_count: bank.transaction_count(),
-        non_vote_transaction_count: bank.non_vote_transaction_count_since_restart(),
-        transaction_error_count: bank.transaction_error_count(),
-        entries_count: bank.transaction_entries_count(),
-        block_cost: cost.block_cost,
-        block_cost_limit: cost.block_limit,
-        account_cost_limit: cost.account_limit,
-        total_fees: fees.total,
-        priority_fees: fees.priority,
-        identity_balance: bank.get_balance(identity),
-        vote_balance: bank.get_balance(vote_account),
-    }
 }
 
 /// Publishes the datapoints the forwarder hands over, each on its row's stream.

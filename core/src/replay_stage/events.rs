@@ -1,11 +1,15 @@
 use {
+    crate::frozen_bank_events::FrozenBankSender,
     agave_event_system::{
         event,
         event_metadata::{cached_thread_and_process_id, monotonic_timestamp_ns},
+        publisher::Publisher,
         stream_name::StreamName,
     },
-    solana_clock::{BankId, Slot},
+    solana_clock::{BankId, Epoch, Slot, UnixTimestamp},
+    solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
+    std::sync::Arc,
 };
 
 pub const SLOT_EVENT_STREAM: StreamName = agave_event_system::stream_name!("replay.slot_event");
@@ -119,10 +123,18 @@ pub struct BankFrozenEvent {
     /// The fork's running totals, as the bank keeps them.
     pub transaction_count_total: u64,
     pub non_vote_transaction_count_total: u64,
+    pub epoch: Epoch,
+    /// The clock sysvar's timestamps and leader schedule epoch.
+    pub clock_epoch_start_timestamp: UnixTimestamp,
+    pub clock_unix_timestamp: UnixTimestamp,
+    pub clock_leader_schedule_epoch: Epoch,
+    /// Our identity's and vote account's balances, in lamports.
+    pub identity_balance: u64,
+    pub vote_balance: u64,
 }
 
 impl BankFrozenEvent {
-    pub(crate) fn new(bank: &Bank) -> Self {
+    pub fn new(bank: &Bank, identity: &Pubkey, vote_account: &Pubkey) -> Self {
         let (tid, pid) = cached_thread_and_process_id();
         let parent_non_vote_transaction_count = bank.parent().map_or(0, |parent| {
             parent.non_vote_transaction_count_since_restart()
@@ -136,6 +148,7 @@ impl BankFrozenEvent {
             )
         };
         let fee_details = bank.get_collector_fee_details();
+        let clock = bank.clock();
         Self {
             pid,
             tid,
@@ -159,7 +172,41 @@ impl BankFrozenEvent {
             block_height: bank.block_height(),
             transaction_count_total: bank.transaction_count(),
             non_vote_transaction_count_total: bank.non_vote_transaction_count_since_restart(),
+            epoch: bank.epoch(),
+            clock_epoch_start_timestamp: clock.epoch_start_timestamp,
+            clock_unix_timestamp: clock.unix_timestamp,
+            clock_leader_schedule_epoch: clock.leader_schedule_epoch,
+            identity_balance: bank.get_balance(identity),
+            vote_balance: bank.get_balance(vote_account),
         }
+    }
+}
+
+/// What replay sends as each bank freezes: its own figures, and the bank to the readers that
+/// take longer.
+pub(crate) struct FrozenOutput {
+    pub(crate) publisher: Publisher<BankFrozenEvent>,
+    pub(crate) vote_account: Pubkey,
+    pub(crate) readers: FrozenBankSender,
+}
+
+impl FrozenOutput {
+    #[cfg(test)]
+    pub(crate) fn stub() -> Self {
+        Self {
+            publisher: Publisher::stub(),
+            vote_account: Pubkey::default(),
+            readers: FrozenBankSender::stub(),
+        }
+    }
+
+    pub(crate) fn frozen(&mut self, bank: &Arc<Bank>, identity: &Pubkey) {
+        if self.publisher.is_enabled() {
+            let _ =
+                self.publisher
+                    .publish(&BankFrozenEvent::new(bank, identity, &self.vote_account));
+        }
+        self.readers.send(bank);
     }
 }
 
@@ -221,7 +268,7 @@ mod tests {
         );
         bank.freeze();
 
-        let event = BankFrozenEvent::new(&bank);
+        let event = BankFrozenEvent::new(&bank, &mint.pubkey(), &genesis.voting_keypair.pubkey());
         assert_eq!(event.slot, 1);
         assert_eq!(event.bank_id, u64::from(bank.bank_id()));
         assert_eq!(event.parent_slot, 0);
@@ -235,5 +282,12 @@ mod tests {
         assert_eq!(event.priority_fee, 0);
         assert!(event.block_cost_limit > 0);
         assert!(event.account_cost_limit > 0);
+        assert_eq!(event.epoch, bank.epoch());
+        assert_eq!(event.clock_unix_timestamp, bank.clock().unix_timestamp);
+        assert_eq!(event.identity_balance, bank.get_balance(&mint.pubkey()));
+        assert_eq!(
+            event.vote_balance,
+            bank.get_balance(&genesis.voting_keypair.pubkey())
+        );
     }
 }

@@ -8,10 +8,9 @@ use {
             ADMITTED_STREAM, AdmittedEvent, BLOCK_STREAM, BlockEvent, EPOCH_STREAM, EpochEvent,
             FINALIZATION_STREAM, FinalizationEvent, GOSSIP_PEER_STREAM, GossipPeerEvent,
             LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM, MessageVersionsEvent,
-            NODE_INFO_STREAM, NodeInfoEvent, OWN_BLOCK_STREAM, OwnBlockEvent, SLOT_CLOCK_STREAM,
-            SLOT_HISTORY_STREAM, SLOT_STATUS_STREAM, SlotClockEvent, SlotHistoryEvent,
-            SlotStatusEvent, TX_OUTCOME_STREAM, TxOutcomeEvent, VALIDATOR_INFO_STREAM,
-            ValidatorInfoEvent,
+            NODE_INFO_STREAM, NodeInfoEvent, OWN_BLOCK_STREAM, OwnBlockEvent, SLOT_HISTORY_STREAM,
+            SLOT_STATUS_STREAM, SlotHistoryEvent, SlotStatusEvent, TX_OUTCOME_STREAM,
+            TxOutcomeEvent, VALIDATOR_INFO_STREAM, ValidatorInfoEvent,
         },
         metric_events::{
             METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
@@ -104,7 +103,6 @@ stamped!(
     SupermajorityWaitEvent,
     SlotStatusEvent,
     EpochEvent,
-    SlotClockEvent,
     LedgerSlotEvent,
     BlockEvent,
     OwnBlockEvent,
@@ -516,7 +514,6 @@ pub struct EventInput {
     pub wait: Stream<SupermajorityWaitEvent>,
     pub status: Stream<SlotStatusEvent>,
     pub epoch: Stream<EpochEvent>,
-    pub clock: Stream<SlotClockEvent>,
     pub ledger: Stream<LedgerSlotEvent>,
     pub blocks: Stream<BlockEvent>,
     pub own_blocks: Stream<OwnBlockEvent>,
@@ -562,7 +559,6 @@ impl EventInput {
             wait: Stream::new(SUPERMAJORITY_WAIT_STREAM),
             status: Stream::new(SLOT_STATUS_STREAM),
             epoch: Stream::new(EPOCH_STREAM),
-            clock: Stream::new(SLOT_CLOCK_STREAM),
             ledger: Stream::new(LEDGER_SLOT_STREAM),
             blocks: Stream::new(BLOCK_STREAM),
             own_blocks: Stream::new(OWN_BLOCK_STREAM),
@@ -615,7 +611,6 @@ impl EventInput {
         self.progress.connect(dir, &explorer);
         self.status.connect(dir, &explorer);
         self.epoch.connect(dir, &explorer);
-        self.clock.connect(dir, &explorer);
         self.ledger.connect(dir, &explorer);
         self.blocks.connect(dir, &explorer);
         let own_resubscribed = self.own_blocks.connect(dir, &explorer);
@@ -662,7 +657,6 @@ impl EventInput {
         self.wait.disconnect();
         self.status.disconnect();
         self.epoch.disconnect();
-        self.clock.disconnect();
         self.ledger.disconnect();
         self.blocks.disconnect();
         self.own_blocks.disconnect();
@@ -743,7 +737,6 @@ impl EventInput {
         self.wait.drain(|event| mirror.apply_wait(&event));
         self.status.drain(|event| mirror.apply_status(&event));
         self.epoch.drain(|event| mirror.apply_epoch(&event));
-        self.clock.drain(|event| mirror.apply_clock(&event));
 
         let tap = &self.tap;
         let observe = |event: &dyn MetricPoint| {
@@ -827,7 +820,6 @@ impl EventInput {
             wait,
             status,
             epoch,
-            clock,
             ledger,
             blocks,
             own_blocks,
