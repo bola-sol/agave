@@ -1,11 +1,9 @@
-//! The node's state as event streams, for a monitor in its own process: banks, ledger, gossip,
-//! validator info, the node's catch-up and the metrics datapoints.
+//! What is still read from the validator's handles for the dashboard: each full block's
+//! transaction outcomes and our blocks' message versions.
 
 pub mod bank_view;
 pub mod blocks;
 pub mod info;
-pub mod metric_forward;
-pub mod metric_types;
 pub mod output;
 pub mod reader;
 pub mod types;
@@ -13,7 +11,7 @@ pub mod versions;
 
 use {
     agave_event_system::EventSystem,
-    output::{EventOutput, MetricOutput},
+    output::EventOutput,
     reader::Reader,
     std::{
         io,
@@ -34,7 +32,7 @@ impl NodeEvents {
         exit: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let events = EventOutput::new(event_system)?.spawn(Arc::new(reader), exit.clone())?;
-        let metrics = MetricOutput::new(event_system)?.spawn(exit)?;
+        let metrics = crate::metric_events::MetricOutput::new(event_system)?.spawn(exit)?;
         Ok(Self {
             threads: std::iter::once(events).chain(metrics).collect(),
         })

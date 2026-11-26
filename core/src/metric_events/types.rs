@@ -22,11 +22,11 @@ pub trait MetricEvent: Sized {
 }
 
 fn text<const N: usize>(value: &str) -> [u8; N] {
-    super::types::pack_str(value)
+    crate::node_events::types::pack_str(value)
 }
 
 fn untext(packed: &[u8]) -> String {
-    super::types::unpack_str(packed)
+    crate::node_events::types::unpack_str(packed)
 }
 
 fn number(value: &str) -> Option<i64> {
@@ -440,19 +440,14 @@ metric_row! {
 }
 
 metric_row! {
-    /// Fields of `xdp-network-config` and `wfsm_gossip`, sent once: the rows XDP setup and
-    /// Supermajority wait.
+    /// Fields of `xdp-network-config`, sent once: the row XDP setup. The supermajority wait's
+    /// stake in gossip comes with `node.supermajority_wait`.
     MetricOnce, METRIC_ONCE_STREAM = "metric.once";
     Xdp = ["xdp-network-config"],
         tags [driver = "driver", zero_copy = "zero_copy"],
         strings [vendor = "vendor", model = "model", kernel_version = "kernel_version"],
         bools [],
         fields [];
-    StakeInGossip = ["wfsm_gossip"],
-        tags [],
-        strings [],
-        bools [],
-        fields [online_stake = "online_stake", total_activated_stake = "total_activated_stake"];
 }
 
 /// Every datapoint a metric stream carries.
