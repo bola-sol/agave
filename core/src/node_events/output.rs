@@ -181,10 +181,12 @@ const SETTLE_NEAR: u64 = 16;
 /// Blocks read per tick behind the root.
 const BLOCKS_PER_TICK: u64 = 64;
 
-/// Every validator info entry and the slot read at, read off the publisher's thread.
+type InfoEntries = Vec<(solana_pubkey::Pubkey, ValidatorInfo)>;
+/// Every validator info entry at the root, then the entries each bank frozen above it changed.
 type InfoScan = JoinHandle<(
     solana_clock::Slot,
-    Vec<(solana_pubkey::Pubkey, ValidatorInfo)>,
+    InfoEntries,
+    Vec<(solana_clock::Slot, InfoEntries)>,
 )>;
 
 pub(crate) struct EventOutput {
@@ -468,7 +470,7 @@ impl EventOutput {
     }
 
     /// Starts the scan of the root bank off this thread, one at a time and not joined at exit,
-    /// and takes its result with the writes of the banks frozen above that root.
+    /// with the banks frozen above that root at the start, and takes its result.
     fn read_info_scan(&mut self, src: &Reader) {
         match &self.info_scan {
             Some(scan) if !scan.is_finished() => return,
@@ -476,12 +478,10 @@ impl EventOutput {
                 let result = self.info_scan.take().map(JoinHandle::join);
                 if !std::mem::take(&mut self.info_scan_stale) {
                     self.info_scanned = true;
-                    if let Some(Ok((root, entries))) = result {
+                    if let Some(Ok((root, entries, above))) = result {
                         self.info_cache.merge(root, entries);
-                        for (slot, bank) in src.banks().frozen {
-                            if slot > root {
-                                self.info_cache.merge(slot, bank.validator_info_changed());
-                            }
+                        for (slot, changed) in above {
+                            self.info_cache.merge(slot, changed);
                         }
                     }
                     return;
@@ -489,10 +489,25 @@ impl EventOutput {
             }
             None => {}
         }
-        let bank = src.bank_forks.read().unwrap().root_bank();
+        let (bank, above) = {
+            let bank_forks = src.bank_forks.read().unwrap();
+            let bank = bank_forks.root_bank();
+            let above: Vec<_> = bank_forks
+                .frozen_banks()
+                .filter(|(slot, _)| *slot > bank.slot())
+                .map(|(_, frozen)| frozen)
+                .collect();
+            (bank, above)
+        };
         self.info_scan = thread::Builder::new()
             .name("solEvtInfo".to_string())
-            .spawn(move || (bank.slot(), super::info::scan_all(&bank)))
+            .spawn(move || {
+                let above = above
+                    .iter()
+                    .map(|frozen| (frozen.slot(), super::info::scan_slot(frozen)))
+                    .collect();
+                (bank.slot(), super::info::scan_all(&bank), above)
+            })
             .ok();
     }
 
@@ -1326,7 +1341,7 @@ impl MetricOutput {
         let (sender, points) = crossbeam_channel::bounded(METRIC_QUEUE);
         let tap = MetricForward::global().clone();
         if !tap.forward_to(sender) {
-            log::warn!("node events: another validator in this process publishes the metrics");
+            log::warn!("node events: the metrics forwarder is already taken in this process");
             return Ok(None);
         }
         thread::Builder::new()

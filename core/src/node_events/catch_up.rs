@@ -11,16 +11,18 @@ pub const IN_STEP_SLOTS: u64 = 4;
 /// Parents walked down from the tip before the rest of the distance is counted in slots.
 const BEHIND_WALK_BLOCKS: u64 = 32;
 const CHECK_EVERY: Duration = Duration::from_secs(1);
+/// In step this long from the first reading without trailing, the node is taken never to trail.
+const STEADY_FOR: Duration = Duration::from_secs(600);
 
-/// Latched once: the node trailed the cluster, then came within `IN_STEP_SLOTS` of its tip. A node
-/// in step at its first reading never trailed and has no catch-up time. Checked no more after the
-/// first reading in step.
+/// Latched once: the node trailed the cluster, then came within `IN_STEP_SLOTS` of its tip. The tip
+/// read before the first shreds arrive is the ledger's own, so a restarted node reads in step
+/// first. Checked no more once latched, or after `STEADY_FOR` in step without trailing.
 #[derive(Debug, Default)]
 pub(crate) struct CatchUp {
     trailed: bool,
-    in_step: bool,
     /// Unix milliseconds, 0 before.
     caught_up_ms: u64,
+    first: Option<Instant>,
     checked: Option<Instant>,
 }
 
@@ -30,7 +32,7 @@ impl CatchUp {
     }
 
     pub(crate) fn check(&mut self, reader: &Reader, now: Instant) {
-        if self.in_step
+        if self.done(now)
             || self
                 .checked
                 .is_some_and(|at| now.duration_since(at) < CHECK_EVERY)
@@ -50,19 +52,25 @@ impl CatchUp {
             .max()
             .unwrap_or(0);
         let behind = walk_behind(|slot| reader.parent_of(slot), tip, completed);
-        self.observe(behind, unix_millis());
+        self.observe(behind, now, unix_millis());
     }
 
-    fn observe(&mut self, behind: u64, now_ms: u64) {
-        if self.in_step {
+    fn done(&self, now: Instant) -> bool {
+        self.caught_up_ms != 0
+            || (!self.trailed
+                && self
+                    .first
+                    .is_some_and(|first| now.duration_since(first) >= STEADY_FOR))
+    }
+
+    fn observe(&mut self, behind: u64, now: Instant, now_ms: u64) {
+        if self.done(now) {
             return;
         }
+        self.first.get_or_insert(now);
         if behind > IN_STEP_SLOTS {
             self.trailed = true;
-            return;
-        }
-        self.in_step = true;
-        if self.trailed {
+        } else if self.trailed {
             self.caught_up_ms = now_ms.max(1);
         }
     }
@@ -96,26 +104,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_a_node_that_never_trailed_has_no_catch_up_time() {
+    fn test_a_node_in_step_for_long_after_starting_is_taken_never_to_trail() {
+        let start = Instant::now();
         let mut catch_up = CatchUp::default();
-        catch_up.observe(1, 100);
-        assert!(catch_up.in_step);
-        // A later stall and recovery is not a catch-up after starting.
-        catch_up.observe(50, 200);
-        catch_up.observe(0, 300);
+        catch_up.observe(1, start, 100);
+        assert!(!catch_up.done(start + STEADY_FOR - Duration::from_secs(1)));
+        assert!(catch_up.done(start + STEADY_FOR));
+        catch_up.observe(50, start + STEADY_FOR, 200);
+        catch_up.observe(0, start + STEADY_FOR, 300);
         assert_eq!(catch_up.caught_up_ms(), 0);
     }
 
     #[test]
-    fn test_catch_up_latches_once_after_trailing() {
+    fn test_a_restart_reads_in_step_then_trails_then_catches_up() {
+        // Before the first shreds the tip is the ledger's own.
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
         let mut catch_up = CatchUp::default();
-        catch_up.observe(50, 100);
+        catch_up.observe(0, at(0), 100);
+        catch_up.observe(900, at(1), 200);
         assert_eq!(catch_up.caught_up_ms(), 0);
-        catch_up.observe(4, 200);
-        assert_eq!(catch_up.caught_up_ms(), 200);
-        catch_up.observe(60, 300);
-        catch_up.observe(0, 400);
-        assert_eq!(catch_up.caught_up_ms(), 200);
+        catch_up.observe(3, at(90), 300);
+        assert_eq!(catch_up.caught_up_ms(), 300);
+        catch_up.observe(60, at(91), 400);
+        catch_up.observe(0, at(92), 500);
+        assert_eq!(catch_up.caught_up_ms(), 300);
     }
 
     #[test]
