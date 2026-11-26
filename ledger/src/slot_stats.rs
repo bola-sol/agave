@@ -105,6 +105,19 @@ pub struct SlotsStats {
     pub stats: Mutex<LruCache<Slot, SlotStats>>,
 }
 
+impl SlotsStats {
+    /// Repaired and recovered shreds counted for `slot`'s original block, while its stats are held.
+    pub(crate) fn repaired_recovered(&self, slot: Slot) -> (usize, usize) {
+        self.stats
+            .lock()
+            .unwrap()
+            .peek(&slot)
+            .map_or((0, 0), |stats| {
+                (stats.original.num_repaired, stats.original.num_recovered)
+            })
+    }
+}
+
 impl Default for SlotsStats {
     fn default() -> Self {
         Self {

@@ -14,8 +14,8 @@ use {
         },
         reader::Reader,
         types::{
-            LEDGER_SLOT_STREAM, LedgerSlotEvent, MESSAGE_VERSIONS_STREAM, MessageVersionsEvent,
-            OUTCOME_FAILED, OUTCOME_SUCCEEDED, OUTCOME_UNKNOWN, TX_OUTCOME_STREAM, TxOutcomeEvent,
+            MESSAGE_VERSIONS_STREAM, MessageVersionsEvent, OUTCOME_FAILED, OUTCOME_SUCCEEDED,
+            OUTCOME_UNKNOWN, TX_OUTCOME_STREAM, TxOutcomeEvent,
         },
     },
     agave_event_system::{
@@ -74,8 +74,6 @@ fn stream<E: Event>(
         .ok_or_else(|| io::Error::other("no publisher"))
 }
 
-/// Slots below the highest whose blockstore records are watched.
-const LEDGER_WINDOW: u64 = 64;
 /// How often points sent once an hour, a run or an epoch go again, for a subscriber that missed them.
 const LATCHED_EVERY: Duration = Duration::from_secs(60);
 /// Metrics points held for the publisher.
@@ -88,9 +86,6 @@ pub(crate) struct EventOutput {
     held: std::collections::BTreeMap<solana_clock::Slot, Arc<dyn BankView>>,
     /// Blocks already read, so a bank still in bank forks is not read again.
     blocks_read: std::collections::BTreeSet<solana_clock::Slot>,
-    ledger: Publisher<LedgerSlotEvent>,
-    /// What has been sent of each watched slot: its first shred, and that it filled.
-    ledger_sent: std::collections::BTreeMap<solana_clock::Slot, (bool, bool)>,
 }
 
 impl EventOutput {
@@ -100,8 +95,6 @@ impl EventOutput {
             versions: stream(event_system, MESSAGE_VERSIONS_STREAM, 256)?,
             held: std::collections::BTreeMap::new(),
             blocks_read: std::collections::BTreeSet::new(),
-            ledger: stream(event_system, LEDGER_SLOT_STREAM, 1024)?,
-            ledger_sent: std::collections::BTreeMap::new(),
         })
     }
 
@@ -123,57 +116,11 @@ impl EventOutput {
 
     fn tick(&mut self, held_src: &Arc<Reader>) {
         let src = held_src.as_ref();
-        self.send_ledger(src);
         self.send_blocks_read(src);
     }
 }
 
 impl EventOutput {
-    /// Each watched slot once its first shred arrives, and again once it fills.
-    fn send_ledger(&mut self, src: &Reader) {
-        if !self.ledger.is_enabled() {
-            self.ledger_sent.clear();
-            return;
-        }
-        // Under the tip for the slots arriving, and under bank forks' highest for the slots replay
-        // is completing, which trail the tip far while a node catches up.
-        let replaying = src.highest_slot();
-        let tip = replaying.max(src.cluster_tip().unwrap_or_default());
-        let window = |top: solana_clock::Slot| top.saturating_sub(LEDGER_WINDOW)..=top;
-        self.ledger_sent = self
-            .ledger_sent
-            .split_off(&replaying.saturating_sub(LEDGER_WINDOW));
-        let slots: std::collections::BTreeSet<solana_clock::Slot> =
-            window(replaying).chain(window(tip)).collect();
-        for slot in slots {
-            let (first_sent, full_sent) = self.ledger_sent.get(&slot).copied().unwrap_or_default();
-            if full_sent {
-                continue;
-            }
-            let Some(first_shred_ms) = src.first_shred_time(slot) else {
-                continue;
-            };
-            let full = src.is_full(slot);
-            if first_sent && !full {
-                continue;
-            }
-            let parent = src.parent_of(slot);
-            let (pid, tid, timestamp_ns) = header();
-            let _ = self.ledger.publish(&LedgerSlotEvent {
-                pid,
-                tid,
-                timestamp_ns,
-                slot,
-                has_parent: parent.is_some(),
-                parent_slot: parent.unwrap_or_default(),
-                first_shred_ms,
-                full,
-            });
-            self.ledger_sent.insert(slot, (true, full));
-        }
-    }
-
-    /// The gossip table whole, with each peer's advertised snapshots.
     /// Each frozen block's transactions once it is full, and our blocks' message versions.
     fn send_blocks_read(&mut self, src: &Reader) {
         let outcomes_on = self.outcomes.is_enabled();
