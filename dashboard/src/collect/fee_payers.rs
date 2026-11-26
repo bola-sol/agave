@@ -1,30 +1,24 @@
 //! Fee payers whose transactions fail in our blocks, against the same payers in other leaders'
 //! blocks, for this epoch and the last.
 
+pub use solana_core::node_events::blocks::{TxOutcome, tx_outcomes};
 use {
     crate::{
         produced::{BlockFees, TopFeePayer, TopFeeTransaction},
         source::{BankView, Source},
-        versions::is_simple_vote,
     },
-    agave_feature_set::FeatureSet,
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
-    solana_entry::entry::Entry,
-    solana_message::VersionedMessage,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
-    solana_sdk_ids::{ed25519_program, secp256k1_program, secp256r1_program},
     solana_signature::Signature,
-    solana_svm_transaction::instruction::SVMInstruction,
-    solana_transaction::versioned::VersionedTransaction,
     std::{
         cmp::Reverse,
         collections::{BTreeMap, HashMap},
         sync::Arc,
     },
 };
+#[cfg(test)]
+use {solana_entry::entry::Entry, solana_runtime::bank::Bank};
 
 /// Flagged from this many transactions in our blocks in an epoch.
 const MIN_TRANSACTIONS: u64 = 100;
@@ -416,54 +410,6 @@ fn tally_block(
     tally_outcomes(bank.epoch(), bank.slot(), ours, &outcomes)
 }
 
-/// One non-vote transaction of a block as the fee tallies read it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TxOutcome {
-    pub signature: Option<Signature>,
-    pub payer: Pubkey,
-    /// `None` where the status cache held no result.
-    pub failed: Option<bool>,
-    /// Read for our own blocks only.
-    pub priority: u64,
-    pub base: u64,
-}
-
-/// Every non-vote transaction of our block, or only the followed payers' in another's.
-pub(crate) fn tx_outcomes(
-    bank: &Bank,
-    entries: &[Entry],
-    ours: bool,
-    followed: &dyn Fn(&Pubkey) -> bool,
-) -> Vec<TxOutcome> {
-    let lamports_per_signature = bank.get_lamports_per_signature();
-    entries
-        .iter()
-        .flat_map(|entry| &entry.transactions)
-        .filter(|transaction| !is_simple_vote(transaction))
-        .filter_map(|transaction| {
-            let payer = *transaction.message.static_account_keys().first()?;
-            if !ours && !followed(&payer) {
-                return None;
-            }
-            let (priority, base) = if ours {
-                (
-                    priority_fee(transaction, &bank.feature_set),
-                    base_fee(transaction, lamports_per_signature),
-                )
-            } else {
-                (0, 0)
-            };
-            Some(TxOutcome {
-                signature: transaction.signatures.first().copied(),
-                payer,
-                failed: failed_in(bank, transaction),
-                priority,
-                base,
-            })
-        })
-        .collect()
-}
-
 /// A result not found in the status cache leaves the transaction out of the tally, though not
 /// out of what the block paid.
 fn tally_outcomes(
@@ -503,72 +449,20 @@ fn tally_outcomes(
     (tally, ours.then(|| paid.top(slot)))
 }
 
-/// Charged for each of the transaction's signatures and each a precompile verifies, whose count
-/// leads its instruction data.
-fn base_fee(transaction: &VersionedTransaction, lamports_per_signature: u64) -> u64 {
-    let message = &transaction.message;
-    let keys = message.static_account_keys();
-    let signatures = u64::try_from(transaction.signatures.len()).unwrap_or(u64::MAX);
-    message
-        .instructions()
-        .iter()
-        .filter(|instruction| {
-            keys.get(usize::from(instruction.program_id_index))
-                .is_some_and(|program| {
-                    ed25519_program::check_id(program)
-                        || secp256k1_program::check_id(program)
-                        || secp256r1_program::check_id(program)
-                })
-        })
-        .map(|instruction| u64::from(instruction.data.first().copied().unwrap_or(0)))
-        .fold(signatures, u64::saturating_add)
-        .saturating_mul(lamports_per_signature)
-}
-
-/// By message hash, which the cache holds for all but durable nonce transactions; those are found
-/// by signature where the node keeps signatures.
-fn failed_in(bank: &Bank, transaction: &VersionedTransaction) -> Option<bool> {
-    let message = &transaction.message;
-    let by_hash = bank.status_cache.read().unwrap().get_status(
-        message.hash(),
-        message.recent_blockhash(),
-        &bank.ancestors,
-    );
-    let (slot, status) = match by_hash {
-        Some(found) => found,
-        None => bank.get_signature_status_slot(transaction.signatures.first()?)?,
-    };
-    (slot == bank.slot()).then(|| status.is_err())
-}
-
-/// What the fee charged beyond the signatures: a v1 message states it, earlier ones set a price
-/// per compute unit.
-fn priority_fee(transaction: &VersionedTransaction, feature_set: &FeatureSet) -> u64 {
-    let message = &transaction.message;
-    if let VersionedMessage::V1(v1) = message {
-        return v1.config.priority_fee.unwrap_or(0);
-    }
-    let keys = message.static_account_keys();
-    let instructions = message.instructions().iter().filter_map(|instruction| {
-        let program = keys.get(usize::from(instruction.program_id_index))?;
-        Some((program, SVMInstruction::from(instruction)))
-    });
-    process_compute_budget_instructions(instructions, feature_set)
-        .map_or(0, |limits| limits.get_prioritization_fee())
-}
-
 #[cfg(test)]
 mod tests {
     use {
         super::*,
         solana_compute_budget_interface::ComputeBudgetInstruction,
+        solana_core::node_events::blocks::base_fee,
         solana_keypair::Keypair,
-        solana_message::{compiled_instruction::CompiledInstruction, legacy},
+        solana_message::{VersionedMessage, compiled_instruction::CompiledInstruction, legacy},
         solana_runtime::genesis_utils::{GenesisConfigInfo, create_genesis_config},
+        solana_sdk_ids::{ed25519_program, secp256k1_program, secp256r1_program},
         solana_signature::Signature,
         solana_signer::Signer,
         solana_system_interface::instruction::transfer,
-        solana_transaction::Transaction,
+        solana_transaction::{Transaction, versioned::VersionedTransaction},
     };
 
     fn tally(transactions: u64, failed: u64, priority_failed: u64) -> Tally {

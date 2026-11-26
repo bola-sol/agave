@@ -1,11 +1,21 @@
-//! Publishes what the dashboard reads of the node as event streams, from inside the validator, so
-//! a dashboard in its own process can rebuild it. Test branch only: each stream is read through
-//! the same [`Source`] the collector reads, so this tests the event shapes, not where Agave would
-//! publish them.
+//! Publishes the node's state as event streams: banks, ledger, gossip, validator info and the
+//! metrics datapoints, read through the validator's handles.
 
 use {
-    crate::{
-        events::{
+    super::{
+        bank_view::BankView,
+        blocks::{Block, TxOutcome},
+        catch_up::CatchUp,
+        info::{ValidatorInfo, ValidatorInfoCache},
+        metric_forward::MetricForward,
+        metric_types::{
+            METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
+            METRIC_ONCE_STREAM, METRIC_SLOT_STREAM, METRIC_TPU_STREAM, METRIC_VOTOR_STREAM,
+            MetricAccounts, MetricEvent, MetricGossip, MetricLeader, MetricNet, MetricOnce,
+            MetricSlot, MetricTpu, MetricVotor,
+        },
+        reader::Reader,
+        types::{
             ACCOUNT_PATHS, ADDR_ALPENGLOW, ADDR_BYTES, ADDR_GOSSIP, ADDR_RPC,
             ADDR_SERVE_REPAIR_UDP, ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC,
             ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, ADDRS, ADMITTED_STREAM, AdmittedEvent, BITMAP_BYTES,
@@ -20,14 +30,6 @@ use {
             SlotStatusEvent, TX_OUTCOME_STREAM, TxOutcomeEvent, VALIDATOR_INFO_STREAM,
             VOTE_REWARD_BYTES, ValidatorInfoEvent, pack_addr, pack_path, pack_str,
         },
-        metric_events::{
-            METRIC_ACCOUNTS_STREAM, METRIC_GOSSIP_STREAM, METRIC_LEADER_STREAM, METRIC_NET_STREAM,
-            METRIC_ONCE_STREAM, METRIC_SLOT_STREAM, METRIC_TPU_STREAM, METRIC_VOTOR_STREAM,
-            MetricAccounts, MetricEvent, MetricGossip, MetricLeader, MetricNet, MetricOnce,
-            MetricSlot, MetricTpu, MetricVotor,
-        },
-        metrics_tap::MetricsTap,
-        source::{BankView, Source},
     },
     agave_event_system::{
         Event, EventSystem, StreamConfig,
@@ -50,6 +52,12 @@ use {
 };
 
 const TICK: Duration = Duration::from_millis(200);
+/// A last vote this close to the newest one in the bank counts as carried.
+pub const NEAR_SLOTS: u64 = 3;
+/// Where the runtime keeps each epoch's inflation: `vote_reward_account` under the alpenglow
+/// feature id.
+pub const VOTE_REWARD_ACCOUNT: solana_pubkey::Pubkey =
+    solana_pubkey::Pubkey::from_str_const("3vJzniWALu2qGFJ1ZY6JD3Y2ZmA5zWqmVdDX7yBXHgu7");
 /// Unchanged events go out again this often, so a late subscriber has them soon.
 const RESEND: Duration = Duration::from_secs(5);
 
@@ -160,6 +168,8 @@ const OWN_EVERY: Duration = Duration::from_secs(10);
 const INFO_EVERY: Duration = Duration::from_secs(60);
 /// How often points sent once an hour, a run or an epoch go again, for a subscriber that missed them.
 const LATCHED_EVERY: Duration = Duration::from_secs(60);
+/// Metrics points held for the publisher.
+const METRIC_QUEUE: usize = 16_384;
 /// Set events sent before a pause, so a set larger than its stream arrives whole.
 const PACE_BATCH: usize = 512;
 const PACE_PAUSE: Duration = Duration::from_millis(50);
@@ -171,15 +181,24 @@ const SETTLE_NEAR: u64 = 16;
 /// Blocks read per tick behind the root.
 const BLOCKS_PER_TICK: u64 = 64;
 
+/// Every validator info entry and the slot read at, read off the publisher's thread.
+type InfoScan = JoinHandle<(
+    solana_clock::Slot,
+    Vec<(solana_pubkey::Pubkey, ValidatorInfo)>,
+)>;
+
 pub struct EventOutput {
     peers: Publisher<GossipPeerEvent>,
     peers_sent: Option<(u64, Instant)>,
     info: Publisher<ValidatorInfoEvent>,
     info_sent: Option<(u64, Instant)>,
-    /// The names the in-process dashboard holds, sent whole every `INFO_EVERY`.
-    info_cache: Arc<std::sync::RwLock<crate::validator_info::ValidatorInfoCache>>,
-    /// When the in-process collector saw the node catch up, unix milliseconds, 0 before.
-    caught_up: Arc<std::sync::atomic::AtomicU64>,
+    /// Every name, scanned at turn-on and kept current from frozen banks, sent whole every
+    /// `INFO_EVERY`; empty while the stream is off.
+    info_cache: ValidatorInfoCache,
+    /// The scan running at turn-on.
+    info_scan: Option<InfoScan>,
+    info_scanned: bool,
+    catch_up: CatchUp,
     finalization: Publisher<FinalizationEvent>,
     /// Frozen banks already read for finalization and validator info changes; `None` while both
     /// streams are off.
@@ -214,11 +233,7 @@ pub struct EventOutput {
 }
 
 impl EventOutput {
-    pub fn new(
-        event_system: &EventSystem,
-        info_cache: Arc<std::sync::RwLock<crate::validator_info::ValidatorInfoCache>>,
-        caught_up: Arc<std::sync::atomic::AtomicU64>,
-    ) -> io::Result<Self> {
+    pub fn new(event_system: &EventSystem) -> io::Result<Self> {
         let mut clock = publishers::<SlotClockEvent>(event_system, SLOT_CLOCK_STREAM, 256, 2)?;
         let (Some(working), Some(root)) = (clock.pop(), clock.pop()) else {
             return Err(io::Error::other("no publishers"));
@@ -228,8 +243,10 @@ impl EventOutput {
             peers_sent: None,
             info: stream(event_system, VALIDATOR_INFO_STREAM, 8192)?,
             info_sent: None,
-            info_cache,
-            caught_up,
+            info_cache: ValidatorInfoCache::default(),
+            info_scan: None,
+            info_scanned: false,
+            catch_up: CatchUp::default(),
             finalization: stream(event_system, FINALIZATION_STREAM, 1024)?,
             frozen_seen: None,
             outcomes: stream(event_system, TX_OUTCOME_STREAM, 65_536)?,
@@ -257,11 +274,7 @@ impl EventOutput {
     }
 
     /// Runs on its own thread until `exit`.
-    pub fn spawn(
-        mut self,
-        src: Arc<dyn Source>,
-        exit: Arc<AtomicBool>,
-    ) -> io::Result<JoinHandle<()>> {
+    pub fn spawn(mut self, src: Arc<Reader>, exit: Arc<AtomicBool>) -> io::Result<JoinHandle<()>> {
         thread::Builder::new()
             .name("solEvtDash".to_string())
             .spawn(move || {
@@ -272,9 +285,11 @@ impl EventOutput {
             })
     }
 
-    fn tick(&mut self, held_src: &Arc<dyn Source>) {
+    fn tick(&mut self, held_src: &Arc<Reader>) {
         let src = held_src.as_ref();
         let now = Instant::now();
+        // From construction whatever the filter, so a stream turned on later carries it.
+        self.catch_up.check(src, now);
         // One root for the blocks and the root clock, so no root goes out ahead of its block.
         let root_bank = src.root_bank();
         self.send_ledger(src);
@@ -284,11 +299,11 @@ impl EventOutput {
         self.send_history(src, now);
         self.send_blocks_read(src);
         self.send_peers(src, now);
-        self.send_info(now);
+        self.send_info(src, now);
         self.send_frozen_reads(src);
         if self.node.enabled() {
             self.node
-                .offer(node_event(src, self.caught_up.load(Ordering::Relaxed)), now);
+                .offer(node_event(src, self.catch_up.caught_up_ms()), now);
         }
         let wants_banks = [
             self.status.enabled(),
@@ -326,7 +341,7 @@ impl EventOutput {
 
 impl EventOutput {
     /// Each watched slot once its first shred arrives, and again once it fills.
-    fn send_ledger(&mut self, src: &dyn Source) {
+    fn send_ledger(&mut self, src: &Reader) {
         if !self.ledger.is_enabled() {
             self.ledger_sent.clear();
             return;
@@ -370,7 +385,7 @@ impl EventOutput {
     }
 
     /// The gossip table whole, with each peer's advertised snapshots.
-    fn send_peers(&mut self, src: &dyn Source, now: Instant) {
+    fn send_peers(&mut self, src: &Reader, now: Instant) {
         if !self.peers.is_enabled() {
             self.peers_sent = None;
             return;
@@ -416,30 +431,45 @@ impl EventOutput {
         publish_paced(&mut self.peers, &events);
     }
 
-    /// Every name the in-process dashboard holds, which its own scan at attach filled and frozen
-    /// banks keep current, so a subscriber that joins late waits at most `INFO_EVERY`.
-    fn send_info(&mut self, now: Instant) {
+    /// Every name, scanned off this thread at turn-on and kept current from frozen banks, so a
+    /// subscriber that joins late waits at most `INFO_EVERY`.
+    fn send_info(&mut self, src: &Reader, now: Instant) {
         if !self.info.is_enabled() {
             self.info_sent = None;
+            self.info_cache = ValidatorInfoCache::default();
+            self.info_scan = None;
+            self.info_scanned = false;
             return;
+        }
+        if self.info_scan.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.info_scanned = true;
+            if let Some(Ok((slot, entries))) = self.info_scan.take().map(JoinHandle::join) {
+                self.info_cache.merge(slot, entries);
+            }
+        } else if self.info_scan.is_none() && !self.info_scanned {
+            let bank = src.bank_forks.read().unwrap().root_bank();
+            self.info_scan = thread::Builder::new()
+                .name("solEvtInfo".to_string())
+                .spawn(move || (bank.slot(), super::info::scan_all(&bank)))
+                .ok();
         }
         let generation = match self.info_sent {
             Some((_, at)) if now.duration_since(at) < INFO_EVERY => return,
             Some((generation, _)) => generation.saturating_add(1),
             None => 1,
         };
-        let (slot, entries) = self.info_cache.read().unwrap().entries();
-        // Tried again next tick until the dashboard's scan has read some.
-        if entries.is_empty() {
+        // Tried again next tick until the scan has read some.
+        if self.info_cache.is_empty() {
             return;
         }
+        let (slot, entries) = self.info_cache.entries();
         let events = info_events(INFO_FULL_SET, generation, slot, &entries);
         publish_paced(&mut self.info, &events);
         self.info_sent = Some((generation, now));
     }
 
     /// Each new frozen bank's finalization reading and the validator info entries it changed.
-    fn send_frozen_reads(&mut self, src: &dyn Source) {
+    fn send_frozen_reads(&mut self, src: &Reader) {
         let finalization_on = self.finalization.is_enabled();
         let info_on = self.info.is_enabled();
         if !finalization_on && !info_on {
@@ -468,13 +498,14 @@ impl EventOutput {
                     for event in info_events(INFO_CHANGE, generation, *slot, &changed) {
                         let _ = self.info.publish(&event);
                     }
+                    self.info_cache.merge(*slot, changed);
                 }
             }
         }
     }
 
     /// Each frozen block's transactions once it is full, and our blocks' message versions.
-    fn send_blocks_read(&mut self, src: &dyn Source) {
+    fn send_blocks_read(&mut self, src: &Reader) {
         let outcomes_on = self.outcomes.is_enabled();
         let versions_on = self.versions.is_enabled();
         if !outcomes_on && !versions_on {
@@ -533,7 +564,7 @@ impl EventOutput {
     }
 
     /// The previous, this and the next epoch's rank maps from the working bank.
-    fn send_admitted(&mut self, src: &dyn Source, now: Instant) {
+    fn send_admitted(&mut self, src: &Reader, now: Instant) {
         if !self.admitted.is_enabled() {
             self.admitted_sent = None;
             return;
@@ -557,7 +588,7 @@ impl EventOutput {
     }
 
     /// The root bank's slot history, whole.
-    fn send_history(&mut self, src: &dyn Source, now: Instant) {
+    fn send_history(&mut self, src: &Reader, now: Instant) {
         if !self.history.is_enabled() {
             self.history_sent = None;
             return;
@@ -575,7 +606,7 @@ impl EventOutput {
     }
 
     /// Each rooted slot's block, from the root at turn-on.
-    fn send_blocks(&mut self, src: &dyn Source, root_bank: &dyn BankView, now: Instant) {
+    fn send_blocks(&mut self, src: &Reader, root_bank: &dyn BankView, now: Instant) {
         if !self.blocks.is_enabled() {
             self.next_block = None;
             return;
@@ -586,7 +617,7 @@ impl EventOutput {
         let me = src.identity();
         while next <= last {
             let block = src.block(next, root);
-            if matches!(block, crate::certs::Block::Opaque)
+            if matches!(block, Block::Opaque)
                 && src.slot_leader(next, root_bank) == Some(me)
                 && self.blocks_settle.holds(next, root, &block, now)
             {
@@ -600,7 +631,7 @@ impl EventOutput {
 
     /// Our blocks this epoch up to the root, whole once read: at turn-on, at a new epoch or
     /// identity, and every `OWN_EVERY`.
-    fn send_own_blocks(&mut self, src: &dyn Source, root_bank: &dyn BankView, now: Instant) {
+    fn send_own_blocks(&mut self, src: &Reader, root_bank: &dyn BankView, now: Instant) {
         if !self.own_blocks.is_enabled() {
             self.own = None;
             return;
@@ -613,7 +644,7 @@ impl EventOutput {
             return;
         };
         let root = root_bank.slot();
-        if !own.read_to(src, root, now)
+        if !own.read_to(|slot| src.block(slot, root), root, src.lowest_slot(), now)
             || own
                 .sent
                 .is_some_and(|at| now.duration_since(at) < OWN_EVERY)
@@ -631,7 +662,7 @@ impl EventOutput {
 }
 
 /// Our blocks of one epoch, read a tick's worth at a time.
-pub(crate) struct OwnBlocks {
+struct OwnBlocks {
     key: (solana_clock::Epoch, solana_pubkey::Pubkey),
     leader_slots: Vec<solana_clock::Slot>,
     next: usize,
@@ -641,49 +672,55 @@ pub(crate) struct OwnBlocks {
 }
 
 impl OwnBlocks {
-    pub(crate) fn new(
-        src: &dyn Source,
+    fn new(
+        src: &Reader,
         bank: &dyn BankView,
         key: (solana_clock::Epoch, solana_pubkey::Pubkey),
     ) -> Option<Self> {
         let (epoch, me) = key;
-        Some(Self {
+        Some(Self::with_slots(
             key,
-            leader_slots: crate::collect::leader_slots_in_epoch(src, bank, epoch, &me)?,
+            src.leader_slots_in_epoch(bank, epoch, &me)?,
+        ))
+    }
+
+    fn with_slots(
+        key: (solana_clock::Epoch, solana_pubkey::Pubkey),
+        leader_slots: Vec<solana_clock::Slot>,
+    ) -> Self {
+        Self {
+            key,
+            leader_slots,
             next: 0,
             events: Vec::new(),
             sent: None,
             settle: Settle::default(),
-        })
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn read_slots(&self) -> Vec<solana_clock::Slot> {
-        self.events.iter().map(|event| event.slot).collect()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn read_kinds(&self) -> Vec<(solana_clock::Slot, u8)> {
+    fn read_kinds(&self) -> Vec<(solana_clock::Slot, u8)> {
         self.events
             .iter()
             .map(|event| (event.slot, event.kind))
             .collect()
     }
 
-    /// Reads up to `BLOCKS_PER_TICK` more of our slots up to `root`; whether all are read.
-    pub(crate) fn read_to(
+    /// Reads up to `BLOCKS_PER_TICK` more of our slots up to `root`, from a ledger holding slots
+    /// from `lowest`; whether all are read.
+    fn read_to(
         &mut self,
-        src: &dyn Source,
+        read_block: impl Fn(solana_clock::Slot) -> Block,
         root: solana_clock::Slot,
+        lowest: solana_clock::Slot,
         now: Instant,
     ) -> bool {
         let mut read = 0u64;
-        let lowest = src.lowest_slot();
         while let Some(slot) = self.leader_slots.get(self.next).copied() {
             if slot > root || read == BLOCKS_PER_TICK {
                 break;
             }
-            let block = src.block(slot, root);
+            let block = read_block(slot);
             if self.settle.holds(slot, root, &block, now) {
                 break;
             }
@@ -699,38 +736,34 @@ impl OwnBlocks {
 }
 
 /// A slot under the ledger's first slot reads as skipped once cleaned; it is unreadable instead.
-pub(crate) fn held_block(
-    slot: solana_clock::Slot,
-    lowest: solana_clock::Slot,
-    block: crate::certs::Block,
-) -> crate::certs::Block {
+fn held_block(slot: solana_clock::Slot, lowest: solana_clock::Slot, block: Block) -> Block {
     match block {
-        crate::certs::Block::Missing if slot < lowest => crate::certs::Block::Opaque,
+        Block::Missing if slot < lowest => Block::Opaque,
         block => block,
     }
 }
 
 /// The first time a block read unreadable, so it is read again for `SETTLE_FOR`.
 #[derive(Debug, Default)]
-pub(crate) struct Settle(Option<(solana_clock::Slot, Instant)>);
+struct Settle(Option<(solana_clock::Slot, Instant)>);
 
 impl Settle {
     /// Whether `block`, read up to `root` at `now`, is held back for another read: unreadable,
     /// near the root, and not yet held for `SETTLE_FOR`.
-    pub(crate) fn holds(
+    fn holds(
         &mut self,
         slot: solana_clock::Slot,
         root: solana_clock::Slot,
-        block: &crate::certs::Block,
+        block: &Block,
         now: Instant,
     ) -> bool {
-        matches!(block, crate::certs::Block::Opaque)
+        matches!(block, Block::Opaque)
             && slot.saturating_add(SETTLE_NEAR) > root
             && self.hold(slot, now)
     }
 
     /// Whether `slot`, unreadable at `now`, is held back for another read.
-    pub(crate) fn hold(&mut self, slot: solana_clock::Slot, now: Instant) -> bool {
+    fn hold(&mut self, slot: solana_clock::Slot, now: Instant) -> bool {
         let since = match self.0 {
             Some((held, since)) if held == slot => since,
             _ => {
@@ -743,7 +776,7 @@ impl Settle {
 }
 
 /// Our blocks as one set; with none, one event with `count` 0.
-pub(crate) fn own_block_events(
+pub fn own_block_events(
     (epoch, identity): (solana_clock::Epoch, solana_pubkey::Pubkey),
     generation: u64,
     covered_to: solana_clock::Slot,
@@ -763,10 +796,7 @@ pub(crate) fn own_block_events(
         covered_to,
     };
     if blocks.is_empty() {
-        return vec![OwnBlockEvent::new(
-            place(0),
-            &block_event(0, crate::certs::Block::Opaque),
-        )];
+        return vec![OwnBlockEvent::new(place(0), &block_event(0, Block::Opaque))];
     }
     blocks
         .iter()
@@ -775,7 +805,7 @@ pub(crate) fn own_block_events(
         .collect()
 }
 
-fn pack_addrs(peer: &crate::source::PeerRow) -> [u8; ADDRS * ADDR_BYTES] {
+fn pack_addrs(peer: &super::bank_view::PeerRow) -> [u8; ADDRS * ADDR_BYTES] {
     let mut addrs = [0u8; ADDRS * ADDR_BYTES];
     for (at, addr) in [
         (ADDR_GOSSIP, peer.gossip),
@@ -796,11 +826,11 @@ fn pack_addrs(peer: &crate::source::PeerRow) -> [u8; ADDRS * ADDR_BYTES] {
     addrs
 }
 
-pub(crate) fn info_events(
+pub fn info_events(
     reason: u8,
     generation: u64,
     slot: solana_clock::Slot,
-    entries: &[(solana_pubkey::Pubkey, crate::validator_info::ValidatorInfo)],
+    entries: &[(solana_pubkey::Pubkey, ValidatorInfo)],
 ) -> Vec<ValidatorInfoEvent> {
     let (pid, tid, timestamp_ns) = header();
     let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
@@ -827,7 +857,7 @@ pub(crate) fn info_events(
 
 /// What the finalization share reads of a frozen bank: its ranked accounts' last votes against
 /// the newest.
-pub(crate) fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEvent> {
+pub fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEvent> {
     if !bank.is_alpenglow() {
         return None;
     }
@@ -858,7 +888,7 @@ pub(crate) fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEven
         if let Some(seen) = event.seen.get_mut(byte) {
             *seen |= mask;
         }
-        if front.saturating_sub(slot) <= crate::collect::NEAR_SLOTS
+        if front.saturating_sub(slot) <= NEAR_SLOTS
             && let Some(carried) = event.carried.get_mut(byte)
         {
             *carried |= mask;
@@ -871,7 +901,7 @@ pub(crate) fn finalization_event(bank: &dyn BankView) -> Option<FinalizationEven
 fn outcome_events(
     slot: solana_clock::Slot,
     ours: bool,
-    outcomes: &[crate::collect::TxOutcome],
+    outcomes: &[TxOutcome],
 ) -> Vec<TxOutcomeEvent> {
     let (pid, tid, timestamp_ns) = header();
     let count = u32::try_from(outcomes.len()).unwrap_or(u32::MAX);
@@ -926,10 +956,10 @@ fn publish_paced<E: Event>(publisher: &mut Publisher<E>, events: &[E]) {
 }
 
 /// An epoch's rank map in parts of `RANKS_PER_EVENT`.
-pub(crate) fn admitted_events(
+pub fn admitted_events(
     epoch: solana_clock::Epoch,
     generation: u64,
-    stakes: &crate::source::EpochStakeView,
+    stakes: &super::bank_view::EpochStakeView,
 ) -> Vec<AdmittedEvent> {
     let (pid, tid, timestamp_ns) = header();
     let ranks = stakes.ranks.len();
@@ -974,7 +1004,7 @@ pub(crate) fn admitted_events(
 }
 
 /// The slot history's bitmap in parts of `HISTORY_WORDS`.
-pub(crate) fn history_events(
+pub fn history_events(
     history: &solana_slot_history::SlotHistory,
     generation: u64,
 ) -> Vec<SlotHistoryEvent> {
@@ -1009,7 +1039,7 @@ pub(crate) fn history_events(
         .collect()
 }
 
-pub(crate) fn block_event(slot: solana_clock::Slot, block: crate::certs::Block) -> BlockEvent {
+pub fn block_event(slot: solana_clock::Slot, block: Block) -> BlockEvent {
     let (pid, tid, timestamp_ns) = header();
     let mut event = BlockEvent {
         pid,
@@ -1032,9 +1062,9 @@ pub(crate) fn block_event(slot: solana_clock::Slot, block: crate::certs::Block) 
         u16::try_from(bitmap.len()).ok()
     };
     match block {
-        crate::certs::Block::Missing => event.kind = BLOCK_MISSING,
-        crate::certs::Block::Pending | crate::certs::Block::Opaque => {}
-        crate::certs::Block::Footer(footer) => {
+        Block::Missing => event.kind = BLOCK_MISSING,
+        Block::Pending | Block::Opaque => {}
+        Block::Footer(footer) => {
             let notar = match &footer.notar_bitmap {
                 Some(bitmap) => pack(bitmap, &mut event.notar).map(Some),
                 None => Some(None),
@@ -1064,7 +1094,7 @@ fn header() -> (i32, i32, u64) {
     (pid, tid, monotonic_timestamp_ns())
 }
 
-pub(crate) fn node_event(src: &dyn Source, caught_up_ms: u64) -> NodeInfoEvent {
+pub fn node_event(src: &Reader, caught_up_ms: u64) -> NodeInfoEvent {
     let (pid, tid, timestamp_ns) = header();
     let contact = src.my_contact();
     let mut addrs = [0u8; ADDRS * ADDR_BYTES];
@@ -1137,7 +1167,7 @@ pub(crate) fn node_event(src: &dyn Source, caught_up_ms: u64) -> NodeInfoEvent {
     }
 }
 
-pub(crate) fn status_event(src: &dyn Source) -> SlotStatusEvent {
+pub fn status_event(src: &Reader) -> SlotStatusEvent {
     let (pid, tid, timestamp_ns) = header();
     let commitment = src.commitment();
     let tip = src.cluster_tip();
@@ -1155,13 +1185,13 @@ pub(crate) fn status_event(src: &dyn Source) -> SlotStatusEvent {
     }
 }
 
-pub(crate) fn epoch_event(bank: &dyn BankView, vote_account: &solana_pubkey::Pubkey) -> EpochEvent {
+pub fn epoch_event(bank: &dyn BankView, vote_account: &solana_pubkey::Pubkey) -> EpochEvent {
     let (pid, tid, timestamp_ns) = header();
     let schedule = bank.epoch_schedule();
     let cost = bank.cost();
     let ticket_short = bank.vat_ticket_short(vote_account);
     let vote_reward = bank
-        .account_data(&crate::collect::VOTE_REWARD_ACCOUNT)
+        .account_data(&VOTE_REWARD_ACCOUNT)
         .filter(|data| data.len() <= VOTE_REWARD_BYTES)
         .unwrap_or_default();
     EpochEvent {
@@ -1194,7 +1224,7 @@ pub(crate) fn epoch_event(bank: &dyn BankView, vote_account: &solana_pubkey::Pub
     }
 }
 
-pub(crate) fn clock_event(
+pub fn clock_event(
     role: u8,
     bank: &dyn BankView,
     identity: &solana_pubkey::Pubkey,
@@ -1234,7 +1264,7 @@ pub(crate) fn clock_event(
     }
 }
 
-/// Publishes the datapoints the tap forwards, each on its row's stream.
+/// Publishes the datapoints the forwarder hands over, each on its row's stream.
 pub struct MetricOutput {
     slot: Publisher<MetricSlot>,
     leader: Publisher<MetricLeader>,
@@ -1262,13 +1292,12 @@ impl MetricOutput {
         })
     }
 
-    /// Runs on its own thread until `exit`, turning the tap's forwarding on while any stream is.
-    pub fn spawn(
-        mut self,
-        tap: Arc<MetricsTap>,
-        points: crossbeam_channel::Receiver<(DataPoint, u64)>,
-        exit: Arc<AtomicBool>,
-    ) -> io::Result<JoinHandle<()>> {
+    /// Runs on its own thread until `exit`, turning forwarding on while any stream is.
+    pub fn spawn(mut self, exit: Arc<AtomicBool>) -> io::Result<JoinHandle<()>> {
+        // Bounded, so a stalled publisher drops points rather than holding memory.
+        let (sender, points) = crossbeam_channel::bounded(METRIC_QUEUE);
+        let tap = MetricForward::global().clone();
+        tap.forward_to(sender);
         thread::Builder::new()
             .name("solEvtMetric".to_string())
             .spawn(move || {
@@ -1332,5 +1361,94 @@ impl MetricOutput {
         } else if let Some(event) = MetricOnce::from_point(point, observed_ms) {
             let _ = self.once.publish(&event);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, crate::node_events::blocks::FooterFacts, std::time::Duration};
+
+    fn footer(close_nanos: u64) -> Block {
+        Block::Footer(Box::new(FooterFacts {
+            close_nanos,
+            notar_bitmap: Some(vec![1, 2]),
+            skip_bitmap: None,
+            fast: Some(true),
+        }))
+    }
+
+    /// Turns 1, 2 and 6 of a 32-slot epoch.
+    fn our_slots() -> Vec<solana_clock::Slot> {
+        (4..=11).chain(24..=27).collect()
+    }
+
+    #[test]
+    fn test_an_unreadable_block_is_held_for_a_while_then_let_go() {
+        let mut settle = Settle::default();
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+        assert!(settle.hold(7, at(0)));
+        assert!(settle.hold(7, at(4_999)));
+        assert!(!settle.hold(7, at(5_000)));
+        // Another slot starts its own wait.
+        assert!(settle.hold(8, at(5_000)));
+        assert!(settle.hold(8, at(9_999)));
+    }
+
+    #[test]
+    fn test_only_an_unreadable_block_near_the_root_is_held() {
+        let now = Instant::now();
+        let mut settle = Settle::default();
+        assert!(settle.holds(24, 31, &Block::Opaque, now));
+        let mut settle = Settle::default();
+        assert!(!settle.holds(4, 31, &Block::Opaque, now));
+        assert!(!settle.holds(24, 31, &Block::Missing, now));
+        assert!(!settle.holds(24, 31, &footer(1), now));
+    }
+
+    #[test]
+    fn test_a_cleaned_slot_is_unreadable_not_skipped() {
+        assert!(matches!(held_block(4, 5, Block::Missing), Block::Opaque));
+        assert!(matches!(held_block(5, 5, Block::Missing), Block::Missing));
+        assert!(matches!(held_block(4, 5, footer(1)), Block::Footer(_)));
+    }
+
+    #[test]
+    fn test_the_sender_reads_our_slots_up_to_the_root_and_resumes() {
+        let mut own = OwnBlocks::with_slots((0, solana_pubkey::Pubkey::new_unique()), our_slots());
+        let now = Instant::now();
+        assert!(own.read_to(|_| Block::Missing, 10, 0, now));
+        let read: Vec<_> = own.read_kinds().iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(read, (4..=10).collect::<Vec<_>>());
+        assert!(own.read_to(|_| Block::Missing, 31, 0, now));
+        let read: Vec<_> = own.read_kinds().iter().map(|(slot, _)| *slot).collect();
+        assert_eq!(read, our_slots());
+    }
+
+    #[test]
+    fn test_old_unreadable_slots_of_ours_are_read_in_one_go() {
+        let mut own = OwnBlocks::with_slots((0, solana_pubkey::Pubkey::new_unique()), our_slots());
+        // 4 to 7 read as skipped under the ledger's first slot, 8 to 11 unreadable, 24 to 27 held.
+        let read = |slot| match slot {
+            8..=11 => Block::Opaque,
+            _ => Block::Missing,
+        };
+        assert!(own.read_to(read, 31, 8, Instant::now()));
+        let expected: Vec<_> = (4..=11)
+            .map(|slot| (slot, BLOCK_OPAQUE))
+            .chain((24..=27).map(|slot| (slot, BLOCK_MISSING)))
+            .collect();
+        assert_eq!(own.read_kinds(), expected);
+    }
+
+    #[test]
+    fn test_an_unreadable_block_of_ours_near_the_root_holds_the_read() {
+        let mut own = OwnBlocks::with_slots((0, solana_pubkey::Pubkey::new_unique()), our_slots());
+        let read = |slot| match slot {
+            24 => Block::Opaque,
+            _ => Block::Missing,
+        };
+        assert!(!own.read_to(read, 31, 0, Instant::now()));
+        assert_eq!(own.read_kinds().last().map(|(slot, _)| *slot), Some(11));
     }
 }

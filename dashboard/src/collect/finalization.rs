@@ -2,6 +2,7 @@
 //! alpenglow. A block credits that certificate's signers with its recent slot and the reward
 //! certificate's with the slot eight back, so a last vote near the newest in the bank was carried.
 
+pub(crate) use solana_core::node_events::output::NEAR_SLOTS;
 use {
     super::{Collector, cluster_charts::at_percent},
     crate::{
@@ -14,9 +15,6 @@ use {
     solana_time_utils::timestamp,
     std::collections::{HashMap, VecDeque},
 };
-
-/// A last vote this close to the newest one in the bank counts as carried.
-pub(crate) const NEAR_SLOTS: u64 = 3;
 
 const MINUTE_MILLIS: u64 = 60_000;
 
