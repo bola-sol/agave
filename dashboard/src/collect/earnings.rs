@@ -1,6 +1,7 @@
 //! This epoch's inflation reward to our vote account, split into voting and the producer bonus our
 //! blocks earn for the votes their reward certificates carry.
 
+pub(crate) use solana_core::node_events::output::VOTE_REWARD_ACCOUNT;
 use {
     super::Collector,
     crate::{
@@ -11,11 +12,6 @@ use {
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
 };
-
-/// Where the runtime keeps each epoch's inflation: `vote_reward_account` under the alpenglow
-/// feature id.
-pub(crate) const VOTE_REWARD_ACCOUNT: Pubkey =
-    Pubkey::from_str_const("3vJzniWALu2qGFJ1ZY6JD3Y2ZmA5zWqmVdDX7yBXHgu7");
 
 const BLOCKS_PER_TICK: usize = 64;
 

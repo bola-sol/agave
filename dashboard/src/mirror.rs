@@ -242,26 +242,24 @@ impl From<&NodeInfoEvent> for Node {
     }
 }
 
-impl From<&GossipPeerEvent> for PeerRow {
-    fn from(event: &GossipPeerEvent) -> Self {
-        let addr = |at: usize| addr_at(&event.addrs, at);
-        Self {
-            pubkey: Pubkey::new_from_array(event.pubkey),
-            client: unpack_str(&event.client),
-            version: unpack_str(&event.version),
-            wallclock: event.wallclock,
-            outset: event.outset,
-            shred_version: event.shred_version,
-            gossip: addr(ADDR_GOSSIP),
-            rpc: addr(ADDR_RPC),
-            tvu_udp: addr(ADDR_TVU_UDP),
-            tpu_quic: addr(ADDR_TPU_QUIC),
-            tpu_forwards_quic: addr(ADDR_TPU_FORWARDS_QUIC),
-            tpu_vote_udp: addr(ADDR_TPU_VOTE_UDP),
-            tpu_vote_quic: addr(ADDR_TPU_VOTE_QUIC),
-            serve_repair_udp: addr(ADDR_SERVE_REPAIR_UDP),
-            alpenglow: addr(ADDR_ALPENGLOW),
-        }
+fn peer_row(event: &GossipPeerEvent) -> PeerRow {
+    let addr = |at: usize| addr_at(&event.addrs, at);
+    PeerRow {
+        pubkey: Pubkey::new_from_array(event.pubkey),
+        client: unpack_str(&event.client),
+        version: unpack_str(&event.version),
+        wallclock: event.wallclock,
+        outset: event.outset,
+        shred_version: event.shred_version,
+        gossip: addr(ADDR_GOSSIP),
+        rpc: addr(ADDR_RPC),
+        tvu_udp: addr(ADDR_TVU_UDP),
+        tpu_quic: addr(ADDR_TPU_QUIC),
+        tpu_forwards_quic: addr(ADDR_TPU_FORWARDS_QUIC),
+        tpu_vote_udp: addr(ADDR_TPU_VOTE_UDP),
+        tpu_vote_quic: addr(ADDR_TPU_VOTE_QUIC),
+        serve_repair_udp: addr(ADDR_SERVE_REPAIR_UDP),
+        alpenglow: addr(ADDR_ALPENGLOW),
     }
 }
 
@@ -939,7 +937,7 @@ impl Mirror {
         };
         state.peers = parts
             .iter()
-            .map(|part| (PeerRow::from(part), part.heard_ms))
+            .map(|part| (peer_row(part), part.heard_ms))
             .collect();
         state.peer_at = state
             .peers
@@ -1721,12 +1719,8 @@ impl Source for Mirror {
 mod tests {
     use {
         super::*,
-        crate::{
-            event_output::{clock_event, epoch_event, node_event, status_event},
-            events::ROLE_WORKING,
-            fixture::fixture,
-            source::Direct,
-        },
+        crate::{events::ROLE_WORKING, fixture::fixture, source::Direct},
+        solana_core::node_events::output::{clock_event, epoch_event, node_event, status_event},
     };
 
     fn wait_part(
@@ -1839,11 +1833,11 @@ mod tests {
         let direct = Direct::new(harness.ctx.clone(), None);
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let (identity, vote_account) = (direct.identity(), direct.vote_account());
-        mirror.apply_node(&node_event(&direct, 0));
+        mirror.apply_node(&node_event(&harness.reader(), 0));
         assert_eq!(mirror.caught_up_millis(), None);
-        mirror.apply_node(&node_event(&direct, 1_234));
+        mirror.apply_node(&node_event(&harness.reader(), 1_234));
         assert_eq!(mirror.caught_up_millis(), Some(1_234));
-        mirror.apply_status(&status_event(&direct));
+        mirror.apply_status(&status_event(&harness.reader()));
         let working = direct.working_bank();
         mirror.apply_epoch(&epoch_event(working.as_ref(), &vote_account));
         mirror.apply_clock(&clock_event(
@@ -1913,7 +1907,7 @@ mod tests {
 
     #[test]
     fn test_rank_maps_and_slot_history_come_back_whole() {
-        use crate::event_output::{admitted_events, history_events};
+        use solana_core::node_events::output::{admitted_events, history_events};
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let entries: Vec<RankEntry> = (0..70u64)
             .map(|stake| RankEntry {
@@ -2040,7 +2034,7 @@ mod tests {
 
     #[test]
     fn test_a_full_info_set_leaves_a_newer_change_alone() {
-        use crate::event_output::info_events;
+        use solana_core::node_events::output::info_events;
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let key = Pubkey::new_unique();
         let named = |name: &str| ValidatorInfo {
@@ -2059,7 +2053,7 @@ mod tests {
 
     #[test]
     fn test_roots_before_the_history_arrives_are_kept() {
-        use crate::event_output::history_events;
+        use solana_core::node_events::output::history_events;
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let mut history = SlotHistory::default();
         history.add(10);
@@ -2142,7 +2136,7 @@ mod tests {
         let harness = fixture();
         let direct = Direct::new(harness.ctx.clone(), None);
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
-        mirror.apply_node(&node_event(&direct, 0));
+        mirror.apply_node(&node_event(&harness.reader(), 0));
         let (me, other) = (direct.identity(), Pubkey::new_unique());
         let leaders = [other, me, me, other, other, other, me, other];
         mirror.apply_schedule(&EpochInfo {
@@ -2192,10 +2186,10 @@ mod tests {
                     Block::Pending => Block::Pending,
                     Block::Opaque => Block::Opaque,
                 };
-                crate::event_output::block_event(*slot, block)
+                solana_core::node_events::output::block_event(*slot, block)
             })
             .collect();
-        crate::event_output::own_block_events((epoch, me), generation, 20, &blocks)
+        solana_core::node_events::output::own_block_events((epoch, me), generation, 20, &blocks)
     }
 
     #[test]
@@ -2206,7 +2200,7 @@ mod tests {
         // Ours, but in the epoch before the root's.
         assert!(matches!(mirror.block(5, 40), Block::Opaque));
         // A block sent at its root answers while the set is awaited.
-        mirror.apply_block(&crate::event_output::block_event(5, footer(7)));
+        mirror.apply_block(&solana_core::node_events::output::block_event(5, footer(7)));
         assert!(matches!(mirror.block(5, 20), Block::Footer(_)));
         assert!(matches!(mirror.block(4, 20), Block::Pending));
         mirror.set_own_blocks_connected(false, false);
@@ -2273,7 +2267,7 @@ mod tests {
 
     #[test]
     fn test_a_block_comes_back_whole_through_an_own_set() {
-        let block = crate::event_output::block_event(4, footer(3));
+        let block = solana_core::node_events::output::block_event(4, footer(3));
         let place = crate::events::OwnSetPlace {
             pid: block.pid,
             tid: block.tid,
@@ -2289,95 +2283,16 @@ mod tests {
     }
 
     #[test]
-    fn test_an_unreadable_block_is_held_for_a_while_then_let_go() {
-        use crate::event_output::Settle;
-        let mut settle = Settle::default();
-        let start = std::time::Instant::now();
-        let at = |millis| start + std::time::Duration::from_millis(millis);
-        assert!(settle.hold(7, at(0)));
-        assert!(settle.hold(7, at(4_999)));
-        assert!(!settle.hold(7, at(5_000)));
-        // Another slot starts its own wait.
-        assert!(settle.hold(8, at(5_000)));
-        assert!(settle.hold(8, at(9_999)));
-    }
-
-    #[test]
-    fn test_only_an_unreadable_block_near_the_root_is_held() {
-        use crate::event_output::Settle;
-        let now = std::time::Instant::now();
-        let mut settle = Settle::default();
-        assert!(settle.holds(24, 31, &Block::Opaque, now));
-        let mut settle = Settle::default();
-        assert!(!settle.holds(4, 31, &Block::Opaque, now));
-        assert!(!settle.holds(24, 31, &Block::Missing, now));
-        assert!(!settle.holds(24, 31, &footer(1), now));
-    }
-
-    #[test]
-    fn test_old_unreadable_slots_of_ours_are_read_in_one_go() {
-        use crate::{event_output::OwnBlocks, events::BLOCK_OPAQUE};
-        let (mirror, me) = own_mirror();
-        mirror.set_own_blocks_connected(false, false);
-        let harness = fixture();
-        let direct = Direct::new(harness.ctx.clone(), None);
-        mirror.apply_status(&SlotStatusEvent {
-            lowest_slot: 8,
-            ..status_event(&direct)
-        });
-        // 4 to 7 read as skipped under the ledger's first slot, 8 to 11 unreadable, 24 to 27 held.
-        for slot in (4..=7).chain(24..=27) {
-            mirror.apply_block(&crate::event_output::block_event(slot, Block::Missing));
-        }
-        let bank = mirror.root_bank();
-        let mut own = OwnBlocks::new(&mirror, bank.as_ref(), (0, me)).unwrap();
-        assert!(own.read_to(&mirror, 31, std::time::Instant::now()));
-        let expected: Vec<(Slot, u8)> = (4..=11)
-            .map(|slot| (slot, BLOCK_OPAQUE))
-            .chain((24..=27).map(|slot| (slot, BLOCK_MISSING)))
-            .collect();
-        assert_eq!(own.read_kinds(), expected);
-    }
-
-    #[test]
-    fn test_a_cleaned_slot_is_unreadable_not_skipped() {
-        use crate::event_output::held_block;
-        assert!(matches!(held_block(4, 5, Block::Missing), Block::Opaque));
-        assert!(matches!(held_block(5, 5, Block::Missing), Block::Missing));
-        assert!(matches!(held_block(4, 5, footer(1)), Block::Footer(_)));
-    }
-
-    #[test]
     fn test_a_slot_past_the_newest_block_sent_waits_for_it_a_while() {
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         assert!(matches!(mirror.block(9, 20), Block::Opaque));
-        mirror.apply_block(&crate::event_output::block_event(10, Block::Missing));
+        mirror.apply_block(&solana_core::node_events::output::block_event(
+            10,
+            Block::Missing,
+        ));
         assert!(matches!(mirror.block(9, 20), Block::Opaque));
         assert!(matches!(mirror.block(11, 20), Block::Pending));
         std::thread::sleep(BLOCKS_STALE);
         assert!(matches!(mirror.block(11, 20), Block::Opaque));
-    }
-
-    #[test]
-    fn test_the_sender_reads_our_slots_up_to_the_root_and_resumes() {
-        use crate::event_output::OwnBlocks;
-        let harness = fixture();
-        let bank = harness.advance_to(20);
-        let direct = Direct::new(harness.ctx.clone(), None);
-        let me = direct.identity();
-        let view = direct.root_bank();
-        let mut own = OwnBlocks::new(&direct, view.as_ref(), (0, me)).unwrap();
-        let ours: Vec<Slot> = crate::collect::leader_slots_in_epoch(&direct, view.as_ref(), 0, &me)
-            .unwrap()
-            .into_iter()
-            .filter(|slot| *slot <= 20)
-            .collect();
-        assert!(!ours.is_empty());
-        let now = std::time::Instant::now();
-        assert!(own.read_to(&direct, 10, now));
-        let first = ours.iter().filter(|slot| **slot <= 10).count();
-        assert_eq!(own.read_slots(), &ours[..first]);
-        assert!(own.read_to(&direct, bank.slot(), now));
-        assert_eq!(own.read_slots(), ours);
     }
 }

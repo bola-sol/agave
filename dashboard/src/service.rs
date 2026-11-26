@@ -58,8 +58,6 @@ pub struct DashboardService {
     commission_bps: Option<u16>,
     history: Arc<RwLock<SlotHistory>>,
     info_cache: Arc<RwLock<ValidatorInfoCache>>,
-    /// When the collector saw the node catch up, for the event streams.
-    caught_up: Arc<AtomicU64>,
     epochs: Arc<RwLock<Vec<EpochInfo>>>,
     replies: Arc<Replies>,
     server: Option<JoinHandle<()>>,
@@ -71,10 +69,6 @@ pub struct DashboardService {
     filler: Option<JoinHandle<()>>,
     /// Handed to the collector on attach.
     refill: Option<crossbeam_channel::Receiver<Refilled>>,
-    /// What the collector reads, kept for the event streams.
-    source: Option<Arc<dyn Source>>,
-    events: Option<JoinHandle<()>>,
-    metric_events: Option<JoinHandle<()>>,
 }
 
 impl DashboardService {
@@ -289,7 +283,6 @@ impl DashboardService {
             commission_bps: config.commission_bps,
             history,
             info_cache,
-            caught_up: Arc::default(),
             epochs,
             replies,
             server: Some(server),
@@ -300,9 +293,6 @@ impl DashboardService {
             recorder,
             filler,
             refill,
-            source: None,
-            events: None,
-            metric_events: None,
         })
     }
 
@@ -316,7 +306,6 @@ impl DashboardService {
 
     /// Starts the collector and meters on `src`.
     pub fn attach_source(&mut self, src: Arc<dyn Source>) -> io::Result<()> {
-        self.source = Some(src.clone());
         let info_cache = self.info_cache.clone();
         let failed_total = Arc::new(AtomicU64::new(FAILED_UNREAD));
 
@@ -375,7 +364,6 @@ impl DashboardService {
             let tips = self.tip_payment_program_id.as_ref().map(TipMeter::new);
             let commission_bps = self.commission_bps;
             let refill = self.refill.take();
-            let caught_up = self.caught_up.clone();
             thread::Builder::new()
                 .name("solDashColl".to_string())
                 .spawn(move || {
@@ -389,7 +377,6 @@ impl DashboardService {
                         startup,
                         metrics_tap,
                         failed_total,
-                        caught_up,
                     };
                     let mut collector = Collector::with_source(src, shared, tips, commission_bps);
                     if let Some(refill) = refill {
@@ -409,31 +396,6 @@ impl DashboardService {
         Ok(())
     }
 
-    /// Publishes what the collector reads as event streams, for a dashboard in another process.
-    /// Test branch only.
-    pub fn publish_events(
-        &mut self,
-        event_system: &agave_event_system::EventSystem,
-    ) -> io::Result<()> {
-        let src = self
-            .source
-            .clone()
-            .ok_or_else(|| io::Error::other("the collector is not attached"))?;
-        let output = crate::event_output::EventOutput::new(
-            event_system,
-            self.info_cache.clone(),
-            self.caught_up.clone(),
-        )?;
-        self.events = Some(output.spawn(src, self.exit.clone())?);
-        // Bounded so a stalled publisher costs points, not the validator's memory.
-        let (sender, receiver) = crossbeam_channel::bounded(16_384);
-        self.metrics_tap.forward_to(sender);
-        let metrics = crate::event_output::MetricOutput::new(event_system)?;
-        self.metric_events =
-            Some(metrics.spawn(self.metrics_tap.clone(), receiver, self.exit.clone())?);
-        Ok(())
-    }
-
     /// Publishes the validator's start as another process's events report it.
     pub fn report_startup_from(&self, reported: crate::startup::SharedReported) {
         self.startup.lock().unwrap().report_from(reported);
@@ -446,8 +408,6 @@ impl DashboardService {
 
     pub fn join(mut self) -> thread::Result<()> {
         for handle in [
-            self.events.take(),
-            self.metric_events.take(),
             self.collector.take(),
             self.meters.take(),
             self.boot.take(),

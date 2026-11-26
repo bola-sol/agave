@@ -23,11 +23,11 @@ pub trait MetricEvent: Sized {
 }
 
 fn text<const N: usize>(value: &str) -> [u8; N] {
-    crate::events::pack_str(value)
+    super::types::pack_str(value)
 }
 
 fn untext(packed: &[u8]) -> String {
-    crate::events::unpack_str(packed)
+    super::types::unpack_str(packed)
 }
 
 fn number(value: &str) -> Option<i64> {
