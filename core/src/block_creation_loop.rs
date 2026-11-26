@@ -160,6 +160,8 @@ pub struct BlockCreationLoopConfig {
     // Channel to receive RecordReceiver from PohService
     pub record_receiver_receiver: Receiver<RecordReceiver>,
     pub optimistic_parent_receiver: Receiver<LeaderWindowInfo>,
+    /// Our footers, to replay, which publishes them as their banks freeze.
+    pub own_footer_sender: Sender<crate::block_events::OwnFooter>,
 
     /// Sender for packets to banking stage (used to re-inject transactions after sad leader handover).
     pub banking_stage_sender: BankingPacketSender,
@@ -190,6 +192,7 @@ struct LeaderContext {
     transaction_status_sender: Option<TransactionStatusSender>,
     replay_highest_frozen: Arc<ReplayHighestFrozen>,
     reward_certs_requestor: CertsRequestor,
+    own_footer_sender: Sender<crate::block_events::OwnFooter>,
     /// Banking-stage ingress used to reschedule transactions after sad handover.
     banking_stage_sender: BankingPacketSender,
 
@@ -277,6 +280,7 @@ fn start_loop(config: BlockCreationLoopConfig, reward_certs_requestor: CertsRequ
         replay_highest_frozen,
         highest_parent_ready,
         optimistic_parent_receiver,
+        own_footer_sender,
         highest_finalized,
         banking_stage_sender,
         sharable_banks,
@@ -331,6 +335,7 @@ fn start_loop(config: BlockCreationLoopConfig, reward_certs_requestor: CertsRequ
         transaction_status_sender,
         replay_highest_frozen,
         reward_certs_requestor,
+        own_footer_sender,
         banking_stage_sender,
         metrics: LoopMetrics::default(),
         highest_finalized,
@@ -916,6 +921,10 @@ fn record_and_complete_block(
             ValidatedRewardCert::try_new_for_leader(&bank, &skip, &notar, validators)?;
         let guard = ctx.highest_finalized.read().unwrap();
         let footer = produce_block_footer(&bank, skip, notar, guard.as_ref());
+        // Dropped rather than waited for: replay then sends no footer for this bank.
+        let _ = ctx
+            .own_footer_sender
+            .try_send((bank_slot, bank.bank_id().into(), footer.clone()));
         let final_cert_input = guard.as_ref().map(|c| c.vote_rewards_input());
 
         // BankingStage may still be executing batches that were already recorded.
@@ -1784,6 +1793,7 @@ mod tests {
             transaction_status_sender: None,
             replay_highest_frozen: Arc::new(ReplayHighestFrozen::default()),
             reward_certs_requestor,
+            own_footer_sender: crossbeam_channel::unbounded().0,
             banking_stage_sender,
             metrics: LoopMetrics::default(),
             genesis_cert_block_marker: test_genesis_cert_block_marker(),
@@ -1897,6 +1907,7 @@ mod tests {
             transaction_status_sender: None,
             replay_highest_frozen: Arc::new(ReplayHighestFrozen::default()),
             reward_certs_requestor,
+            own_footer_sender: crossbeam_channel::unbounded().0,
             banking_stage_sender,
             metrics: LoopMetrics::default(),
             genesis_cert_block_marker: GenesisCertBlockMarker {
@@ -1991,6 +2002,7 @@ mod tests {
             transaction_status_sender: None,
             replay_highest_frozen: Arc::new(ReplayHighestFrozen::default()),
             reward_certs_requestor,
+            own_footer_sender: crossbeam_channel::unbounded().0,
             banking_stage_sender,
             metrics: LoopMetrics::default(),
             genesis_cert_block_marker: test_genesis_cert_block_marker(),
@@ -2106,6 +2118,7 @@ mod tests {
             transaction_status_sender: None,
             replay_highest_frozen: Arc::new(ReplayHighestFrozen::default()),
             reward_certs_requestor,
+            own_footer_sender: crossbeam_channel::unbounded().0,
             banking_stage_sender,
             metrics: LoopMetrics::default(),
             genesis_cert_block_marker,
@@ -2177,6 +2190,7 @@ mod tests {
             transaction_status_sender: None,
             replay_highest_frozen: Arc::new(ReplayHighestFrozen::default()),
             reward_certs_requestor,
+            own_footer_sender: crossbeam_channel::unbounded().0,
             banking_stage_sender,
             metrics: LoopMetrics::default(),
             genesis_cert_block_marker: test_genesis_cert_block_marker(),
@@ -2300,6 +2314,7 @@ mod tests {
             transaction_status_sender: Some(transaction_status_sender),
             replay_highest_frozen: Arc::new(ReplayHighestFrozen::default()),
             reward_certs_requestor,
+            own_footer_sender: crossbeam_channel::unbounded().0,
             banking_stage_sender,
             metrics: LoopMetrics::default(),
             genesis_cert_block_marker: test_genesis_cert_block_marker(),

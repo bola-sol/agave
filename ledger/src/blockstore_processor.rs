@@ -33,7 +33,7 @@ use {
     },
     solana_clock::Slot,
     solana_entry::{
-        block_component::{ParsedBlockComponent, VersionedBlockMarker},
+        block_component::{ParsedBlockComponent, VersionedBlockFooter, VersionedBlockMarker},
         entry::{
             self, EntrySliceTickCheck as _, EntryType, EntryView, UnverifiedSignatures,
             create_ticks,
@@ -954,6 +954,8 @@ pub struct ConfirmationProgress {
     pub num_shreds: u64,
     pub num_entries: usize,
     pub num_txs: usize,
+    /// The footer replay read, once it has.
+    pub block_footer: Option<Box<VersionedBlockFooter>>,
     async_verification: Option<AsyncVerificationProgress>,
 }
 
@@ -1517,6 +1519,9 @@ pub fn confirm_slot(
                 let block_footer = match &marker {
                     VersionedBlockMarker::V1(marker) => marker.as_block_footer().cloned(),
                 };
+                if let Some(footer) = &block_footer {
+                    progress.block_footer = Some(Box::new(footer.clone()));
+                }
                 if let Some(parent_bank) = bank.parent() {
                     let allow_initial_update_parent =
                         replay_starts_at_update_parent && marker.is_update_parent();

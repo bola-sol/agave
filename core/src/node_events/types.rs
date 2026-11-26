@@ -184,7 +184,8 @@ pub const BLOCK_FOOTER: u8 = 3;
 /// Bytes an encoded reward certificate bitmap holds; a longer one reads as opaque.
 pub const BITMAP_BYTES: usize = 512;
 
-/// A rooted slot as the certificate walks read it: skipped, unreadable, or its footer's figures.
+/// A frozen bank's footer figures as replay read them, or as we produced them; in the own set, a
+/// rooted slot of ours as the ledger holds it: skipped, unreadable or its footer's figures.
 #[event]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockEvent {
@@ -192,6 +193,8 @@ pub struct BlockEvent {
     pub tid: i32,
     pub timestamp_ns: u64,
     pub slot: Slot,
+    /// The bank the footer belongs to; 0 in the own set.
+    pub bank_id: u64,
     /// `BLOCK_MISSING`, `BLOCK_OPAQUE` or `BLOCK_FOOTER`.
     pub kind: u8,
     /// The leader's close time, unix nanoseconds.
@@ -219,7 +222,8 @@ pub struct OwnBlockEvent {
     pub generation: u64,
     pub index: u32,
     pub count: u32,
-    /// The root the set was read up to, for diagnosis.
+    /// The slot the set was read up to; ours past it are answered by the footers sent as they
+    /// froze.
     pub covered_to: Slot,
     pub slot: Slot,
     pub kind: u8,
@@ -280,6 +284,7 @@ impl OwnBlockEvent {
             tid: self.tid,
             timestamp_ns: self.timestamp_ns,
             slot: self.slot,
+            bank_id: 0,
             kind: self.kind,
             close_nanos: self.close_nanos,
             has_notar: self.has_notar,

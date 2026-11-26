@@ -679,6 +679,10 @@ impl EventInput {
     }
 
     pub fn drain(&mut self) {
+        // Banks and footers ahead of the roots that name them, as they were sent.
+        let mirror = &self.mirror;
+        self.bank_frozen.drain(|event| mirror.apply_frozen(&event));
+        self.blocks.drain(|event| mirror.apply_block(&event));
         let slots = &mut self.slots;
         let mut rooted = Vec::new();
         let mut begun = 0;
@@ -697,22 +701,20 @@ impl EventInput {
                 slots.newest_finished = slots.newest_finished.max(slot);
             }
             SlotEvent::Removed { .. } => slots.removed = slots.removed.saturating_add(1),
-            SlotEvent::Rooted { slot, .. } => {
+            SlotEvent::Rooted { slot, bank_id, .. } => {
                 slots.root = slots.root.max(slot);
-                rooted.push(slot);
+                rooted.push((slot, bank_id));
             }
         });
-        for slot in rooted {
-            self.mirror.apply_rooted(slot);
+        for (slot, bank_id) in rooted {
+            self.mirror.apply_rooted(slot, bank_id);
         }
         if begun > 0 {
             self.mirror.apply_begun(begun);
         }
 
         let mirror = &self.mirror;
-        self.bank_frozen.drain(|event| mirror.apply_frozen(&event));
         self.ledger.drain(|event| mirror.apply_ledger(&event));
-        self.blocks.drain(|event| mirror.apply_block(&event));
         self.own_blocks
             .drain(|event| mirror.apply_own_block(&event));
         self.admitted.drain(|event| mirror.apply_admitted(&event));

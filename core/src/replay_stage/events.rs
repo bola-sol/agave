@@ -1,12 +1,18 @@
 use {
-    crate::frozen_bank_events::FrozenBankSender,
+    crate::{
+        block_events::{OwnFooter, footer_event},
+        frozen_bank_events::FrozenBankSender,
+        node_events::types::BlockEvent,
+    },
     agave_event_system::{
         event,
         event_metadata::{cached_thread_and_process_id, monotonic_timestamp_ns},
         publisher::Publisher,
         stream_name::StreamName,
     },
+    crossbeam_channel::Receiver,
     solana_clock::{BankId, Epoch, Slot, UnixTimestamp},
+    solana_entry::block_component::{BlockFooterV1, VersionedBlockFooter},
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     std::sync::Arc,
@@ -182,12 +188,19 @@ impl BankFrozenEvent {
     }
 }
 
-/// What replay sends as each bank freezes: its own figures, and the bank to the readers that
-/// take longer.
+/// Our footers kept for their banks' freeze, at most this many.
+const OWN_FOOTERS_KEPT: usize = 64;
+
+/// What replay sends as each bank freezes: its own figures, its footer, and the bank to the
+/// readers that take longer.
 pub(crate) struct FrozenOutput {
     pub(crate) publisher: Publisher<BankFrozenEvent>,
+    pub(crate) blocks: Publisher<BlockEvent>,
     pub(crate) vote_account: Pubkey,
     pub(crate) readers: FrozenBankSender,
+    /// Our footers as block creation produced them, since our banks are not replayed from shreds.
+    pub(crate) own_footers: Receiver<OwnFooter>,
+    pub(crate) own_held: Vec<OwnFooter>,
 }
 
 impl FrozenOutput {
@@ -195,18 +208,54 @@ impl FrozenOutput {
     pub(crate) fn stub() -> Self {
         Self {
             publisher: Publisher::stub(),
+            blocks: Publisher::stub(),
             vote_account: Pubkey::default(),
             readers: FrozenBankSender::stub(),
+            own_footers: crossbeam_channel::never(),
+            own_held: Vec::new(),
         }
     }
 
-    pub(crate) fn frozen(&mut self, bank: &Arc<Bank>, identity: &Pubkey) {
+    /// `footer` is the one replay read; ours comes from block creation.
+    pub(crate) fn frozen(
+        &mut self,
+        bank: &Arc<Bank>,
+        identity: &Pubkey,
+        footer: Option<&VersionedBlockFooter>,
+        ours: bool,
+    ) {
         if self.publisher.is_enabled() {
             let _ =
                 self.publisher
                     .publish(&BankFrozenEvent::new(bank, identity, &self.vote_account));
         }
+        let own = ours.then(|| self.take_own(bank)).flatten();
+        if self.blocks.is_enabled() {
+            let footer = footer
+                .map(|VersionedBlockFooter::V1(footer)| footer)
+                .or(own.as_ref());
+            if let Some(footer) = footer {
+                let _ = self.blocks.publish(&footer_event(bank, footer));
+            }
+        }
         self.readers.send(bank);
+    }
+
+    /// Our footer for `bank`, from those block creation sent.
+    fn take_own(&mut self, bank: &Bank) -> Option<BlockFooterV1> {
+        self.own_held.extend(self.own_footers.try_iter());
+        let (slot, bank_id) = (bank.slot(), BankId::from(bank.bank_id()));
+        let at = self
+            .own_held
+            .iter()
+            .position(|(held, id, _)| *held == slot && *id == bank_id);
+        let footer = at.map(|at| self.own_held.swap_remove(at).2);
+        self.own_held.retain(|(held, _, _)| *held > slot);
+        if self.own_held.len() > OWN_FOOTERS_KEPT {
+            let excess = self.own_held.len().saturating_sub(OWN_FOOTERS_KEPT);
+            self.own_held.drain(..excess);
+        }
+        footer
     }
 }
 
@@ -289,5 +338,37 @@ mod tests {
             event.vote_balance,
             bank.get_balance(&genesis.voting_keypair.pubkey())
         );
+    }
+
+    #[test]
+    fn test_our_footer_is_taken_for_its_own_bank_only() {
+        let genesis = solana_runtime::genesis_utils::create_genesis_config(1_000);
+        let bank = Bank::new_for_tests(&genesis.genesis_config);
+        let footer = |close| BlockFooterV1 {
+            bank_hash: solana_hash::Hash::default(),
+            block_producer_time_nanos: close,
+            block_user_agent: Vec::new(),
+            block_final_cert: None,
+            skip_reward_cert: None,
+            notar_reward_cert: None,
+        };
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let mut output = FrozenOutput {
+            own_footers: receiver,
+            ..FrozenOutput::stub()
+        };
+        let bank_id = BankId::from(bank.bank_id());
+        // Another bank of the same slot, then this one, then a later slot.
+        sender
+            .send((bank.slot(), bank_id.saturating_add(1), footer(1)))
+            .unwrap();
+        sender.send((bank.slot(), bank_id, footer(2))).unwrap();
+        sender
+            .send((bank.slot().saturating_add(1), 9, footer(3)))
+            .unwrap();
+        let taken = output.take_own(&bank).unwrap();
+        assert_eq!(taken.block_producer_time_nanos, 2);
+        assert_eq!(output.own_held.len(), 1);
+        assert!(output.take_own(&bank).is_none());
     }
 }

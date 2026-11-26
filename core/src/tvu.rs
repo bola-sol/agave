@@ -187,6 +187,8 @@ pub struct AlpenglowInitializationState {
     pub highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
     pub bank_forks_controller: Arc<dyn BankForksController>,
     pub bank_forks_controller_receiver: BankForksCommandReceiver,
+    /// Our footers, from block creation to replay.
+    pub own_footer_receiver: Receiver<crate::block_events::OwnFooter>,
 
     // Main communication channel
     pub votor_event_sender: VotorEventSender,
@@ -275,6 +277,7 @@ impl Tvu {
             highest_parent_ready,
             bank_forks_controller,
             bank_forks_controller_receiver,
+            own_footer_receiver,
             votor_event_sender,
             votor_event_receiver,
             cancel,
@@ -587,6 +590,7 @@ impl Tvu {
             popular_pruned_forks_receiver,
             bank_forks_controller_receiver,
             latest_switch_request,
+            own_footer_receiver,
         };
 
         let replay_stage_config = ReplayStageConfig {
@@ -921,6 +925,7 @@ pub mod tests {
                 leader_window_info_sender,
                 optimistic_parent_sender,
                 optimistic_parent_receiver,
+                own_footer_receiver: crossbeam_channel::never(),
                 replay_highest_frozen,
                 highest_parent_ready,
                 votor_event_sender,

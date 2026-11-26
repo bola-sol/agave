@@ -12,6 +12,7 @@ pub mod bank_state_events;
 pub mod banking_channels;
 pub mod banking_stage;
 pub(crate) mod block_creation_loop;
+pub mod block_events;
 pub mod cluster_info_vote_listener;
 pub mod cluster_slots_service;
 pub mod commitment_service;

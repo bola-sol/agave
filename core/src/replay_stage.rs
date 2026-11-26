@@ -20,6 +20,7 @@ use {
         },
         cost_update_service::CostUpdate,
         frozen_bank_events::FrozenBankEvents,
+        node_events::types::{BLOCK_STREAM, BlockEvent},
         repair::{
             ancestor_hashes_service::AncestorHashesReplayUpdateSender,
             cluster_slot_state_verifier::*,
@@ -510,6 +511,8 @@ pub struct ReplayReceivers {
     pub popular_pruned_forks_receiver: Receiver<Vec<u64>>,
     pub bank_forks_controller_receiver: BankForksCommandReceiver,
     pub latest_switch_request: LatestSwitchRequest,
+    /// Our footers as block creation produces them.
+    pub own_footer_receiver: Receiver<crate::block_events::OwnFooter>,
 }
 
 /// Timing information for the ReplayStage main processing loop
@@ -834,6 +837,7 @@ impl ReplayStage {
             popular_pruned_forks_receiver,
             bank_forks_controller_receiver,
             latest_switch_request,
+            own_footer_receiver,
         } = receivers;
 
         trace!("replay stage");
@@ -860,6 +864,16 @@ impl ReplayStage {
             .map_err(|err| format!("Failed to create replay bank-frozen stream: {err}"))?;
         let (frozen_bank_events, frozen_bank_sender) =
             FrozenBankEvents::new(event_system, bank_forks.clone(), exit.clone())?;
+        let blocks_factory = event_system
+            .create_stream::<BlockEvent>(
+                BLOCK_STREAM,
+                StreamConfig {
+                    capacity: 512,
+                    publisher_slots: 1,
+                    subscriber_slots: 8,
+                },
+            )
+            .map_err(|err| format!("Failed to create the block footer stream: {err}"))?;
 
         // Start the replay stage loop
         let migration_status = bank_forks.read().unwrap().migration_status();
@@ -881,8 +895,13 @@ impl ReplayStage {
                 publisher: bank_frozen_factory
                     .try_create_publisher()
                     .expect("fresh replay stream has one publisher slot"),
+                blocks: blocks_factory
+                    .try_create_publisher()
+                    .expect("fresh block footer stream has one publisher slot"),
                 vote_account,
                 readers: frozen_bank_sender,
+                own_footers: own_footer_receiver,
+                own_held: Vec::new(),
             };
             if let Some(arena) = replay_arena {
                 arena
@@ -4347,7 +4366,18 @@ impl ReplayStage {
                     bank.bank_id().into(),
                     true,
                 ));
-                frozen_output.frozen(&bank.clone_without_scheduler(), my_pubkey);
+                let footer = completed_replay
+                    .replay_progress
+                    .read()
+                    .unwrap()
+                    .block_footer
+                    .clone();
+                frozen_output.frozen(
+                    &bank.clone_without_scheduler(),
+                    my_pubkey,
+                    footer.as_deref(),
+                    is_leader_block,
+                );
 
                 let r_replay_stats = completed_replay.replay_stats.read().unwrap();
                 let r_replay_progress = completed_replay.replay_progress.read().unwrap();

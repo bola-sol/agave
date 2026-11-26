@@ -1649,6 +1649,7 @@ impl Validator {
         // small (but highly overprovisioned) number for performance and easier
         // debug if things go off the rails.
         let (optimistic_parent_sender, optimistic_parent_receiver) = bounded(100);
+        let (own_footer_sender, own_footer_receiver) = bounded(64);
 
         let banking_stage_sender_for_bcl = banking_channels.non_vote_sender.clone();
         let entry_notification_sender = entry_notifier_service
@@ -1673,6 +1674,7 @@ impl Validator {
             replay_highest_frozen: replay_highest_frozen.clone(),
             record_receiver_receiver,
             optimistic_parent_receiver: optimistic_parent_receiver.clone(),
+            own_footer_sender,
             highest_finalized: highest_finalized.clone(),
             banking_stage_sender: banking_stage_sender_for_bcl,
             sharable_banks: bank_forks.read().unwrap().sharable_banks(),
@@ -1792,6 +1794,7 @@ impl Validator {
                 leader_window_info_sender,
                 optimistic_parent_sender,
                 optimistic_parent_receiver,
+                own_footer_receiver,
                 replay_highest_frozen,
                 highest_parent_ready,
                 bank_forks_controller,
@@ -1924,6 +1927,8 @@ impl Validator {
             &event_system,
             cluster_info.clone(),
             blockstore.clone(),
+            bank_forks.clone(),
+            leader_schedule_cache.clone(),
             highest_finalized.clone(),
             exit.clone(),
         )

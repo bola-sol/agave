@@ -10,10 +10,11 @@ use {
             ACCOUNT_PATHS, ADDR_ALPENGLOW, ADDR_BYTES, ADDR_GOSSIP, ADDR_RPC,
             ADDR_SERVE_REPAIR_UDP, ADDR_TPU_FORWARDS_QUIC, ADDR_TPU_QUIC, ADDR_TPU_VOTE_QUIC,
             ADDR_TPU_VOTE_UDP, ADDR_TVU_UDP, AdmittedEvent, BITMAP_BYTES, BLOCK_FOOTER,
-            BLOCK_MISSING, BlockEvent, EpochEvent, FinalizationEvent, GossipPeerEvent,
-            INFO_FULL_SET, LedgerSlotEvent, MessageVersionsEvent, NodeInfoEvent, OUTCOME_FAILED,
-            OUTCOME_SUCCEEDED, OwnBlockEvent, PATH_BYTES, SlotHistoryEvent, SlotStatusEvent,
-            TxOutcomeEvent, ValidatorInfoEvent, unpack_addr, unpack_path, unpack_str,
+            BLOCK_MISSING, BLOCK_OPAQUE, BlockEvent, EpochEvent, FinalizationEvent,
+            GossipPeerEvent, INFO_FULL_SET, LedgerSlotEvent, MessageVersionsEvent, NodeInfoEvent,
+            OUTCOME_FAILED, OUTCOME_SUCCEEDED, OwnBlockEvent, PATH_BYTES, SlotHistoryEvent,
+            SlotStatusEvent, TxOutcomeEvent, ValidatorInfoEvent, unpack_addr, unpack_path,
+            unpack_str,
         },
         snapshot,
         source::{
@@ -57,6 +58,8 @@ use {
 const EPOCHS_KEPT: usize = 3;
 /// Slots of blockstore records and roots kept below the newest.
 const LEDGER_KEPT: u64 = 8192;
+/// Slots under the root whose banks' footers are kept, for roots that arrive out of order.
+const FOOTERS_UNDER_ROOT: u64 = 64;
 /// Blocks kept for the certificate walks.
 const BLOCKS_KEPT: usize = 4096;
 /// Frozen banks held for a collector that has not taken them yet.
@@ -531,6 +534,10 @@ struct State {
     info_changes: Vec<(Pubkey, ValidatorInfo)>,
     ledger: BTreeMap<Slot, LedgerSlot>,
     rooted: BTreeSet<Slot>,
+    /// The bank each rooted slot was rooted with.
+    rooted_banks: BTreeMap<Slot, u64>,
+    /// Footers of frozen banks above the root, by slot and bank.
+    footers: BTreeMap<(Slot, u64), BlockEvent>,
     blocks: BTreeMap<Slot, BlockEvent>,
     /// The newest block sent at its root, and when it arrived.
     blocks_to: Option<(Slot, std::time::Instant)>,
@@ -554,6 +561,8 @@ struct State {
 struct OwnSet {
     epoch: Epoch,
     identity: Pubkey,
+    /// Our slots up to here are in `blocks`; past it they wait for their footers or the next set.
+    covered_to: Slot,
     blocks: BTreeMap<Slot, BlockEvent>,
 }
 
@@ -910,14 +919,43 @@ impl Mirror {
         }
     }
 
-    pub fn apply_rooted(&self, slot: Slot) {
+    /// A rooted bank: its footer becomes the slot's block, and slots skipped since the last root
+    /// read as skipped.
+    pub fn apply_rooted(&self, slot: Slot, bank_id: u64) {
         let mut state = self.state.write().unwrap();
-        if state.rooted.last().is_none_or(|root| slot > *root) {
+        let newest = state.rooted.last().copied();
+        if newest.is_none_or(|root| slot > root) {
             // Bank forks keeps the root and drops the banks below it.
             state.frozen = state.frozen.split_off(&slot);
             state.rooted = state.rooted.split_off(&slot.saturating_sub(LEDGER_KEPT));
+            state.rooted_banks = state
+                .rooted_banks
+                .split_off(&slot.saturating_sub(LEDGER_KEPT));
+            if let Some(root) = newest {
+                // An ancestor rooted with it may follow and replace its skip.
+                for skipped in root.saturating_add(1)..slot {
+                    let event = missing_block(skipped);
+                    state.blocks.entry(skipped).or_insert(event);
+                }
+            }
+            state.blocks_to = Some((slot, std::time::Instant::now()));
         }
         state.rooted.insert(slot);
+        state.rooted_banks.insert(slot, bank_id);
+        let block = state
+            .footers
+            .remove(&(slot, bank_id))
+            .unwrap_or_else(|| opaque_block(slot));
+        state.blocks.insert(slot, block);
+        // Footers of banks well under the root, which can no longer be rooted; those just under it
+        // stay for ancestors whose roots follow.
+        let root = state.rooted.last().copied().unwrap_or(slot);
+        state.footers = state
+            .footers
+            .split_off(&(root.saturating_sub(FOOTERS_UNDER_ROOT), 0));
+        while state.blocks.len() > BLOCKS_KEPT {
+            state.blocks.pop_first();
+        }
         // A root already in the history, as one read after it, is left alone.
         if let Some(history) = state.shared.history.as_mut()
             && slot >= history.next_slot
@@ -1083,6 +1121,7 @@ impl Mirror {
         state.own = Some(OwnSet {
             epoch: event.epoch,
             identity: Pubkey::new_from_array(event.identity),
+            covered_to: event.covered_to,
             blocks: parts
                 .iter()
                 .filter(|part| part.count > 0)
@@ -1091,15 +1130,26 @@ impl Mirror {
         });
     }
 
+    /// A frozen bank's footer, held until the bank is rooted; one arriving after its root takes
+    /// the slot.
     pub fn apply_block(&self, event: &BlockEvent) {
         let mut state = self.state.write().unwrap();
-        let newest = state
-            .blocks_to
-            .map_or(event.slot, |(to, _)| to.max(event.slot));
-        state.blocks_to = Some((newest, std::time::Instant::now()));
-        state.blocks.insert(event.slot, event.clone());
-        while state.blocks.len() > BLOCKS_KEPT {
-            state.blocks.pop_first();
+        if state.rooted_banks.get(&event.slot) == Some(&event.bank_id) {
+            state.blocks.insert(event.slot, event.clone());
+            return;
+        }
+        if state
+            .rooted
+            .last()
+            .is_some_and(|root| event.slot.saturating_add(FOOTERS_UNDER_ROOT) <= *root)
+        {
+            return;
+        }
+        state
+            .footers
+            .insert((event.slot, event.bank_id), event.clone());
+        while state.footers.len() > BLOCKS_KEPT {
+            state.footers.pop_first();
         }
     }
 
@@ -1209,6 +1259,21 @@ impl Mirror {
         reported.max(frozen)
     }
 
+    /// Whether `slot` is ours and past the reach of our block set for its epoch.
+    fn own_uncovered(&self, state: &State, slot: Slot) -> bool {
+        let (Some(own), Some(facts), Some(me)) = (
+            state.own.as_ref(),
+            state.epoch.as_ref(),
+            state.node.as_ref().map(|node| node.identity),
+        ) else {
+            return false;
+        };
+        own.identity == me
+            && own.epoch == facts.schedule.get_epoch(slot)
+            && slot > own.covered_to
+            && Self::leader_of(state, &facts.schedule, slot) == Some(me)
+    }
+
     /// Whether `slot` is ours in the root's epoch and that epoch's own block set is still awaited.
     fn own_awaited(&self, slot: Slot, root: Slot) -> bool {
         let state = self.state.read().unwrap();
@@ -1249,6 +1314,33 @@ impl Mirror {
         let turn = index.checked_div(NUM_CONSECUTIVE_LEADER_SLOTS.get() as u64)?;
         let turn = usize::try_from(turn).ok()?;
         state.schedules.get(&epoch)?.get(turn).copied()
+    }
+}
+
+fn missing_block(slot: Slot) -> BlockEvent {
+    BlockEvent {
+        kind: BLOCK_MISSING,
+        ..opaque_block(slot)
+    }
+}
+
+fn opaque_block(slot: Slot) -> BlockEvent {
+    BlockEvent {
+        pid: 0,
+        tid: 0,
+        timestamp_ns: 0,
+        slot,
+        bank_id: 0,
+        kind: BLOCK_OPAQUE,
+        close_nanos: 0,
+        has_notar: false,
+        notar_len: 0,
+        notar: [0u8; BITMAP_BYTES],
+        has_skip: false,
+        skip_len: 0,
+        skip: [0u8; BITMAP_BYTES],
+        has_fast: false,
+        fast: false,
     }
 }
 
@@ -1560,10 +1652,16 @@ impl Source for Mirror {
             return Block::Pending;
         }
         let state = self.state.read().unwrap();
-        let held = state
+        let read = state
             .blocks
             .get(&slot)
-            .or_else(|| state.own.as_ref().and_then(|own| own.blocks.get(&slot)));
+            .filter(|event| event.kind != BLOCK_OPAQUE);
+        let own = state.own.as_ref().and_then(|own| own.blocks.get(&slot));
+        // Ours past the set's reach, unread at its root, waits for the next set.
+        if read.is_none() && own.is_none() && self.own_uncovered(&state, slot) {
+            return Block::Pending;
+        }
+        let held = read.or(own).or_else(|| state.blocks.get(&slot));
         let Some(event) = held else {
             // The validator holds a block back while it settles, so its root can run ahead.
             let behind = state
@@ -1746,7 +1844,7 @@ mod tests {
             Block::Pending => published::Block::Pending,
             Block::Opaque => published::Block::Opaque,
         };
-        solana_core::node_events::output::block_event(slot, block)
+        solana_core::block_events::block_event(slot, 0, &block)
     }
 
     fn wait_part(
@@ -1882,8 +1980,8 @@ mod tests {
         assert_eq!(mirror.cluster_tip(), Some(20));
         assert_eq!(mirror.lowest_slot(), 2);
 
-        mirror.apply_rooted(5);
-        mirror.apply_rooted(3);
+        mirror.apply_rooted(5, 0);
+        mirror.apply_rooted(3, 0);
         let root = Commitment {
             root: 5,
             confirmed: 5,
@@ -1940,7 +2038,7 @@ mod tests {
                 &vote_account,
             ));
         }
-        mirror.apply_rooted(direct.commitment().root);
+        mirror.apply_rooted(direct.commitment().root, 0);
         mirror.apply_begun(direct.highest_slot());
         // Not ready without the vote accounts, schedule and slot history.
         assert!(!mirror.ready());
@@ -2031,8 +2129,8 @@ mod tests {
         for event in history_events(&history, 1) {
             mirror.apply_history(&event);
         }
-        mirror.apply_rooted(4_000);
-        mirror.apply_rooted(4_002);
+        mirror.apply_rooted(4_000, 0);
+        mirror.apply_rooted(4_002, 0);
         let held = mirror.root_bank().get_slot_history().unwrap();
         history.add(4_002);
         assert_eq!(held, history);
@@ -2147,7 +2245,7 @@ mod tests {
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let mut history = SlotHistory::default();
         history.add(10);
-        mirror.apply_rooted(12);
+        mirror.apply_rooted(12, 0);
         for event in history_events(&history, 1) {
             mirror.apply_history(&event);
         }
@@ -2283,7 +2381,7 @@ mod tests {
                 block_event(*slot, block)
             })
             .collect();
-        solana_core::node_events::output::own_block_events((epoch, me), generation, 20, &blocks)
+        solana_core::block_events::own_block_events((epoch, me), generation, 20, &blocks)
     }
 
     #[test]
@@ -2293,8 +2391,9 @@ mod tests {
         assert!(matches!(mirror.block(12, 20), Block::Opaque));
         // Ours, but in the epoch before the root's.
         assert!(matches!(mirror.block(5, 40), Block::Opaque));
-        // A block sent at its root answers while the set is awaited.
+        // A footer sent as its bank froze answers once rooted, while the set is awaited.
         mirror.apply_block(&block_event(5, footer(7)));
+        mirror.apply_rooted(5, 0);
         assert!(matches!(mirror.block(5, 20), Block::Footer(_)));
         assert!(matches!(mirror.block(4, 20), Block::Pending));
         mirror.set_own_blocks_connected(false, false);
@@ -2377,10 +2476,48 @@ mod tests {
     }
 
     #[test]
+    fn test_footers_become_blocks_when_their_banks_are_rooted() {
+        let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
+        let footer_of = |slot, bank_id, close| BlockEvent {
+            bank_id,
+            ..block_event(slot, footer(close))
+        };
+        mirror.apply_rooted(10, 1);
+        // Slot 12 froze twice, on two forks; the second bank is the one rooted.
+        mirror.apply_block(&footer_of(12, 2, 120));
+        mirror.apply_block(&footer_of(12, 3, 121));
+        mirror.apply_block(&footer_of(14, 4, 140));
+        mirror.apply_rooted(14, 4);
+        assert!(matches!(mirror.block(11, 20), Block::Missing));
+        assert!(matches!(mirror.block(13, 20), Block::Missing));
+        assert!(matches!(mirror.block(14, 20), Block::Footer(facts) if facts.close_nanos == 140));
+        // An ancestor's root arriving after its child's replaces the skip.
+        mirror.apply_rooted(12, 3);
+        assert!(matches!(mirror.block(12, 20), Block::Footer(facts) if facts.close_nanos == 121));
+        // Rooted before its footer arrived, then the footer.
+        mirror.apply_rooted(15, 5);
+        assert!(matches!(mirror.block(15, 20), Block::Opaque));
+        mirror.apply_block(&footer_of(15, 5, 150));
+        assert!(matches!(mirror.block(15, 20), Block::Footer(facts) if facts.close_nanos == 150));
+    }
+
+    #[test]
+    fn test_ours_past_the_set_wait_for_the_next() {
+        let (mirror, me) = own_mirror();
+        for part in own_set(0, me, 1, &[(4, footer(9))]) {
+            mirror.apply_own_block(&part);
+        }
+        // The set reaches slot 20; slot 24 is ours and past it.
+        mirror.apply_rooted(26, 0);
+        assert!(matches!(mirror.block(24, 26), Block::Pending));
+        assert!(matches!(mirror.block(4, 26), Block::Footer(_)));
+    }
+
+    #[test]
     fn test_a_slot_past_the_newest_block_sent_waits_for_it_a_while() {
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         assert!(matches!(mirror.block(9, 20), Block::Opaque));
-        mirror.apply_block(&block_event(10, Block::Missing));
+        mirror.apply_rooted(10, 0);
         assert!(matches!(mirror.block(9, 20), Block::Opaque));
         assert!(matches!(mirror.block(11, 20), Block::Pending));
         std::thread::sleep(BLOCKS_STALE);

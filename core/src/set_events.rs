@@ -1,12 +1,13 @@
 //! State a late subscriber needs that is too large or too slow for the state thread: the gossip
-//! table, and votor's newest certificate with the ledger's floor.
+//! table, our blocks this epoch, and votor's newest certificate with the ledger's floor.
 
 use {
     crate::{
         bank_state_events::{Latest, publish_paced, publisher},
+        block_events::OwnBlocks,
         node_events::types::{
-            GOSSIP_PEER_STREAM, GossipPeerEvent, SLOT_STATUS_STREAM, SlotStatusEvent, pack_contact,
-            pack_str,
+            GOSSIP_PEER_STREAM, GossipPeerEvent, OWN_BLOCK_STREAM, OwnBlockEvent,
+            SLOT_STATUS_STREAM, SlotStatusEvent, pack_contact, pack_str,
         },
     },
     agave_event_system::{
@@ -15,8 +16,10 @@ use {
         publisher::Publisher,
     },
     solana_gossip::{cluster_info::ClusterInfo, crds_data::SnapshotHashes},
-    solana_ledger::blockstore::Blockstore,
-    solana_runtime::validated_block_finalization::ValidatedBlockFinalizationCert,
+    solana_ledger::{blockstore::Blockstore, leader_schedule_cache::LeaderScheduleCache},
+    solana_runtime::{
+        bank_forks::BankForks, validated_block_finalization::ValidatedBlockFinalizationCert,
+    },
     std::{
         sync::{
             Arc, RwLock,
@@ -111,9 +114,12 @@ impl SetEvents {
         event_system: &EventSystem,
         cluster_info: Arc<ClusterInfo>,
         blockstore: Arc<Blockstore>,
+        bank_forks: Arc<RwLock<BankForks>>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
         highest_finalized: Arc<RwLock<Option<ValidatedBlockFinalizationCert>>>,
         exit: Arc<AtomicBool>,
     ) -> Result<Self, String> {
+        let mut own_blocks = publisher::<OwnBlockEvent>(event_system, OWN_BLOCK_STREAM, 1024)?;
         let mut peers = publisher::<GossipPeerEvent>(event_system, GOSSIP_PEER_STREAM, 16_384)?;
         let mut status = Latest::new(publisher::<SlotStatusEvent>(
             event_system,
@@ -127,6 +133,14 @@ impl SetEvents {
                 while !exit.load(Ordering::Relaxed) {
                     sets.send_peers(&mut peers, &cluster_info, &exit);
                     sets.send_status(&mut status, &highest_finalized, &blockstore);
+                    sets.send_own_blocks(
+                        &mut own_blocks,
+                        &cluster_info,
+                        &bank_forks,
+                        &leader_schedule_cache,
+                        &blockstore,
+                        &exit,
+                    );
                     thread::sleep(TICK);
                 }
             })
@@ -144,6 +158,8 @@ struct SetLoop {
     /// The generation and time of the last whole gossip table.
     peers_sent: Option<(u64, Instant)>,
     status_sent: Option<Instant>,
+    /// Our blocks this epoch read so far; `None` while the stream is off or the schedule unknown.
+    own: Option<OwnBlocks>,
 }
 
 impl SetLoop {
@@ -165,6 +181,35 @@ impl SetLoop {
         };
         self.peers_sent = Some((generation, now));
         publish_paced(publisher, &peer_events(cluster_info, generation), exit);
+    }
+
+    /// Our blocks this epoch up to the settled root, whole once read.
+    fn send_own_blocks(
+        &mut self,
+        publisher: &mut Publisher<OwnBlockEvent>,
+        cluster_info: &ClusterInfo,
+        bank_forks: &RwLock<BankForks>,
+        leader_schedule_cache: &LeaderScheduleCache,
+        blockstore: &Blockstore,
+        exit: &AtomicBool,
+    ) {
+        if !publisher.is_enabled() {
+            self.own = None;
+            return;
+        }
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let key = (root_bank.epoch(), cluster_info.id());
+        if self.own.as_ref().is_none_or(|own| own.key() != key) {
+            // Generations run on across sets, so a subscriber never mistakes a new set for an old.
+            let generation = self.own.as_ref().map_or(0, OwnBlocks::generation);
+            self.own = OwnBlocks::new(leader_schedule_cache, &root_bank, key, generation);
+        }
+        let Some(own) = self.own.as_mut() else {
+            return;
+        };
+        if let Some(events) = own.due(blockstore, root_bank.slot(), Instant::now()) {
+            publish_paced(publisher, &events, exit);
+        }
     }
 
     fn send_status(
