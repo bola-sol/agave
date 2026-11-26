@@ -178,7 +178,7 @@ pub fn base_fee(transaction: &VersionedTransaction, lamports_per_signature: u64)
 
 /// By message hash, which the cache holds for all but durable nonce transactions; those are found
 /// by signature where the node keeps signatures.
-pub fn failed_in(bank: &Bank, transaction: &VersionedTransaction) -> Option<bool> {
+pub(crate) fn failed_in(bank: &Bank, transaction: &VersionedTransaction) -> Option<bool> {
     let message = &transaction.message;
     let by_hash = bank.status_cache.read().unwrap().get_status(
         message.hash(),
