@@ -144,6 +144,33 @@ struct SignalUpdates {
     should_signal: bool,
     newly_completed_slots_with_last_index: Vec<(u64, u64)>,
     update_parent_signals: Vec<UpdateParentSignal>,
+    /// For the slot observer, where one is set.
+    slot_inserts: Vec<SlotInsert>,
+}
+
+/// An original block's first shred or its filling, as one insert batch recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotInsert {
+    pub slot: Slot,
+    pub parent: Option<Slot>,
+    /// Unix milliseconds the first shred arrived.
+    pub first_shred_ms: u64,
+    pub first: bool,
+    pub fill: Option<SlotFill>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotFill {
+    /// Unix milliseconds the slot filled.
+    pub full_ms: u64,
+    pub last_index: u64,
+    pub num_repaired: usize,
+    pub num_recovered: usize,
+}
+
+/// Told of each original block's first shred and filling, after the batch is written.
+pub trait SlotInsertObserver: Send + Sync {
+    fn observe(&self, insert: &SlotInsert);
 }
 
 /// Effects produced while preparing SlotMeta chaining updates.
@@ -426,6 +453,7 @@ pub struct Blockstore {
     /// in small insertion batches.
     update_parent_shred_parent_cache: Mutex<UpdateParentShredParentCache>,
     certificate_forwarder: OnceLock<CertificateForwarder>,
+    slot_observer: OnceLock<Box<dyn SlotInsertObserver>>,
     pub lowest_cleanup_slot: RwLock<Slot>,
     // A sender that feeds into the BlockstoreCleanupService request channel
     // to enable manual Blockstore purge requests to be issued
@@ -729,6 +757,13 @@ impl Blockstore {
             .expect("certificate sender already set");
     }
 
+    /// Sets the observer told of each original block's first shred and filling; once only.
+    pub fn set_slot_observer(&self, observer: Box<dyn SlotInsertObserver>) {
+        if self.slot_observer.set(observer).is_err() {
+            warn!("blockstore slot observer already set");
+        }
+    }
+
     /// Opens a Ledger in directory, provides "infinite" window of shreds
     pub fn open(ledger_path: &Path) -> Result<Blockstore> {
         Self::do_open(ledger_path, BlockstoreOptions::default())
@@ -821,6 +856,7 @@ impl Blockstore {
                 UPDATE_PARENT_SHRED_PARENT_CACHE_CAPACITY,
             )),
             certificate_forwarder: OnceLock::new(),
+            slot_observer: OnceLock::new(),
             insert_shreds_lock: Mutex::<()>::default(),
             switch_block_lock: SwitchBlockLock(FairMutex::new(())),
             max_root,
@@ -2422,6 +2458,7 @@ impl Blockstore {
             should_signal,
             newly_completed_slots_with_last_index,
             update_parent_signals,
+            slot_inserts,
         } = self.commit_updates_to_write_batch(&mut shred_insertion_tracker, metrics)?;
 
         // Write out the accumulated batch.
@@ -2437,6 +2474,12 @@ impl Blockstore {
         if let Some(forwarder) = self.certificate_forwarder.get() {
             for (slot, last_index) in newly_completed_slots_with_last_index.iter() {
                 forwarder.maybe_forward_block_footer_certificate(self, *slot, *last_index);
+            }
+        }
+
+        if let Some(observer) = self.slot_observer.get() {
+            for insert in &slot_inserts {
+                observer.observe(insert);
             }
         }
 
@@ -6177,6 +6220,8 @@ impl Blockstore {
         let mut should_signal = false;
         let mut newly_completed_slots_with_last_index = vec![];
         let mut update_parent_signals = Vec::new();
+        let mut slot_inserts = Vec::new();
+        let observed = self.slot_observer.get().is_some();
         let completed_slots_senders = self.completed_slots_senders.lock().unwrap();
 
         // Check if any metadata was changed, if so, insert the new version of the
@@ -6197,6 +6242,30 @@ impl Blockstore {
                     meta.last_index
                         .expect("newly completed slot has last index"),
                 ));
+            }
+            if observed && location == BlockLocation::Original {
+                let first = meta.received > 0
+                    && meta_backup
+                        .as_ref()
+                        .is_none_or(|backup| backup.received == 0);
+                let fill = is_newly_completed_slot(meta, meta_backup).then(|| {
+                    let (num_repaired, num_recovered) = self.slots_stats.repaired_recovered(slot);
+                    SlotFill {
+                        full_ms: timestamp(),
+                        last_index: meta.last_index.unwrap_or_default(),
+                        num_repaired,
+                        num_recovered,
+                    }
+                });
+                if first || fill.is_some() {
+                    slot_inserts.push(SlotInsert {
+                        slot,
+                        parent: meta.parent_slot,
+                        first_shred_ms: meta.first_shred_timestamp,
+                        first,
+                        fill,
+                    });
+                }
             }
             // Check if the working copy of the metadata has changed
             if Some(meta) != meta_backup.as_ref() {
@@ -6220,6 +6289,7 @@ impl Blockstore {
             should_signal,
             newly_completed_slots_with_last_index,
             update_parent_signals,
+            slot_inserts,
         })
     }
 

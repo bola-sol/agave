@@ -487,6 +487,25 @@ pub struct SlotProgress {
 const QUEUE_CHECK: Duration = Duration::from_secs(2);
 
 /// A metric event as its datapoint, for one closure over every row.
+/// The `shred_insert_is_full` point a filled slot's ledger event stands for, for the metrics tap.
+fn fill_point(event: &LedgerSlotEvent) -> solana_metrics::datapoint::DataPoint {
+    let mut point = solana_metrics::datapoint::DataPoint::new("shred_insert_is_full");
+    if let Some(at) = std::time::UNIX_EPOCH.checked_add(Duration::from_millis(event.full_ms)) {
+        point.timestamp = at;
+    }
+    let int = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    point
+        .add_field_i64("slot", int(event.slot))
+        .add_field_i64(
+            "total_time_ms",
+            int(event.full_ms.saturating_sub(event.first_shred_ms)),
+        )
+        .add_field_i64("last_index", int(event.last_index))
+        .add_field_i64("num_repaired", i64::from(event.num_repaired))
+        .add_field_i64("num_recovered", i64::from(event.num_recovered));
+    point
+}
+
 trait MetricPoint {
     fn point(&self) -> (solana_metrics::datapoint::DataPoint, u64);
 }
@@ -714,7 +733,13 @@ impl EventInput {
         }
 
         let mirror = &self.mirror;
-        self.ledger.drain(|event| mirror.apply_ledger(&event));
+        let tap = &self.tap;
+        self.ledger.drain(|event| {
+            mirror.apply_ledger(&event);
+            if event.full {
+                tap.observe_external(&fill_point(&event), event.full_ms);
+            }
+        });
         self.own_blocks
             .drain(|event| mirror.apply_own_block(&event));
         self.admitted.drain(|event| mirror.apply_admitted(&event));

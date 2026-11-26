@@ -8629,3 +8629,34 @@ fn test_connectivity_does_not_propagate_through_incomplete_slot() {
     assert!(!blockstore.meta(60).unwrap().unwrap().is_connected());
     assert!(!blockstore.meta(70).unwrap().unwrap().is_connected());
 }
+
+#[test]
+fn test_the_slot_observer_sees_the_first_shred_then_the_fill() {
+    struct Seen(Arc<Mutex<Vec<SlotInsert>>>);
+    impl SlotInsertObserver for Seen {
+        fn observe(&self, insert: &SlotInsert) {
+            self.0.lock().unwrap().push(insert.clone());
+        }
+    }
+    let ledger_path = get_tmp_ledger_path_auto_delete!();
+    let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    blockstore.set_slot_observer(Box::new(Seen(seen.clone())));
+    let (mut shreds, _) = make_slot_entries(1, 0, 20);
+    assert!(shreds.len() > 1);
+    let last = shreds.split_off(1);
+    blockstore.insert_shreds(shreds, false).unwrap();
+    blockstore.insert_shreds(last.clone(), false).unwrap();
+    // Again: neither a first shred nor a fill.
+    blockstore.insert_shreds(last, false).unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].first && seen[0].fill.is_none());
+    assert_eq!((seen[0].slot, seen[0].parent), (1, Some(0)));
+    assert!(seen[0].first_shred_ms > 0);
+    assert!(!seen[1].first);
+    let fill = seen[1].fill.unwrap();
+    assert_eq!(fill.num_repaired, 0);
+    assert!(fill.full_ms >= seen[1].first_shred_ms);
+    assert_eq!(seen[1].first_shred_ms, seen[0].first_shred_ms);
+}

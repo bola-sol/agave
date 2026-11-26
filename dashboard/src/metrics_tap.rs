@@ -4266,7 +4266,6 @@ mod carried_tests {
             RETRANSMIT_STAGE,
             RETRANSMIT_SLOT_STATS,
             REPLAY_SLOT_STATS,
-            SHRED_FULL,
             COST_TRACKER,
             WFSM_GOSSIP,
             GOSSIP_ENTRIES,
@@ -4282,6 +4281,8 @@ mod carried_tests {
         for name in read.into_iter().chain(GOSSIP_STATS) {
             assert!(crate::metric_events::carried(name), "{name}");
         }
+        // Each slot's fill comes with its ledger event instead.
+        assert!(!crate::metric_events::carried(SHRED_FULL));
         // The bundle stage's points are jito's; this branch is agave.
         for name in [BUNDLE_STAGE, BUNDLE_SLOT_STATS] {
             assert!(!crate::metric_events::carried(name), "{name}");

@@ -1050,12 +1050,21 @@ impl Mirror {
                 .ledger
                 .split_off(&event.slot.saturating_sub(LEDGER_KEPT));
         }
+        // A slot's first shred and its filling may arrive in either order.
+        let held = state.ledger.get(&event.slot).copied().unwrap_or_default();
         state.ledger.insert(
             event.slot,
             LedgerSlot {
-                first_shred_ms: event.first_shred_ms,
-                parent: event.has_parent.then_some(event.parent_slot),
-                full: event.full,
+                first_shred_ms: if event.first_shred_ms == 0 {
+                    held.first_shred_ms
+                } else {
+                    event.first_shred_ms
+                },
+                parent: event
+                    .has_parent
+                    .then_some(event.parent_slot)
+                    .or(held.parent),
+                full: event.full || held.full,
             },
         );
     }
@@ -1962,6 +1971,10 @@ mod tests {
             parent_slot: 0,
             first_shred_ms: 1,
             full: false,
+            full_ms: 0,
+            last_index: 0,
+            num_repaired: 0,
+            num_recovered: 0,
         };
         let status = |certificate_slot| SlotStatusEvent {
             pid: 0,
@@ -1979,6 +1992,15 @@ mod tests {
         mirror.apply_status(&status(20));
         assert_eq!(mirror.cluster_tip(), Some(20));
         assert_eq!(mirror.lowest_slot(), 2);
+        // The fill can arrive ahead of the first shred; neither undoes the other.
+        mirror.apply_ledger(&LedgerSlotEvent {
+            full: true,
+            first_shred_ms: 0,
+            ..shred(30)
+        });
+        mirror.apply_ledger(&shred(30));
+        assert!(mirror.state.read().unwrap().ledger[&30].full);
+        assert_eq!(mirror.first_shred_time(30), Some(1));
 
         mirror.apply_rooted(5, 0);
         mirror.apply_rooted(3, 0);

@@ -18,6 +18,7 @@ use {
             verify_blockstore_root_with_vote_history,
         },
         forwarding_stage::ForwardingClientConfig,
+        ledger_events::LedgerSlotObserver,
         node_events::{NodeEvents, metric_forward::MetricForward, reader::Reader},
         repair::{
             self, repair_handler::RepairHandlerType, serve_repair_service::ServeRepairService,
@@ -1923,6 +1924,9 @@ impl Validator {
             exit.clone(),
         )
         .map_err(ValidatorError::Other)?;
+        blockstore.set_slot_observer(Box::new(
+            LedgerSlotObserver::new(&event_system).map_err(ValidatorError::Other)?,
+        ));
         let set_events = SetEvents::new(
             &event_system,
             cluster_info.clone(),

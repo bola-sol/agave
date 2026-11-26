@@ -162,7 +162,7 @@ pub struct SlotHistoryEvent {
 }
 
 /// A slot's blockstore record: when its first shred arrived, its parent, and whether it is full.
-/// Sent when the first shred is seen and again when the slot fills.
+/// Sent as the blockstore records the first shred and again as the slot fills.
 #[event]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerSlotEvent {
@@ -175,6 +175,12 @@ pub struct LedgerSlotEvent {
     /// Unix milliseconds; 0 where none has arrived.
     pub first_shred_ms: u64,
     pub full: bool,
+    /// Once full: when it filled, in unix milliseconds, its last shred index, and the shreds
+    /// repair and erasure recovery brought.
+    pub full_ms: u64,
+    pub last_index: u64,
+    pub num_repaired: u32,
+    pub num_recovered: u32,
 }
 
 pub const BLOCK_MISSING: u8 = 1;
