@@ -3,6 +3,7 @@
 
 use {
     crate::{
+        catch_up::{IN_STEP_SLOTS, walk_behind},
         certs,
         context::{DashboardContext, StartProgress},
         geoip,
@@ -26,7 +27,6 @@ use {
     },
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_core::node_events::catch_up::{IN_STEP_SLOTS, walk_behind},
     solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_pubkey::Pubkey,
     solana_rpc::optimistically_confirmed_bank_tracker::BankNotificationReceiver,

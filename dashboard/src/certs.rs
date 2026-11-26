@@ -2,7 +2,7 @@
 //! validator's was, read from the reward certificates alpenglow leaders write
 //! into their block footers.
 
-pub use solana_core::node_events::blocks::{Block, FooterFacts, carried_fast, read_block};
+pub use crate::blocks::{Block, FooterFacts, carried_fast, read_block};
 use {
     crate::source::{BankView, Source},
     agave_votor_messages::reward_certificate::NUM_SLOTS_FOR_REWARD,
