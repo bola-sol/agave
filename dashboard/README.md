@@ -1,34 +1,43 @@
 # agave-dashboard
 
-A web dashboard served by `agave-validator` itself.
+A web dashboard for `agave-validator`, run as its own process on the validator's
+box and fed by the validator's event streams.
 
 ```bash
-agave-validator --dashboard-port 10999
+export AGAVE_EVENTS='off,replay.=on,bank.=on,tvu.shred_fetch=on,node.=on,metric.=on,ledger.=on,gossip.=on'
+agave-validator --ledger <LEDGER> ...
+cargo build --release -p agave-dashboard --features agave-unstable-api --bin agave-dashboard
+agave-dashboard --ledger <LEDGER>
 ```
 
-Then open <http://127.0.0.1:10999>. There is nothing else to configure and no
-second process to run. The SPA is embedded in the validator binary, and the data
-comes from handles the validator already holds.
+Then open <http://127.0.0.1:10999>. The validator publishes the streams the
+filter turns on; it reads the filter only from `AGAVE_EVENTS` at start, so
+export it in the validator's start script or run `agave-validator set-event-filter`
+after each restart. `agave-dashboard` reads the queues under `<LEDGER>/events`
+and, before the validator's event system exists, the start phase from its admin
+socket. When the validator restarts, the dashboard starts itself again. If the
+validator runs with file capabilities, its queues need root to open. The SPA is
+embedded in the `agave-dashboard` binary.
 
 ## Exposing it
 
 The dashboard has no authentication and no TLS. It binds to `127.0.0.1` unless
-`--dashboard-bind-address` says otherwise, and everything below assumes you have
-decided to serve it to somebody else.
+`--bind-address` says otherwise, and everything below assumes you have decided to
+serve it to somebody else.
 
 ```bash
-agave-validator \
-  --dashboard-port 10999 \
-  --dashboard-allowed-host dashboard.example.com
+agave-dashboard --ledger <LEDGER> \
+  --port 10999 \
+  --allowed-host dashboard.example.com
 ```
 
-`--dashboard-allowed-host` lists the names the dashboard will answer to; repeat
+`--allowed-host` lists the names the dashboard will answer to; repeat
 the flag for each one. `localhost` and any IP literal are accepted without it, so
 `http://<your-ip>:10999` works out of the box. A **domain** has to be listed.
 
 A request whose `Host` is not on the list gets a **421** and the page does not
 load at all. That is the failure to expect when a proxy forwards a name the
-validator has not been told about, and the refused name is in the validator log.
+dashboard has not been told about, and the refused name is in its log.
 
 Behind Caddy:
 
@@ -122,24 +131,23 @@ skipped entirely on a validator whose index does not cover that program. See
 ## Architecture
 
 ```
-core/src/validator.rs ──► DashboardService
+agave-validator: event system ──► core publishers (replay, shred fetch, bank state,
+                                  start, node_events) ──► queues under <LEDGER>/events
+agave-dashboard: event_input ──► mirror (the validator's state rebuilt) ──► DashboardService
                             ├── server thread     (HTTP + websocket on one port)
                             ├── boot thread       (startup progress until the collector attaches)
                             ├── collector thread  (samples state at 5Hz, diffs, publishes)
-                            ├── meters thread     (once-a-second readings: TPS, host, network)
-                            └── info loader       (validator names, read once at attach)
+                            └── meters thread     (once-a-second readings: TPS, host, network)
 ```
 
-`context.rs` holds the handles the dashboard reads through. The validator binary
-starts the service before the snapshot download, so the page is up through the
-slowest part of a cold start, and builds the context from the `Validator` once
-`Validator::new` returns. `solana-core` itself changes in two places: the
-config gains two hooks (a list of extra bank notification senders, served by a
-relay thread that copies each of replay's notifications to them and to the
-RPC tracker, and a sender handed gossip and bank forks before the
-supermajority wait), and `Validator` makes three fields public: the block
-commitment cache, the leader schedule cache and the highest finalized
-certificate.
+The validator publishes the streams from `core/src/node_events` and the other
+event modules in `solana-core`; nothing of the dashboard is in it. `event_input.rs`
+subscribes to each stream and checks for new queues every two seconds, and
+`mirror.rs` rebuilds what the collector reads, so the same collector runs here as
+ran inside the validator. State a late subscriber needs is resent whole on a
+timer: vote accounts, schedules, rank maps and the slot history every five
+seconds, our blocks every ten, names every minute. `context.rs` and the `Direct`
+source still read a validator in process, for the tests.
 
 `collect.rs` samples five times a second but publishes only what changed, so an
 idle validator produces almost no websocket traffic. `proto.rs` defines the
@@ -154,7 +162,7 @@ The SPA lives in `frontend/`. Its `dist` directory is checked in so that a plain
 The page can pause, rewind and play back from there. In the browser, `ring.ts`
 keeps a copy of the store every thirty seconds and the messages since, per-slot
 ones whole and the rest thinned to about one a second, for fifteen minutes.
-With `--dashboard-history-dir <DIR>` the validator also records its feed there
+With `--history-dir <DIR>` the dashboard also records its feed there
 for two days: one file per ten minutes, each opening with the snapshot a joining
 page receives and going on with every message after it, packed into zstd blocks
 that `zstd -dc` reads. That is about 0.3 GB a day on mainnet, capped at 2 GiB,
@@ -162,7 +170,7 @@ and the files are deleted as they age out; nothing else in the directory is
 touched. The recorder listens as a page does, so the work done only while
 somebody watches runs all the time. A page reaches further back than its own
 fifteen minutes by fetching the blocks it needs, and restarts show as gaps.
-At startup the validator reads the recording back for our blocks, turns,
+At startup the dashboard reads the recording back for our blocks, turns,
 waterfalls, costs and fee tables, so the Slots page keeps them across a restart.
 Without the flag nothing is written and a page rewinds no further back than
 when it was opened. Replies to requests are not recorded, so schedule searches,
