@@ -1,10 +1,10 @@
 # What the dashboard reads
 
-This file lists what this build of the dashboard reads from the validator today, with each exact field. The events the dashboard needs from agave's event system are listed in [bola-sol/agave-dashboard-events](https://github.com/bola-sol/agave-dashboard-events). An event that replaces a datapoint needs the fields given here.
+This file lists what the dashboard reads of the validator, with each exact field. On this branch the validator's event publishers in `solana-core` make these reads and send them as events, and the dashboard reads the events. The events the dashboard needs from agave's event system are listed in [bola-sol/agave-dashboard-events](https://github.com/bola-sol/agave-dashboard-events). An event that replaces a datapoint needs the fields given here.
 
 ## Metrics datapoints
 
-The validator reports on itself with `solana_metrics` datapoints. The dashboard installs an observer that matches each point by name and field name. It ignores all other fields. If the validator stops sending a point, the figures that use it stop without an error.
+The validator reports on itself with `solana_metrics` datapoints. The validator's metrics forwarder in `solana-core` observes every point, the metric streams carry the rows below, and the dashboard matches each point by name and field name. It ignores all other fields. If the validator stops sending a point, the figures that use it stop without an error.
 
 ### Per slot
 
@@ -101,7 +101,7 @@ Replay sends a notification for each bank it freezes. The dashboard adds a sende
 | `status_cache`, read with `get_status` by each transaction's message hash and recent blockhash against the bank's `ancestors`; `get_signature_status_slot` for those not found, which are durable nonce transactions | Whether each non-vote transaction failed, for Slot details' fee payers fold and each of our blocks' top fee tables: every transaction in our blocks, and in other leaders' blocks only those of payers seen in ours this epoch. The bank is held until the blockstore has the whole block, and a block counts once its slot is rooted. |
 | `epoch`, `feature_set` | The epoch a block's fee payers count in. The compute budget rules that turn a transaction's instructions into its priority fee; a v1 message states the fee itself. |
 
-The dashboard keeps our blocks for the current epoch and the whole previous epoch. With `--dashboard-history-dir`, it reads them back from its own recording at startup, with their turns, waterfalls, costs and fee tables, so a restart keeps them; a block the ledger still holds is kept only if `Blockstore::is_root` says it rooted. An event with these fields, sent when a block completes, removes the need to hold a bank.
+The dashboard keeps our blocks for the current epoch and the whole previous epoch. With `--history-dir`, it reads them back from its own recording at startup, with their turns, waterfalls, costs and fee tables, so a restart keeps them; a block the ledger still holds is kept only if `Blockstore::is_root` says it rooted. An event with these fields, sent when a block completes, removes the need to hold a bank.
 
 ## Gossip and bank forks before the wait
 
@@ -173,7 +173,7 @@ A page can ask for data that is too large or too rare to push. Each answer comes
 | `peers.leaders` | Each staked node's and scheduled leader's client, version, address, country and stake, for schedule rows the peer table no longer holds |
 | `produced.figures` | This epoch's blocks and all of the previous epoch's, newest first, 1,024 to a page: nine numbers per block, with their leader turns |
 | `produced.detail` | Our blocks in a range of up to 64 slots, with their turns, waterfalls and costs; for a single slot, who paid the most in it |
-| `rewind.range` | With `--dashboard-history-dir`, the recorded segments' start, end and block count |
+| `rewind.range` | With `--history-dir`, the recorded segments' start, end and block count |
 | `rewind.read` | One recorded block of up to 768 KB: the messages the feed published, with when each went out. Two decoded at a time, on blocking threads. |
 | `cluster.charts` | The Cluster page: Transactions, CU Used, Slot Time, Notarized Stake and Fast Finalization in up to 120 bins from catching up to now, each at least three 20-slot runs wide, the epoch's skips, and stake by client and by country. Gathered on a page's first ask and every fifteen seconds while it keeps asking; charts held from an earlier viewing are not served. |
 
