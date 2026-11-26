@@ -74,20 +74,16 @@ pub struct NodeInfoEvent {
     pub global_addresses_only: bool,
 }
 
-/// Where the node stands: commitment, the highest slot, the tip and the ledger's floor.
+/// What no other stream carries of where the node stands: votor's newest finalization
+/// certificate and the ledger's floor.
 #[event]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotStatusEvent {
     pub pid: i32,
     pub tid: i32,
     pub timestamp_ns: u64,
-    pub root: Slot,
-    pub confirmed: Slot,
-    pub finalized: Slot,
-    /// Bank forks' highest slot.
-    pub highest_slot: Slot,
-    pub has_cluster_tip: bool,
-    pub cluster_tip: Slot,
+    pub has_certificate_slot: bool,
+    pub certificate_slot: Slot,
     pub lowest_slot: Slot,
 }
 

@@ -687,8 +687,12 @@ impl EventInput {
     pub fn drain(&mut self) {
         let slots = &mut self.slots;
         let mut rooted = Vec::new();
+        let mut begun = 0;
         self.slot_events.drain(|event| match event {
-            SlotEvent::Begin { .. } => slots.begun = slots.begun.saturating_add(1),
+            SlotEvent::Begin { slot, .. } => {
+                slots.begun = slots.begun.saturating_add(1);
+                begun = begun.max(slot);
+            }
             SlotEvent::ExecutionFinished {
                 slot, succeeded, ..
             } => {
@@ -706,6 +710,9 @@ impl EventInput {
         });
         for slot in rooted {
             self.mirror.apply_rooted(slot);
+        }
+        if begun > 0 {
+            self.mirror.apply_begun(begun);
         }
 
         let mirror = &self.mirror;
