@@ -111,8 +111,23 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, St
     }))
 }
 
+/// True when SIGHUP was ignored at start, as under `nohup`.
+fn hangup_ignored() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("SigIgn:"))
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        })
+        .is_some_and(|mask| mask & 1 != 0)
+}
+
 /// Sets `stop` on SIGTERM, SIGINT or SIGHUP, so a closed terminal also drops the subscribers.
+/// SIGHUP is left alone when it was ignored at start, so `nohup` keeps it running.
 fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<thread::JoinHandle<()>> {
+    let watch_hangup = !hangup_ignored();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -120,18 +135,30 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<thread::JoinHandle<()
         .name("evDashSig".to_string())
         .spawn(move || {
             runtime.block_on(async move {
-                let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
+                let (Ok(mut term), Ok(mut int)) = (
                     signal(SignalKind::terminate()),
                     signal(SignalKind::interrupt()),
-                    signal(SignalKind::hangup()),
                 ) else {
                     log::error!("events: no signal handlers");
                     return;
                 };
+                let mut hup = watch_hangup
+                    .then(|| signal(SignalKind::hangup()))
+                    .transpose()
+                    .unwrap_or_else(|err| {
+                        log::error!("events: no SIGHUP handler: {err}");
+                        None
+                    });
+                let hangup = async {
+                    match hup.as_mut() {
+                        Some(hup) => hup.recv().await,
+                        None => std::future::pending().await,
+                    }
+                };
                 tokio::select! {
                     _ = term.recv() => log::info!("events: SIGTERM"),
                     _ = int.recv() => log::info!("events: SIGINT"),
-                    _ = hup.recv() => log::info!("events: SIGHUP"),
+                    _ = hangup => log::info!("events: SIGHUP"),
                 }
                 stop.store(true, Ordering::Relaxed);
             });
