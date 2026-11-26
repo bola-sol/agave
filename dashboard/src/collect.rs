@@ -2244,7 +2244,7 @@ impl Collector {
         if self.caught_cluster {
             return;
         }
-        // Read from another process that attached after the node caught up, the node's own time.
+        // Recorded by an earlier run against the same validator process.
         if let Some(at_millis) = self.src.caught_up_millis() {
             self.latch_caught_up(at_millis);
             return;
@@ -2259,11 +2259,12 @@ impl Collector {
             self.trailed_cluster = true;
             return;
         }
-        // Read from another process, the node's own time is waited for, so both pages agree.
-        if !self.trailed_cluster || self.src.reports_caught_up() {
+        if !self.trailed_cluster {
             return;
         }
-        self.latch_caught_up(timestamp());
+        let now = timestamp();
+        self.src.record_caught_up(now);
+        self.latch_caught_up(now);
     }
 
     fn latch_caught_up(&mut self, at_millis: u64) {

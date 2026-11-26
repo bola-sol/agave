@@ -162,7 +162,15 @@ struct Node {
     account_paths: Vec<PathBuf>,
     snapshot_config: Option<SnapshotConfig>,
     global_addresses_only: bool,
-    caught_up_ms: u64,
+}
+
+/// The catch-up time in a `caught_up` file, where it was recorded for `process`.
+fn recorded_millis(text: &str, process: &str) -> Option<u64> {
+    let (recorded_for, millis) = text.trim().rsplit_once(' ')?;
+    if recorded_for != process {
+        return None;
+    }
+    millis.parse().ok()
 }
 
 /// A peer's addresses as `NodeInfoEvent::addrs` and `GossipPeerEvent::addrs` hold them.
@@ -237,7 +245,6 @@ impl From<&NodeInfoEvent> for Node {
                 .collect(),
             snapshot_config,
             global_addresses_only: event.global_addresses_only,
-            caught_up_ms: event.caught_up_ms,
         }
     }
 }
@@ -675,6 +682,10 @@ pub struct Mirror {
     /// The publishing validator's process id, 0 until its node info or start progress arrives.
     validator_pid: std::sync::atomic::AtomicU32,
     reported: SharedReported,
+    /// The file the catch-up time is kept in, under the history dir.
+    caught_up_file: std::sync::OnceLock<PathBuf>,
+    /// The validator process and the catch-up time recorded for it, once read.
+    caught_up: std::sync::Mutex<Option<(String, Option<u64>)>>,
 }
 
 impl Mirror {
@@ -684,7 +695,24 @@ impl Mirror {
             start_progress,
             validator_pid: std::sync::atomic::AtomicU32::new(0),
             reported: SharedReported::default(),
+            caught_up_file: std::sync::OnceLock::new(),
+            caught_up: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Keeps the catch-up time in `dir`, so a restarted dashboard shows it for the same process.
+    pub fn keep_caught_up_in(&self, dir: &std::path::Path) {
+        let _ = self.caught_up_file.set(dir.join("caught_up"));
+    }
+
+    /// The validator process as its id and start time, which a reused id does not repeat.
+    fn validator_process(&self) -> Option<String> {
+        let pid = self.validator_pid()?;
+        let started = crate::host_stats::process_started()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        Some(format!("{pid} {started}"))
     }
 
     /// The validator's start as its events report it, for the startup publisher.
@@ -1450,16 +1478,33 @@ impl Source for Mirror {
             })
             .count()
     }
-    fn reports_caught_up(&self) -> bool {
-        true
-    }
     fn caught_up_millis(&self) -> Option<u64> {
-        let state = self.state.read().unwrap();
-        state
-            .node
-            .as_ref()
-            .map(|node| node.caught_up_ms)
-            .filter(|millis| *millis > 0)
+        let file = self.caught_up_file.get()?;
+        let process = self.validator_process()?;
+        let mut caught_up = self.caught_up.lock().unwrap();
+        if let Some((read_for, millis)) = caught_up.as_ref()
+            && *read_for == process
+        {
+            return *millis;
+        }
+        let millis = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|text| recorded_millis(&text, &process));
+        *caught_up = Some((process, millis));
+        millis
+    }
+    fn record_caught_up(&self, at_millis: u64) {
+        let (Some(file), Some(process)) = (self.caught_up_file.get(), self.validator_process())
+        else {
+            return;
+        };
+        if let Err(err) = std::fs::write(file, format!("{process} {at_millis}\n")) {
+            log::warn!(
+                "dashboard: catch-up time not kept in {}: {err}",
+                file.display()
+            );
+        }
+        *self.caught_up.lock().unwrap() = Some((process, Some(at_millis)));
     }
     fn global_addresses_only(&self) -> bool {
         let state = self.state.read().unwrap();
@@ -1720,8 +1765,52 @@ mod tests {
     use {
         super::*,
         crate::{events::ROLE_WORKING, fixture::fixture, source::Direct},
-        solana_core::node_events::output::{clock_event, epoch_event, node_event, status_event},
+        solana_core::{
+            bank_state_events::{epoch_event, node_event},
+            node_events::output::{clock_event, status_event},
+        },
     };
+
+    /// A rank map as `bank.admitted` sends it, in parts of `RANKS_PER_EVENT`.
+    fn admitted_parts(epoch: Epoch, generation: u64, view: &EpochStakeView) -> Vec<AdmittedEvent> {
+        use crate::events::RANKS_PER_EVENT;
+        let ranks = view.ranks.len();
+        let count = u32::try_from(ranks.div_ceil(RANKS_PER_EVENT)).unwrap();
+        (0..ranks)
+            .step_by(RANKS_PER_EVENT)
+            .zip(0u32..)
+            .map(|(first, index)| {
+                let mut event = AdmittedEvent {
+                    pid: 0,
+                    tid: 0,
+                    timestamp_ns: 0,
+                    epoch,
+                    generation,
+                    index,
+                    count,
+                    total_stake: view.total_stake,
+                    first_rank: u32::try_from(first).unwrap(),
+                    len: 0,
+                    votes: [0u8; RANKS_PER_EVENT * 32],
+                    identities: [0u8; RANKS_PER_EVENT * 32],
+                    stakes: [0u64; RANKS_PER_EVENT],
+                };
+                let rows = (first..ranks.min(first.saturating_add(RANKS_PER_EVENT)))
+                    .map(|rank| view.ranks.entry(rank).unwrap());
+                let votes = event.votes.as_chunks_mut::<32>().0.iter_mut();
+                let identities = event.identities.as_chunks_mut::<32>().0.iter_mut();
+                for (((entry, vote), identity), stake) in
+                    rows.zip(votes).zip(identities).zip(event.stakes.iter_mut())
+                {
+                    *vote = entry.vote.to_bytes();
+                    *identity = entry.identity.to_bytes();
+                    *stake = entry.stake;
+                    event.len = event.len.saturating_add(1);
+                }
+                event
+            })
+            .collect()
+    }
 
     fn block_event(slot: Slot, block: Block) -> BlockEvent {
         use solana_core::node_events::blocks as published;
@@ -1843,16 +1932,26 @@ mod tests {
     }
 
     #[test]
+    fn test_a_kept_catch_up_time_counts_only_for_its_process() {
+        assert_eq!(recorded_millis("41 1700 1800\n", "41 1700"), Some(1_800));
+        // The same id reused by a later process.
+        assert_eq!(recorded_millis("41 1700 1800\n", "41 1900"), None);
+        assert_eq!(recorded_millis("", "41 1700"), None);
+        assert_eq!(recorded_millis("41 1700 soon", "41 1700"), None);
+    }
+
+    #[test]
     fn test_the_mirror_answers_as_the_validator_does() {
         let harness = fixture();
         harness.advance_to(5);
         let direct = Direct::new(harness.ctx.clone(), None);
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let (identity, vote_account) = (direct.identity(), direct.vote_account());
-        mirror.apply_node(&node_event(&harness.reader(), 0));
-        assert_eq!(mirror.caught_up_millis(), None);
-        mirror.apply_node(&node_event(&harness.reader(), 1_234));
-        assert_eq!(mirror.caught_up_millis(), Some(1_234));
+        mirror.apply_node(&node_event(
+            &harness.node_facts(),
+            direct.root_bank().as_bank().unwrap(),
+            &vote_account,
+        ));
         mirror.apply_status(&status_event(&harness.reader()));
         let working = direct.working_bank();
         mirror.apply_epoch(&epoch_event(working.as_bank().unwrap(), &vote_account));
@@ -1923,7 +2022,7 @@ mod tests {
 
     #[test]
     fn test_rank_maps_and_slot_history_come_back_whole() {
-        use solana_core::node_events::output::{admitted_events, history_events};
+        use solana_core::bank_state_events::history_events;
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let entries: Vec<RankEntry> = (0..70u64)
             .map(|stake| RankEntry {
@@ -1936,24 +2035,11 @@ mod tests {
             total_stake: 9_999,
             ranks: Arc::new(RankRows::new(entries.clone())),
         };
-        let published = solana_core::node_events::bank_view::EpochStakeView {
-            total_stake: view.total_stake,
-            ranks: Arc::new(solana_core::node_events::bank_view::RankRows::new(
-                entries
-                    .iter()
-                    .map(|entry| solana_core::node_events::bank_view::RankEntry {
-                        vote: entry.vote,
-                        identity: entry.identity,
-                        stake: entry.stake,
-                    })
-                    .collect(),
-            )),
-        };
-        let mut events = admitted_events(0, 1, &published);
+        let mut events = admitted_parts(0, 1, &view);
         assert_eq!(events.len(), 3);
         // Out of order, and a stale generation's part left over.
         events.reverse();
-        mirror.apply_admitted(&admitted_events(0, 0, &published)[0]);
+        mirror.apply_admitted(&admitted_parts(0, 0, &view)[0]);
         for event in &events {
             mirror.apply_admitted(event);
         }
@@ -2091,7 +2177,7 @@ mod tests {
 
     #[test]
     fn test_roots_before_the_history_arrives_are_kept() {
-        use solana_core::node_events::output::history_events;
+        use solana_core::bank_state_events::history_events;
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
         let mut history = SlotHistory::default();
         history.add(10);
@@ -2174,7 +2260,11 @@ mod tests {
         let harness = fixture();
         let direct = Direct::new(harness.ctx.clone(), None);
         let mirror = Mirror::new(Arc::new(RwLock::new(ValidatorStartProgress::Running)));
-        mirror.apply_node(&node_event(&harness.reader(), 0));
+        mirror.apply_node(&node_event(
+            &harness.node_facts(),
+            direct.root_bank().as_bank().unwrap(),
+            &direct.vote_account(),
+        ));
         let (me, other) = (direct.identity(), Pubkey::new_unique());
         let leaders = [other, me, me, other, other, other, me, other];
         mirror.apply_schedule(&EpochInfo {

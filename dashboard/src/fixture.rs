@@ -209,6 +209,17 @@ impl Fixture {
         Collector::new(self.ctx.clone(), shared, None, None, frozen_banks)
     }
 
+    /// What `node.info` carries besides the banks, over the same handles.
+    pub fn node_facts(&self) -> solana_core::bank_state_events::NodeFacts {
+        let ctx = &self.ctx;
+        solana_core::bank_state_events::NodeFacts {
+            cluster_info: ctx.cluster_info.clone(),
+            ledger_path: ctx.blockstore.ledger_path().clone(),
+            account_paths: ctx.account_paths.clone(),
+            snapshot_config: ctx.snapshot_config.clone(),
+        }
+    }
+
     /// The node events' reader over the same handles.
     pub fn reader(&self) -> solana_core::node_events::reader::Reader {
         let ctx = &self.ctx;

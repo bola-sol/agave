@@ -1,23 +1,39 @@
-//! Vote accounts and leader schedules (the previous, this and the next epoch's) as sets of
-//! events, resent in full every 5 seconds for subscribers that join late.
+//! The node's state as events: who it is, the epoch, vote accounts, leader schedules and rank
+//! maps (the previous, this and the next epoch's), and the slot history, each resent in full
+//! every 5 seconds for subscribers that join late.
 //! Members of a set share a `generation`, and `index` and `count` mark when it is complete.
 //! Vote accounts are read from the working bank, and each tick sends those that changed,
 //! last vote included.
 
 use {
+    crate::node_events::types::{
+        ACCOUNT_PATHS, ADMITTED_STREAM, AdmittedEvent, EPOCH_STREAM, EpochEvent, HISTORY_WORDS,
+        NODE_INFO_STREAM, NodeInfoEvent, PATH_BYTES, RANKS_PER_EVENT, SLOT_HISTORY_STREAM,
+        SlotHistoryEvent, VOTE_REWARD_BYTES, pack_contact, pack_path, pack_str,
+    },
     agave_event_system::{
         EventSystem, StreamConfig, event,
         event_metadata::{cached_thread_and_process_id, monotonic_timestamp_ns},
         publisher::Publisher,
         stream_name::StreamName,
     },
+    agave_snapshots::{SnapshotInterval, snapshot_config::SnapshotConfig},
     solana_clock::{Epoch, Slot},
+    solana_cluster_type::ClusterType,
+    solana_gossip::cluster_info::ClusterInfo,
     solana_leader_schedule::{LeaderSchedule, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime::{
+        bank::{Bank, VATHealthError},
+        bank_forks::BankForks,
+        epoch_stakes::BLSPubkeyToRankMap,
+    },
+    solana_slot_history::SlotHistory,
+    solana_vote_interface::state::VoteStateV4,
     std::{
         collections::HashMap,
+        path::PathBuf,
         sync::{
             Arc, RwLock,
             atomic::{AtomicBool, Ordering},
@@ -39,6 +55,10 @@ pub const TURNS_PER_EVENT: usize = 256;
 
 const TICK: Duration = Duration::from_secs(1);
 const FULL_SET_INTERVAL: Duration = Duration::from_secs(5);
+/// Where the runtime keeps each epoch's inflation: `vote_reward_account` under the alpenglow
+/// feature id.
+pub const VOTE_REWARD_ACCOUNT: Pubkey =
+    Pubkey::from_str_const("3vJzniWALu2qGFJ1ZY6JD3Y2ZmA5zWqmVdDX7yBXHgu7");
 const PACE_BATCH: usize = 512;
 const PACE_PAUSE: Duration = Duration::from_millis(50);
 
@@ -268,6 +288,201 @@ pub(crate) fn leader_schedule_events(
     Some(events)
 }
 
+/// What `node.info` carries besides the banks.
+pub struct NodeFacts {
+    pub cluster_info: Arc<ClusterInfo>,
+    pub ledger_path: PathBuf,
+    pub account_paths: Vec<PathBuf>,
+    pub snapshot_config: Option<SnapshotConfig>,
+}
+
+pub fn node_event(facts: &NodeFacts, bank: &Bank, vote_account: &Pubkey) -> NodeInfoEvent {
+    let (tid, pid) = cached_thread_and_process_id();
+    let contact = facts.cluster_info.my_contact_info();
+    let mut account_paths = [0u8; ACCOUNT_PATHS * PATH_BYTES];
+    for (packed, path) in account_paths
+        .as_chunks_mut::<PATH_BYTES>()
+        .0
+        .iter_mut()
+        .zip(&facts.account_paths)
+    {
+        packed.copy_from_slice(&pack_path(path));
+    }
+    let snapshots = facts.snapshot_config.as_ref();
+    let slots = |interval: SnapshotInterval| match interval {
+        SnapshotInterval::Disabled => 0,
+        SnapshotInterval::Slots(slots) => slots.get(),
+    };
+    NodeInfoEvent {
+        pid,
+        tid,
+        timestamp_ns: monotonic_timestamp_ns(),
+        identity: contact.pubkey().to_bytes(),
+        vote_account: vote_account.to_bytes(),
+        cluster: match bank.cluster_type() {
+            ClusterType::Testnet => 0,
+            ClusterType::MainnetBeta => 1,
+            ClusterType::Devnet => 2,
+            ClusterType::Development => 3,
+        },
+        shred_version: facts.cluster_info.my_shred_version(),
+        version: pack_str(&contact.version().to_string()),
+        client: pack_str(&contact.version().client().to_string()),
+        wallclock: 0,
+        outset: contact.outset(),
+        addrs: pack_contact(&contact),
+        ledger_path: pack_path(&facts.ledger_path),
+        account_paths,
+        has_snapshots: snapshots.is_some(),
+        snapshots_generated: snapshots.is_some_and(|config| config.should_generate_snapshots()),
+        full_snapshot_dir: snapshots.map_or([0u8; PATH_BYTES], |config| {
+            pack_path(&config.full_snapshot_archives_dir)
+        }),
+        incremental_snapshot_dir: snapshots.map_or([0u8; PATH_BYTES], |config| {
+            pack_path(&config.incremental_snapshot_archives_dir)
+        }),
+        full_snapshot_interval: snapshots
+            .map_or(0, |config| slots(config.full_snapshot_archive_interval)),
+        incremental_snapshot_interval: snapshots.map_or(0, |config| {
+            slots(config.incremental_snapshot_archive_interval)
+        }),
+        global_addresses_only: matches!(
+            facts.cluster_info.socket_addr_space(),
+            solana_net_utils::SocketAddrSpace::Global
+        ),
+    }
+}
+
+pub fn epoch_event(bank: &Bank, vote_account: &Pubkey) -> EpochEvent {
+    let (tid, pid) = cached_thread_and_process_id();
+    let schedule = bank.epoch_schedule();
+    let (block_cost_limit, account_cost_limit) =
+        bank.read_cost_tracker().map_or((0, 0), |tracker| {
+            (tracker.get_block_limit(), tracker.get_account_limit())
+        });
+    let ticket_short = match bank.get_vat_health_for_next_epoch(vote_account) {
+        Err(VATHealthError::InsufficientFundsInVoteAccount(balance, minimum)) => {
+            Some(minimum.saturating_sub(balance))
+        }
+        Ok(()) | Err(_) => None,
+    };
+    let vote_reward = bank
+        .get_account(&VOTE_REWARD_ACCOUNT)
+        .map(|account| solana_account::ReadableAccount::data(&account).to_vec())
+        .filter(|data| data.len() <= VOTE_REWARD_BYTES)
+        .unwrap_or_default();
+    let mut packed_reward = [0u8; VOTE_REWARD_BYTES];
+    if let Some(slot) = packed_reward.get_mut(..vote_reward.len()) {
+        slot.copy_from_slice(&vote_reward);
+    }
+    EpochEvent {
+        pid,
+        tid,
+        timestamp_ns: monotonic_timestamp_ns(),
+        epoch: bank.epoch(),
+        slots_per_epoch: schedule.slots_per_epoch,
+        leader_schedule_slot_offset: schedule.leader_schedule_slot_offset,
+        warmup: schedule.warmup,
+        first_normal_epoch: schedule.first_normal_epoch,
+        first_normal_slot: schedule.first_normal_slot,
+        ns_per_slot: u64::try_from(bank.ns_per_slot_at_slot(bank.slot())).unwrap_or(u64::MAX),
+        alpenglow: bank.is_alpenglow(),
+        lamports_per_signature: bank.get_lamports_per_signature(),
+        block_cost_limit,
+        account_cost_limit,
+        minimum_vat_balance: bank.minimum_vote_account_balance_for_vat(),
+        vote_account_rent: bank.get_minimum_balance_for_rent_exemption(VoteStateV4::size_of()),
+        has_ticket_short: ticket_short.is_some(),
+        ticket_short: ticket_short.unwrap_or(0),
+        vote_reward_len: u8::try_from(vote_reward.len()).unwrap_or(0),
+        vote_reward: packed_reward,
+    }
+}
+
+/// An epoch's rank map in parts of `RANKS_PER_EVENT`.
+pub fn admitted_events(
+    epoch: Epoch,
+    generation: u64,
+    total_stake: u64,
+    ranks: &BLSPubkeyToRankMap,
+) -> Vec<AdmittedEvent> {
+    let (tid, pid) = cached_thread_and_process_id();
+    let timestamp_ns = monotonic_timestamp_ns();
+    let len = ranks.len();
+    let count = u32::try_from(len.div_ceil(RANKS_PER_EVENT)).unwrap_or(u32::MAX);
+    (0..len)
+        .step_by(RANKS_PER_EVENT)
+        .zip(0u32..)
+        .map(|(first, index)| {
+            let mut event = AdmittedEvent {
+                pid,
+                tid,
+                timestamp_ns,
+                epoch,
+                generation,
+                index,
+                count,
+                total_stake,
+                first_rank: u32::try_from(first).unwrap_or(u32::MAX),
+                len: 0,
+                votes: [0u8; RANKS_PER_EVENT * 32],
+                identities: [0u8; RANKS_PER_EVENT * 32],
+                stakes: [0u64; RANKS_PER_EVENT],
+            };
+            let entries = (first..len.min(first.saturating_add(RANKS_PER_EVENT)))
+                .filter_map(|rank| ranks.get_pubkey_stake_entry(rank));
+            for (at, entry) in entries.enumerate() {
+                let start = at.saturating_mul(32);
+                if let Some(slot) = event.votes.get_mut(start..start.saturating_add(32)) {
+                    slot.copy_from_slice(&entry.vote_account_pubkey.to_bytes());
+                }
+                if let Some(slot) = event.identities.get_mut(start..start.saturating_add(32)) {
+                    slot.copy_from_slice(&entry.node_pubkey.to_bytes());
+                }
+                if let Some(slot) = event.stakes.get_mut(at) {
+                    *slot = entry.stake.get().get();
+                }
+                event.len = event.len.saturating_add(1);
+            }
+            event
+        })
+        .collect()
+}
+
+/// The slot history's bitmap in parts of `HISTORY_WORDS`.
+pub fn history_events(history: &SlotHistory, generation: u64) -> Vec<SlotHistoryEvent> {
+    use bv::Bits;
+    let (tid, pid) = cached_thread_and_process_id();
+    let timestamp_ns = monotonic_timestamp_ns();
+    let words = history.bits.block_len();
+    let count = u32::try_from(words.div_ceil(HISTORY_WORDS)).unwrap_or(u32::MAX);
+    (0..words)
+        .step_by(HISTORY_WORDS)
+        .zip(0u32..)
+        .map(|(first, index)| {
+            let last = words.min(first.saturating_add(HISTORY_WORDS));
+            let mut event = SlotHistoryEvent {
+                pid,
+                tid,
+                timestamp_ns,
+                generation,
+                index,
+                count,
+                next_slot: history.next_slot,
+                first_word: u32::try_from(first).unwrap_or(u32::MAX),
+                len: u16::try_from(last.saturating_sub(first)).unwrap_or(0),
+                words: [0u64; HISTORY_WORDS],
+            };
+            for (at, word) in (first..last).enumerate() {
+                if let Some(slot) = event.words.get_mut(at) {
+                    *slot = history.bits.get_block(word);
+                }
+            }
+            event
+        })
+        .collect()
+}
+
 /// Publishes in batches with a pause between, so a set larger than the stream's capacity arrives
 /// whole when the subscriber drains within the pauses.
 fn publish_paced<E: agave_event_system::Event>(
@@ -288,6 +503,87 @@ fn publish_paced<E: agave_event_system::Event>(
     }
 }
 
+/// Everything but the header, which decides whether an event changed.
+trait Unstamped: Clone + PartialEq {
+    fn unstamped(&self) -> Self;
+}
+
+macro_rules! unstamped {
+    ($($event:ty),*) => {$(
+        impl Unstamped for $event {
+            fn unstamped(&self) -> Self {
+                Self {
+                    pid: 0,
+                    tid: 0,
+                    timestamp_ns: 0,
+                    ..self.clone()
+                }
+            }
+        }
+    )*};
+}
+
+unstamped!(NodeInfoEvent, EpochEvent);
+
+/// Sends an event when it changes, when its stream turns on, and with each full set.
+struct Latest<E: agave_event_system::Event + Unstamped> {
+    publisher: Publisher<E>,
+    sent: Option<E>,
+}
+
+impl<E: agave_event_system::Event + Unstamped> Latest<E> {
+    fn new(publisher: Publisher<E>) -> Self {
+        Self {
+            publisher,
+            sent: None,
+        }
+    }
+
+    fn enabled(&mut self) -> bool {
+        let on = self.publisher.is_enabled();
+        if !on {
+            self.sent = None;
+        }
+        on
+    }
+
+    fn offer(&mut self, event: E, due: bool) {
+        let key = event.unstamped();
+        if due || self.sent.as_ref() != Some(&key) {
+            let _ = self.publisher.publish(&event);
+            self.sent = Some(key);
+        }
+    }
+}
+
+fn publisher<E: agave_event_system::Event>(
+    event_system: &EventSystem,
+    name: StreamName,
+    capacity: usize,
+) -> Result<Publisher<E>, String> {
+    let shown = format!("{name:?}");
+    event_system
+        .create_stream::<E>(
+            name,
+            StreamConfig {
+                capacity,
+                publisher_slots: 1,
+                subscriber_slots: 8,
+            },
+        )
+        .map_err(|err| format!("Failed to create stream {shown}: {err}"))?
+        .try_create_publisher()
+        .ok_or_else(|| format!("No publisher slot on the new stream {shown}"))
+}
+
+/// The streams besides vote accounts and leader schedules.
+struct StatePublishers {
+    node: Latest<NodeInfoEvent>,
+    epoch: Latest<EpochEvent>,
+    admitted: Publisher<AdmittedEvent>,
+    history: Publisher<SlotHistoryEvent>,
+}
+
 pub struct BankStateEvents {
     thread_hdl: JoinHandle<()>,
 }
@@ -298,8 +594,15 @@ impl BankStateEvents {
         bank_forks: Arc<RwLock<BankForks>>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         our_vote_account: Pubkey,
+        node: NodeFacts,
         exit: Arc<AtomicBool>,
     ) -> Result<Self, String> {
+        let mut state_publishers = StatePublishers {
+            node: Latest::new(publisher(event_system, NODE_INFO_STREAM, 16)?),
+            epoch: Latest::new(publisher(event_system, EPOCH_STREAM, 16)?),
+            admitted: publisher(event_system, ADMITTED_STREAM, 1024)?,
+            history: publisher(event_system, SLOT_HISTORY_STREAM, 256)?,
+        };
         let vote_factory = event_system
             .create_stream::<VoteAccountEvent>(
                 VOTE_ACCOUNT_STREAM,
@@ -339,6 +642,13 @@ impl BankStateEvents {
                         &our_vote_account,
                         &exit,
                     );
+                    state.tick_state(
+                        &mut state_publishers,
+                        &bank_forks,
+                        &node,
+                        &our_vote_account,
+                        &exit,
+                    );
                     thread::sleep(TICK);
                 }
             })
@@ -353,6 +663,13 @@ impl BankStateEvents {
 
 #[derive(Default)]
 struct StateLoop {
+    admitted_generation: u64,
+    history_generation: u64,
+    admitted_on: bool,
+    history_on: bool,
+    /// The full-set clock for the streams `tick_state` sends.
+    state_epoch: Option<Epoch>,
+    state_next_full: Option<Instant>,
     vote_generation: u64,
     schedule_generation: u64,
     votes_on: bool,
@@ -431,6 +748,82 @@ impl StateLoop {
     }
 }
 
+impl StateLoop {
+    /// Node info and the epoch when they change, rank maps and the slot history in full; all at
+    /// turn-on, a new epoch and every `FULL_SET_INTERVAL`.
+    fn tick_state(
+        &mut self,
+        out: &mut StatePublishers,
+        bank_forks: &RwLock<BankForks>,
+        node: &NodeFacts,
+        our_vote_account: &Pubkey,
+        exit: &AtomicBool,
+    ) {
+        let node_on = out.node.enabled();
+        let epoch_on = out.epoch.enabled();
+        let admitted_on = out.admitted.is_enabled();
+        let history_on = out.history.is_enabled();
+        let admitted_turned_on = admitted_on && !self.admitted_on;
+        let history_turned_on = history_on && !self.history_on;
+        self.admitted_on = admitted_on;
+        self.history_on = history_on;
+        if !(node_on || epoch_on || admitted_on || history_on) {
+            return;
+        }
+
+        let (working, root) = {
+            let bank_forks = bank_forks.read().unwrap();
+            (bank_forks.working_bank(), bank_forks.root_bank())
+        };
+        let epoch = working.epoch();
+        let now = Instant::now();
+        let due =
+            self.state_epoch != Some(epoch) || self.state_next_full.is_none_or(|at| now >= at);
+        if due {
+            self.state_epoch = Some(epoch);
+            self.state_next_full = Some(now + FULL_SET_INTERVAL);
+        }
+
+        if node_on {
+            out.node
+                .offer(node_event(node, &working, our_vote_account), due);
+        }
+        if epoch_on {
+            out.epoch
+                .offer(epoch_event(&working, our_vote_account), due);
+        }
+        if admitted_on && (due || admitted_turned_on) {
+            self.admitted_generation = self.admitted_generation.saturating_add(1);
+            let generation = self.admitted_generation;
+            let events: Vec<AdmittedEvent> =
+                [epoch.saturating_sub(1), epoch, epoch.saturating_add(1)]
+                    .into_iter()
+                    .filter_map(|epoch| Some((epoch, working.epoch_stakes(epoch)?)))
+                    .flat_map(|(epoch, stakes)| {
+                        admitted_events(
+                            epoch,
+                            generation,
+                            stakes.total_stake(),
+                            stakes.bls_pubkey_to_rank_map(),
+                        )
+                    })
+                    .collect();
+            publish_paced(&mut out.admitted, &events, exit);
+        }
+        if history_on
+            && (due || history_turned_on)
+            && let Some(history) = root.get_slot_history()
+        {
+            self.history_generation = self.history_generation.saturating_add(1);
+            publish_paced(
+                &mut out.history,
+                &history_events(&history, self.history_generation),
+                exit,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -441,6 +834,44 @@ mod tests {
         },
         solana_signer::Signer,
     };
+
+    #[test]
+    fn test_rank_map_goes_out_with_every_rank_and_the_epoch_with_its_schedule() {
+        let keypairs: Vec<_> = (0..3).map(|_| ValidatorVoteKeypairs::new_rand()).collect();
+        let genesis =
+            create_genesis_config_with_vote_accounts(1_000_000_000, &keypairs, vec![100, 200, 300]);
+        let bank = Bank::new_for_tests(&genesis.genesis_config);
+        let stakes = bank.epoch_stakes(bank.epoch()).unwrap();
+        let ranks = stakes.bls_pubkey_to_rank_map();
+        assert_eq!(ranks.len(), 3);
+
+        let events = admitted_events(0, 4, stakes.total_stake(), ranks);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            (event.generation, event.index, event.count, event.len),
+            (4, 0, 1, 3)
+        );
+        assert_eq!(event.total_stake, stakes.total_stake());
+        let sent = event
+            .votes
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .zip(event.stakes)
+            .take(3);
+        for (rank, (vote, stake)) in sent.enumerate() {
+            let entry = ranks.get_pubkey_stake_entry(rank).unwrap();
+            assert_eq!(*vote, entry.vote_account_pubkey.to_bytes());
+            assert_eq!(stake, entry.stake.get().get());
+        }
+
+        let ours = keypairs[0].vote_keypair.pubkey();
+        let epoch = epoch_event(&bank, &ours);
+        assert_eq!(epoch.epoch, bank.epoch());
+        assert_eq!(epoch.slots_per_epoch, bank.epoch_schedule().slots_per_epoch);
+        assert_eq!(epoch.alpenglow, bank.is_alpenglow());
+    }
 
     #[test]
     fn test_vote_account_set_counts_staked_and_ours() {

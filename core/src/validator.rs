@@ -4,7 +4,7 @@ pub use solana_perf::report_target_features;
 use {
     crate::{
         admin_rpc_post_init::{AdminRpcRequestMetadataPostInit, KeyUpdaterType, KeyUpdaters},
-        bank_state_events::BankStateEvents,
+        bank_state_events::{BankStateEvents, NodeFacts},
         banking_channels::Channels,
         banking_stage::{
             BankingStage, transaction_scheduler::scheduler_controller::SchedulerConfig,
@@ -1909,6 +1909,12 @@ impl Validator {
             bank_forks.clone(),
             leader_schedule_cache.clone(),
             *vote_account,
+            NodeFacts {
+                cluster_info: cluster_info.clone(),
+                ledger_path: blockstore.ledger_path().clone(),
+                account_paths: config.account_paths.clone(),
+                snapshot_config: Some(config.snapshot_config.clone()),
+            },
             exit.clone(),
         )
         .map_err(ValidatorError::Other)?;

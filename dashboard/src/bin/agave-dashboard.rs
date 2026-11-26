@@ -207,6 +207,9 @@ fn main() -> ExitCode {
     );
 
     let mirror = Arc::new(Mirror::new(start_progress.clone()));
+    if let Some(dir) = &args.history_dir {
+        mirror.keep_caught_up_in(dir);
+    }
     service.report_startup_from(mirror.reported());
     let ledger = args.ledger.clone();
     let mut input = EventInput::new(ledger.join("events"), mirror.clone(), service.metrics_tap());
