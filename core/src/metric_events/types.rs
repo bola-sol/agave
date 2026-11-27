@@ -260,14 +260,10 @@ macro_rules! metric_row {
 }
 
 metric_row! {
-    /// Fields of `replay-slot-stats`, `retransmit-stage-slot-stats` and `cost_tracker_stats`: the
-    /// rows Slot replayed, Turbine layers and Block cost. Block full comes with `ledger.first_shred`.
+    /// Fields of `retransmit-stage-slot-stats` and `cost_tracker_stats`: the rows Turbine layers
+    /// and Block cost. Slot replayed comes with `replay.slot_stats`, Block full with
+    /// `ledger.first_shred`.
     MetricSlot, METRIC_SLOT_STREAM = "metric.slot";
-    Replayed = ["replay-slot-stats"],
-        tags [],
-        strings [],
-        bools [],
-        fields [slot = "slot", fetch_entries_time = "fetch_entries_time", confirmation_without_replay_us = "confirmation_without_replay_us", confirmation_time_us = "confirmation_time_us", bank_complete_time_us = "bank_complete_time_us", entry_poh_verification_time = "entry_poh_verification_time", entry_transaction_verification_time = "entry_transaction_verification_time", task_submission_us = "task_submission_us", replay_time = "replay_time", execute_us = "execute_us", execute_details_execute_inner_us = "execute_details_execute_inner_us", execute_details_serialize_us = "execute_details_serialize_us", execute_details_deserialize_us = "execute_details_deserialize_us", load_us = "load_us", store_us = "store_us", program_cache_us = "program_cache_us", total_transactions = "total_transactions", execute_details_create_executor_load_elf_us = "execute_details_create_executor_load_elf_us", execute_details_create_executor_verify_code_us = "execute_details_create_executor_verify_code_us", execute_details_create_executor_jit_compile_us = "execute_details_create_executor_jit_compile_us", validate_transactions_us = "validate_transactions_us", validate_fees_us = "validate_fees_us", filter_executable_us = "filter_executable_us", collect_balances_us = "collect_balances_us", collect_logs_us = "collect_logs_us", update_stakes_cache_us = "update_stakes_cache_us", update_transaction_statuses = "update_transaction_statuses", check_block_limits_us = "check_block_limits_us"];
     TurbineLayers = ["retransmit-stage-slot-stats"],
         tags [],
         strings [],

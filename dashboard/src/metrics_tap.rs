@@ -4265,7 +4265,6 @@ mod carried_tests {
             XDP_NETWORK_CONFIG,
             RETRANSMIT_STAGE,
             RETRANSMIT_SLOT_STATS,
-            REPLAY_SLOT_STATS,
             COST_TRACKER,
             GOSSIP_ENTRIES,
             GOSSIP_ENTRY_FAILS,
@@ -4280,9 +4279,10 @@ mod carried_tests {
         for name in read.into_iter().chain(GOSSIP_STATS) {
             assert!(crate::metric_events::carried(name), "{name}");
         }
-        // Each slot's fill comes with its ledger event instead, and the wait's stake in gossip with
-        // the wait's own stream.
+        // Each slot's fill comes with its ledger event instead, each slot's replay with replay's slot
+        // stats, and the wait's stake in gossip with the wait's own stream.
         assert!(!crate::metric_events::carried(SHRED_FULL));
+        assert!(!crate::metric_events::carried(REPLAY_SLOT_STATS));
         assert!(!crate::metric_events::carried(WFSM_GOSSIP));
         // The bundle stage's points are jito's; this branch is agave.
         for name in [BUNDLE_STAGE, BUNDLE_SLOT_STATS] {

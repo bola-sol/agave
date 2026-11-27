@@ -34,7 +34,10 @@ use {
             LEADER_SCHEDULE_STREAM, LeaderScheduleEvent, VOTE_ACCOUNT_CHANGE, VOTE_ACCOUNT_STREAM,
             VoteAccountEvent,
         },
-        replay_stage::events::{BANK_FROZEN_STREAM, BankFrozenEvent, SLOT_EVENT_STREAM, SlotEvent},
+        replay_stage::events::{
+            BANK_FROZEN_STREAM, BankFrozenEvent, SLOT_EVENT_STREAM, SLOT_STATS_STREAM, SlotEvent,
+            SlotStatsEvent,
+        },
         shred_fetch_events::{SHRED_FETCH_PATH_REPAIR, SHRED_FETCH_STREAM, ShredFetchCounters},
         start_events::{
             START_PROGRESS_STREAM, SUPERMAJORITY_WAIT_STREAM, StartProgressEvent,
@@ -70,6 +73,12 @@ impl Stamped for SlotEvent {
 }
 
 impl Stamped for BankFrozenEvent {
+    fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+}
+
+impl Stamped for SlotStatsEvent {
     fn timestamp_ns(&self) -> u64 {
         self.timestamp_ns
     }
@@ -506,6 +515,77 @@ fn fill_point(event: &LedgerSlotEvent) -> solana_metrics::datapoint::DataPoint {
     point
 }
 
+/// The `replay-slot-stats` point a slot stats event stands for, for the metrics tap.
+fn stats_point(event: &SlotStatsEvent) -> solana_metrics::datapoint::DataPoint {
+    let int = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    let (confirmation, replay) = if event.unified_scheduler {
+        ("confirmation_without_replay_us", "task_submission_us")
+    } else {
+        ("confirmation_time_us", "replay_time")
+    };
+    let mut point = solana_metrics::datapoint::DataPoint::new("replay-slot-stats");
+    for (name, value) in [
+        ("slot", event.slot),
+        ("fetch_entries_time", event.fetch_us),
+        ("fetch_entries_fail_time", event.fetch_fail_us),
+        ("entry_poh_verification_time", event.poh_verify_us),
+        (
+            "entry_transaction_verification_time",
+            event.transaction_verify_us,
+        ),
+        (confirmation, event.confirmation_us),
+        (replay, event.replay_us),
+        ("num_bank_switches", event.bank_switches),
+        ("replay_total_elapsed", event.replay_total_us),
+        ("bank_complete_time_us", event.bank_complete_us),
+        ("total_transactions", event.transactions),
+        ("total_entries", event.entries),
+        ("total_shreds", event.shreds),
+        ("validate_transactions_us", event.validate_transactions_us),
+        ("validate_fees_us", event.validate_fees_us),
+        ("filter_executable_us", event.filter_executable_us),
+        ("program_cache_us", event.program_cache_us),
+        ("load_us", event.load_us),
+        ("execute_us", event.execute_us),
+        ("collect_balances_us", event.collect_balances_us),
+        ("collect_logs_us", event.collect_logs_us),
+        ("store_us", event.store_us),
+        ("update_stakes_cache_us", event.update_stakes_cache_us),
+        (
+            "update_transaction_statuses",
+            event.update_transaction_statuses_us,
+        ),
+        ("check_block_limits_us", event.check_block_limits_us),
+        ("execute_details_execute_inner_us", event.execute_inner_us),
+        ("execute_details_serialize_us", event.serialize_us),
+        ("execute_details_deserialize_us", event.deserialize_us),
+        (
+            "execute_details_create_executor_load_elf_us",
+            event.load_elf_us,
+        ),
+        (
+            "execute_details_create_executor_verify_code_us",
+            event.verify_code_us,
+        ),
+        (
+            "execute_details_create_executor_jit_compile_us",
+            event.jit_compile_us,
+        ),
+    ] {
+        point.add_field_i64(name, int(value));
+    }
+    point
+}
+
+/// Unix milliseconds of a monotonic stamp from this host, read against both clocks now.
+fn unix_millis_of(stamp_ns: u64, monotonic_now_ns: u64, unix_now_ms: u64) -> u64 {
+    let ago_ms = monotonic_now_ns
+        .saturating_sub(stamp_ns)
+        .checked_div(1_000_000)
+        .unwrap_or(0);
+    unix_now_ms.saturating_sub(ago_ms)
+}
+
 trait MetricPoint {
     fn point(&self) -> (solana_metrics::datapoint::DataPoint, u64);
 }
@@ -525,6 +605,7 @@ pub struct EventInput {
     tap: Arc<MetricsTap>,
     pub slot_events: Stream<SlotEvent>,
     pub bank_frozen: Stream<BankFrozenEvent>,
+    pub slot_stats: Stream<SlotStatsEvent>,
     pub shred_fetch: Stream<ShredFetchCounters>,
     pub vote_accounts: Stream<VoteAccountEvent>,
     pub schedule: Stream<LeaderScheduleEvent>,
@@ -570,6 +651,7 @@ impl EventInput {
             tap,
             slot_events: Stream::new(SLOT_EVENT_STREAM),
             bank_frozen: Stream::new(BANK_FROZEN_STREAM),
+            slot_stats: Stream::new(SLOT_STATS_STREAM),
             shred_fetch: Stream::new(SHRED_FETCH_STREAM),
             vote_accounts: Stream::new(VOTE_ACCOUNT_STREAM),
             schedule: Stream::new(LEADER_SCHEDULE_STREAM),
@@ -619,6 +701,7 @@ impl EventInput {
         let dir = self.dir.as_path();
         self.slot_events.connect(dir, &explorer);
         self.bank_frozen.connect(dir, &explorer);
+        self.slot_stats.connect(dir, &explorer);
         self.shred_fetch.connect(dir, &explorer);
         if self.vote_accounts.connect(dir, &explorer) {
             self.votes.reset_pending();
@@ -668,6 +751,7 @@ impl EventInput {
     pub fn disconnect(&mut self) {
         self.slot_events.disconnect();
         self.bank_frozen.disconnect();
+        self.slot_stats.disconnect();
         self.shred_fetch.disconnect();
         self.vote_accounts.disconnect();
         self.schedule.disconnect();
@@ -701,6 +785,13 @@ impl EventInput {
         // Banks and footers ahead of the roots that name them, as they were sent.
         let mirror = &self.mirror;
         self.bank_frozen.drain(|event| mirror.apply_frozen(&event));
+        // Right after the banks, which freeze first.
+        let tap = &self.tap;
+        let (monotonic_now, unix_now) = (monotonic_timestamp_ns(), solana_time_utils::timestamp());
+        self.slot_stats.drain(|event| {
+            let observed_ms = unix_millis_of(event.timestamp_ns, monotonic_now, unix_now);
+            tap.observe_external(&stats_point(&event), observed_ms);
+        });
         self.blocks.drain(|event| mirror.apply_block(&event));
         let slots = &mut self.slots;
         let mut rooted = Vec::new();
@@ -839,6 +930,7 @@ impl EventInput {
         lines!(
             slot_events,
             bank_frozen,
+            slot_stats,
             shred_fetch,
             vote_accounts,
             schedule,
@@ -967,6 +1059,107 @@ mod tests {
             last_voted_slot: 990,
             pending_delegator_rewards: 0,
         }
+    }
+
+    /// Distinct primes, so a field mapped to the wrong name changes the figures.
+    fn slot_stats(unified_scheduler: bool) -> SlotStatsEvent {
+        SlotStatsEvent {
+            pid: 1,
+            tid: 1,
+            timestamp_ns: 0,
+            slot: 77,
+            bank_id: 3,
+            unified_scheduler,
+            fetch_us: 2,
+            fetch_fail_us: 3,
+            poh_verify_us: 5,
+            transaction_verify_us: 7,
+            confirmation_us: 11,
+            replay_us: 13,
+            bank_switches: 17,
+            replay_total_us: 19,
+            bank_complete_us: 23,
+            transactions: 29,
+            entries: 31,
+            shreds: 37,
+            validate_transactions_us: 41,
+            validate_fees_us: 43,
+            filter_executable_us: 47,
+            program_cache_us: 53,
+            load_us: 59,
+            execute_us: 61,
+            collect_balances_us: 67,
+            collect_logs_us: 71,
+            store_us: 73,
+            update_stakes_cache_us: 79,
+            update_transaction_statuses_us: 83,
+            check_block_limits_us: 89,
+            execute_inner_us: 97,
+            serialize_us: 101,
+            deserialize_us: 103,
+            load_elf_us: 107,
+            verify_code_us: 109,
+            jit_compile_us: 113,
+        }
+    }
+
+    #[test]
+    fn test_slot_stats_reach_the_tap_as_the_datapoint_did() {
+        for unified in [false, true] {
+            let (confirmation, replay) = if unified {
+                ("confirmation_without_replay_us", "task_submission_us")
+            } else {
+                ("confirmation_time_us", "replay_time")
+            };
+            let mut point = solana_metrics::datapoint::DataPoint::new("replay-slot-stats");
+            for (name, value) in [
+                ("slot", 77),
+                ("fetch_entries_time", 2),
+                ("fetch_entries_fail_time", 3),
+                ("entry_poh_verification_time", 5),
+                ("entry_transaction_verification_time", 7),
+                (confirmation, 11),
+                (replay, 13),
+                ("num_bank_switches", 17),
+                ("replay_total_elapsed", 19),
+                ("bank_complete_time_us", 23),
+                ("total_transactions", 29),
+                ("total_entries", 31),
+                ("total_shreds", 37),
+                ("validate_transactions_us", 41),
+                ("validate_fees_us", 43),
+                ("filter_executable_us", 47),
+                ("program_cache_us", 53),
+                ("load_us", 59),
+                ("execute_us", 61),
+                ("collect_balances_us", 67),
+                ("collect_logs_us", 71),
+                ("store_us", 73),
+                ("update_stakes_cache_us", 79),
+                ("update_transaction_statuses", 83),
+                ("check_block_limits_us", 89),
+                ("execute_details_execute_inner_us", 97),
+                ("execute_details_serialize_us", 101),
+                ("execute_details_deserialize_us", 103),
+                ("execute_details_create_executor_load_elf_us", 107),
+                ("execute_details_create_executor_verify_code_us", 109),
+                ("execute_details_create_executor_jit_compile_us", 113),
+            ] {
+                point.add_field_i64(name, value);
+            }
+            let (from_point, from_event) = (MetricsTap::default(), MetricsTap::default());
+            from_point.observe_external(&point, 5_000);
+            from_event.observe_external(&stats_point(&slot_stats(unified)), 5_000);
+            assert!(from_point.replayed(77).is_some());
+            assert_eq!(from_event.replayed(77), from_point.replayed(77));
+        }
+    }
+
+    #[test]
+    fn test_a_monotonic_stamp_reads_as_unix_time() {
+        assert_eq!(unix_millis_of(1_000_000_000, 3_500_000_000, 10_000), 7_500);
+        // A stamp ahead of the clock read is taken as now.
+        assert_eq!(unix_millis_of(4_000_000_000, 3_500_000_000, 10_000), 10_000);
     }
 
     #[test]
