@@ -287,6 +287,11 @@ describe("lasting", () => {
 describe("readAs", () => {
   it("says what was worked out", () => {
     expect(readAs("total", series("fees"), null)).toEqual({ head: "Total of fees", unit: "SOL" });
+    expect(readAs("total", series("failed"), null)).toEqual({ head: "Total of failed transactions", unit: "" });
+    expect(readAs("total", series("votes"), null)).toEqual({ head: "Total of vote transactions", unit: "" });
+    expect(readAs("total", series("udp_drops"), null)).toEqual({ head: "Total of UDP drops", unit: "" });
+    expect(readAs("total", series("net_out"), null)).toEqual({ head: "Total of network out", unit: "GB" });
+    expect(readAs("total", series("compute"), null)).toEqual({ head: "Total of compute", unit: "billion CU" });
     expect(readAs("mean", series("replay"), null)).toEqual({ head: "Mean of replay time", unit: "ms" });
     expect(readAs("when_above", series("replay"), thresholdOf("over 20 ms", series("replay")))).toEqual({
       head: "When replay time was over 20 ms",
