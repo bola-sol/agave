@@ -155,6 +155,8 @@ describe("thresholdOf", () => {
     expect(threshold(thresholdOf("replay over 20000 microseconds", series("replay"))).value).toBe(20);
     expect(threshold(thresholdOf("replay over 900us", series("replay"))).value).toBe(0.9);
     expect(threshold(thresholdOf("tps over 3k", series("transactions"))).value).toBe(3000);
+    expect(threshold(thresholdOf("tps over 3k per second", series("transactions"))).value).toBe(3000);
+    expect(threshold(thresholdOf("memory over 300g", series("memory"))).value).toBe(300);
     expect(threshold(thresholdOf("failed over 50 per block", series("failed"))).value).toBe(50);
   });
 
@@ -178,6 +180,14 @@ describe("thresholdOf", () => {
     expect(threshold(thresholdOf(request, series("memory"))).value).toBeCloseTo(186.3, 1);
     expect(threshold(thresholdOf("memory over 200 gb and cpu over 80", series("cpu"))).value).toBe(80);
     expect(threshold(thresholdOf("replay over 20 ms and cpu over 80%", series("cpu"))).value).toBe(80);
+  });
+
+  it("does not give a series the value after a longer name that holds its own", () => {
+    expect(threshold(thresholdOf("failed transactions over 50 and transactions over 3000", series("transactions"))).value).toBe(3000);
+    expect(threshold(thresholdOf("failed transactions over 50 and transactions over 3000", series("failed"))).value).toBe(50);
+    expect(threshold(thresholdOf("priority fees over 0.1 and fees over 1", series("fees"))).value).toBe(1);
+    expect(threshold(thresholdOf("validator memory over 100 and memory over 200", series("memory"))).value).toBe(200);
+    expect(threshold(thresholdOf("validator memory over 100 and memory over 200", series("validator_memory"))).value).toBe(100);
   });
 
   it("takes a number before a span of time for the window, not a value", () => {
@@ -363,7 +373,7 @@ describe("answerFigure", () => {
     const answer = answerFigure("when_above", series("replay"), bins, context({ threshold: over }));
     expect(answer).toMatchObject({
       label: "Over 20 ms in 1 span, 15 min in all",
-      detail: `longest t${T + 1_200_000}–t${T + 2_100_000} · by 30 s averages · 90 of 360 blocks were over`,
+      detail: `longest t${T + 1_200_000}–t${T + 2_100_000} · by 30 s averages · 90 of 360 blocks were over 20 ms`,
       mark: { threshold: 20, spans: [{ start: T + 1_200_000, end: T + 2_100_000 }] },
     });
   });
@@ -371,7 +381,7 @@ describe("answerFigure", () => {
   it("says a series was never over the value, and gives its highest", () => {
     const bins = hour(() => 8000);
     const answer = answerFigure("when_above", series("replay"), bins, context({ threshold: threshold(thresholdOf("over 20 ms", series("replay"))) }));
-    expect(answer).toMatchObject({ label: "Never over 20 ms in the past hour", detail: "highest 30 s average 8 ms · 0 of 360 blocks were over" });
+    expect(answer).toMatchObject({ label: "Never over 20 ms in the past hour", detail: "highest 30 s average 8 ms · 0 of 360 blocks were over 20 ms" });
   });
 
   it("asks for a value only where the request compared without one", () => {
@@ -392,7 +402,11 @@ describe("answerFigure", () => {
     const bins = hour((index) => (index === 100 ? 412_000 : 8000), T, 200);
     const answer = answerFigure("when_above", series("replay"), bins, context({ threshold: threshold(thresholdOf("over 200 ms", series("replay"))) }));
     expect(answer).toMatchObject({ label: "No 30 s average over 200 ms in the past hour" });
-    expect((answer as { detail: string }).detail).toContain("1 of 360 blocks was over");
+    expect((answer as { detail: string }).detail).toContain("1 of 360 blocks was over 200 ms");
+    // Counted against another value, the highest block still keeps it from "never".
+    const other = answerFigure("when_above", series("replay"), hour((index) => (index === 100 ? 412_000 : 8000)), context({ threshold: threshold(thresholdOf("over 200 ms", series("replay"))) }));
+    expect(other).toMatchObject({ label: "No 30 s average over 200 ms in the past hour" });
+    expect((other as { detail: string }).detail).not.toContain("blocks");
   });
 
   it("counts the blocks only against the value they were counted against", () => {
@@ -430,6 +444,35 @@ describe("answerFigure", () => {
     const bins = rate(2500, T + 1_800_000 - 4000);
     expect(answerFigure("lowest", series("transactions"), bins, context())).toMatchObject({ value: "250 per second" });
     expect(answerFigure("mean", series("transactions"), bins, context())).toMatchObject({ value: "250 per second" });
+  });
+
+  it("leaves a rate's part-filled spans out of when it was under a value", () => {
+    const begun = rate(2500, T + 1_800_000 - 4000);
+    const under = threshold(thresholdOf("tps under 100", series("transactions")));
+    expect(answerFigure("when_below", series("transactions"), begun, context({ threshold: under }))).toMatchObject({
+      label: `Never under 100 per second since t${T + 1_800_000 - 4000}`,
+    });
+    // A gap of a minute in the middle: the spans either side held blocks for part of their seconds.
+    const rows: [number, WireRow, number][] = [];
+    for (let time = T; time < T + 3_600_000; time += 10_000) {
+      if (time < T + 1_204_000 || time >= T + 1_264_000) rows.push([time, row(time, 1, 1, 2500), 1]);
+    }
+    const gapped = bucket(rows, slot("transactions"), T, T + 3_600_000, 120);
+    expect(answerFigure("when_below", series("transactions"), gapped, context({ threshold: under }))).toMatchObject({
+      label: "Never under 100 per second in the past hour",
+    });
+  });
+
+  it("counts blocks at least a value only where they were counted that way", () => {
+    const rows: [number, WireRow, number][] = [];
+    for (let index = 0; index < 360; index += 1) rows.push([T + index * 10_000, row(T + index * 10_000, 8000), index]);
+    const strict = bucket(rows, slot("replay"), T, T + 3_600_000, 120, 8);
+    const atLeast = threshold(thresholdOf("at least 8 ms", series("replay")));
+    expect((answerFigure("when_above", series("replay"), strict, context({ threshold: atLeast })) as { detail: string }).detail).not.toContain("blocks");
+    const inclusive = bucket(rows, slot("replay"), T, T + 3_600_000, 120, 8, true);
+    expect((answerFigure("when_above", series("replay"), inclusive, context({ threshold: atLeast })) as { detail: string }).detail).toContain(
+      "360 of 360 blocks were at least 8 ms",
+    );
   });
 
   it("does not say the history began inside the window over a few skipped slots", () => {
@@ -473,7 +516,7 @@ describe("answerFigure", () => {
   it("counts the host steps whose one-second reading crossed when no step's mean did", () => {
     const answer = answerFigure("when_above", series("cpu"), host([40, 50, 45], [60, 93, 70]), context({ threshold: threshold(thresholdOf("over 80%", series("cpu"))) }));
     expect(answer).toMatchObject({ label: "No 30 s step over 80 percent in the past hour" });
-    expect((answer as { detail: string }).detail).toContain("1 step had a one-second reading over");
+    expect((answer as { detail: string }).detail).toContain("1 step had a one-second reading over 80 percent");
   });
 
   it("names the real span of a host window the readings only partly hold", () => {

@@ -528,6 +528,7 @@ export interface BlockFigures {
   /** The value the blocks were counted against, if any, and how many were over and under it, or
    *  at least and at most it where `inclusive`. */
   threshold?: number;
+  inclusive: boolean;
   over: number;
   under: number;
 }
@@ -609,7 +610,7 @@ export function bucket(
     binMillis: width,
     first: Number.isFinite(first) ? first : from,
     blocks:
-      low && high ? { total, count: readings, mean: total / readings, low, high, threshold, over, under } : undefined,
+      low && high ? { total, count: readings, mean: total / readings, low, high, threshold, inclusive, over, under } : undefined,
   };
 }
 

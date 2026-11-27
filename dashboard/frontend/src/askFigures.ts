@@ -138,7 +138,7 @@ const TIME_UNITS: Units = [
 ];
 const PERCENT_UNITS: Units = [[/^(?:%|percent|pct)$/, SAME]];
 const MEMORY_UNITS: Units = [
-  [/^(?:gib|gigs?)$/, SAME],
+  [/^(?:gib|gigs?|g)$/, SAME],
   [/^(?:gb|gigabytes?)$/, (value) => (value * 1e9) / 2 ** 30],
   [/^(?:mib)$/, (value) => value / 1024],
   [/^(?:mb|megabytes?)$/, (value) => (value * 1e6) / 2 ** 30],
@@ -257,10 +257,19 @@ export function thresholdOf(typed: string, series: Series): ThresholdRead {
       wrong ??= read;
       continue;
     }
-    if (!named && namesSeries(lead, series)) named = read;
+    if (!named && leads(lead, series)) named = read;
     fitting ??= read;
   }
   return named ?? fitting ?? wrong;
+}
+
+/** Whether the words before a comparison name `series` itself, not a longer name holding its own,
+ *  as "failed transactions" holds "transactions". */
+function leads(lead: string, series: Series): boolean {
+  if (!namesSeries(lead, series)) return false;
+  return !SERIES.some(
+    (other) => other !== series && namesSeries(lead, other) && namesSeries(`${other.label} ${other.hint}`, series),
+  );
 }
 
 function unitShown(number: string, unit: string): string {
@@ -278,9 +287,10 @@ function comparison(found: RegExpMatchArray, series: Series): ThresholdRead {
   if (!timed && /^(?:s|secs?|seconds?)$/.test(unit)) return null;
   let value = Number(number.replace(/,/g, ""));
   if (!Number.isFinite(value)) return null;
-  if (/^(?:k|thousand)$/.test(unit)) {
+  const thousands = /^(?:k|thousand)(?:\s+|$)/.exec(unit);
+  if (thousands) {
     value *= 1000;
-    unit = "";
+    unit = unit.slice(thousands[0].length).trim();
   }
   const above = new RegExp(`^(?:${ABOVE})$`).test(comparator);
   const inclusive = new RegExp(`^(?:${ABOVE_INCLUSIVE}|${BELOW_INCLUSIVE})$`).test(comparator);
@@ -292,7 +302,7 @@ function comparison(found: RegExpMatchArray, series: Series): ThresholdRead {
   if (unit) {
     const fits = unitsOf(series.key).find(([pattern]) => pattern.test(unit));
     if (fits) factor = fits[1];
-    // A unit hard against the digits that is none of ours, as "20us" once was, is not a bare number.
+    // A unit hard against the digits that is none of ours is not a bare number.
     else if (glued || ANY_UNIT.some(([pattern]) => pattern.test(unit)) || /^per block$/.test(unit)) return notIn();
     // A word after the number that is no unit, as in "over 50 in the last hour".
     else unit = "";
@@ -553,33 +563,42 @@ export function answerFigure(operation: Operation | null, series: Series, bins: 
       }
       if ("wrong" in threshold) return { unfit: threshold.wrong };
       const words = side(threshold);
-      const spans = spansOf(bins.values, bins.from, bins.binMillis, (value) => holds(threshold, value), bins.to);
+      // A rate's spans leave out those that held blocks for only part of their seconds.
+      const spans = spansOf(drawn, bins.from, bins.binMillis, (value) => holds(threshold, value), bins.to);
       const mark = { threshold: threshold.value, spans };
       const by = `by ${span} ${series.source === "host" ? "steps" : "averages"}`;
       // Counted only where the blocks were counted against this very value.
       const counted =
-        blocks && !rate && blocks.threshold === threshold.value
+        blocks && !rate && blocks.threshold === threshold.value && blocks.inclusive === threshold.inclusive
           ? (threshold.above ? blocks.over : blocks.under)
           : null;
+      const value = withUnit(threshold.value, series.key);
       const countLine =
-        counted === null || !blocks ? null : `${figure(counted)} of ${plural(blocks.count, "block", "blocks")} ${counted === 1 ? "was" : "were"} ${words}`;
+        counted === null || !blocks
+          ? null
+          : `${figure(counted)} of ${plural(blocks.count, "block", "blocks")} ${counted === 1 ? "was" : "were"} ${words} ${value}`;
       let peaked: number | null = null;
       if (series.source === "host" && threshold.above && bins.peaks) {
         peaked = bins.peaks.filter((value) => value !== null && holds(threshold, value)).length;
       }
-      const peakLine = peaked === null ? null : `${plural(peaked, "step", "steps")} had a one-second reading ${words}`;
-      const value = withUnit(threshold.value, series.key);
+      const peakLine = peaked === null ? null : `${plural(peaked, "step", "steps")} had a one-second reading ${words} ${value}`;
       if (spans.length === 0) {
-        const extreme = threshold.above ? bins.max : bins.min;
-        // "Never" only where neither a block nor a one-second reading crossed either.
-        const never = !counted && !peaked;
+        const real = drawn.filter((one): one is number => one !== null);
+        const extreme = real.length === 0 ? null : threshold.above ? Math.max(...real) : Math.min(...real);
+        // "Never" only where no single block nor one-second reading crossed either.
+        const block = blocks && !rate ? (threshold.above ? blocks.high : blocks.low) : null;
+        const never = !(block && holds(threshold, block.value)) && !peaked;
         const where = short ? short.label : `in the ${context.window}`;
         return {
           label: never
             ? `Never ${words} ${value} ${where}`
             : `No ${span} ${series.source === "host" ? "step" : "average"} ${words} ${value} ${where}`,
           value: "",
-          detail: notes(`${threshold.above ? "highest" : "lowest"} ${span} average ${withUnit(extreme, series.key)}`, countLine, peakLine),
+          detail: notes(
+            extreme === null ? null : `${threshold.above ? "highest" : "lowest"} ${span} average ${withUnit(extreme, series.key)}`,
+            countLine,
+            peakLine,
+          ),
           warn,
           mark,
         };
