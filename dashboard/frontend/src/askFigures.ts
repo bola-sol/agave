@@ -89,6 +89,19 @@ const TOTALS: Readonly<Record<string, string>> = {
   net_out: "GB",
 };
 
+/** Series read in time, for which more is worse. */
+const TIMED = new Set(["replay", "fill"]);
+
+/** The operation for one series, set right where the model read a word of judgement as a direction:
+ *  the worst, slowest or longest of a time is its highest, the best, fastest or shortest its lowest. */
+export function directed(operation: Operation | null, typed: string, series: Series): Operation | null {
+  if ((operation !== "highest" && operation !== "lowest") || !TIMED.has(series.key)) return operation;
+  const text = typed.toLowerCase();
+  if (/\b(?:worst|slowest|longest)\b/.test(text)) return "highest";
+  if (/\b(?:best|fastest|quickest|shortest)\b/.test(text)) return "lowest";
+  return operation;
+}
+
 /** Null where the operation fits the series, otherwise why it does not. */
 export function unfit(operation: Operation, series: Series): string | null {
   if (operation === "total" && !(series.key in TOTALS)) return `A total of ${inSentence(series.label)} is not meaningful.`;
