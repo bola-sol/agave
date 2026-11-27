@@ -1,5 +1,5 @@
 /** The Ask page's own logic: what can be charted, how a typed request is read, and how the slot
- *  history and the host's readings become charts. The browser's model only picks the series. */
+ *  history and the host's readings become charts. */
 
 import { HAS_BLOCK, HAS_CLOCK, HAS_REPLAY, HAS_SHREDS, HAS_TIPS, type SlotRange, type WireRow } from "./slotHistory";
 
@@ -611,6 +611,35 @@ export function bucket(
     first: Number.isFinite(first) ? first : from,
     blocks:
       low && high ? { total, count: readings, mean: total / readings, low, high, threshold, inclusive, over, under } : undefined,
+  };
+}
+
+/** A per-slot rate's spans that held blocks for all their seconds: not the one the history begins
+ *  well inside, nor one beside a gap, each of which reads low. The newest is always empty and is no
+ *  gap. */
+export function wholeSpans(bins: Bins): (number | null)[] {
+  const last = bins.values.length - 1;
+  const gap = (index: number): boolean => index >= 0 && index < last && bins.values[index] === null;
+  const firstIndex = Math.floor((bins.first - bins.from) / bins.binMillis);
+  // A first block a tenth of a span late is the slot's own timing, not a history that began there.
+  const late = bins.first - (bins.from + firstIndex * bins.binMillis) > bins.binMillis / 10;
+  return bins.values.map((value, index) =>
+    value === null || gap(index - 1) || gap(index + 1) || (late && index === firstIndex) ? null : value,
+  );
+}
+
+/** A rate's bins as drawn: its part-filled spans left out of the line and its figures alike. */
+export function onWholeSpans(bins: Bins): Bins | null {
+  const values = wholeSpans(bins);
+  const real = values.filter((value): value is number => value !== null);
+  if (real.length === 0) return null;
+  return {
+    ...bins,
+    values,
+    min: Math.min(...real),
+    max: Math.max(...real),
+    mean: real.reduce((sum, value) => sum + value, 0) / real.length,
+    latest: real[real.length - 1],
   };
 }
 

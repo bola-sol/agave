@@ -1,7 +1,7 @@
 /** Figures the Ask page works out beside a chart: a total, a mean, a peak, a share, or when a series
  *  was over or under a value. The model only names the operation; the value is read here. */
 
-import { figure, namesSeries, SERIES, type Bins, type Series } from "./ask";
+import { figure, namesSeries, SERIES, wholeSpans, type Bins, type Series } from "./ask";
 
 export const OPERATIONS = ["chart", "total", "mean", "highest", "lowest", "share", "when_above", "when_below"] as const;
 
@@ -276,13 +276,23 @@ export function thresholdOf(typed: string, series: Series): ThresholdRead {
   return named ?? fitting ?? wrong;
 }
 
-/** Whether the words before a comparison name `series` itself, not a longer name holding its own,
- *  as "failed transactions" holds "transactions". */
+/** Each series whose name holds another's, as "failed transactions" holds "transactions". */
+const HOLDS: Readonly<Record<string, string>> = {
+  failed: "transactions",
+  votes: "transactions",
+  priority_fees: "fees",
+  validator_memory: "memory",
+  repaired: "shreds",
+  recovered: "shreds",
+};
+
+/** Whether the words before a comparison name `series` itself, not a longer name holding its own. */
 function leads(lead: string, series: Series): boolean {
   if (!namesSeries(lead, series)) return false;
-  return !SERIES.some(
-    (other) => other !== series && namesSeries(lead, other) && namesSeries(`${other.label} ${other.hint}`, series),
-  );
+  return !Object.entries(HOLDS).some(([longer, held]) => {
+    const other = byKey(longer);
+    return held === series.key && other !== undefined && namesSeries(lead, other);
+  });
 }
 
 function unitShown(number: string, unit: string): string {
@@ -464,17 +474,6 @@ function hostTotal(bins: Bins, key: string): { total: number; near: boolean } {
   return { total: key === "net_in" || key === "net_out" ? total / 1000 : total, near };
 }
 
-/** A per-slot rate's spans that held blocks for all their seconds: not the one the history begins
- *  in, nor one beside a gap, each of which reads low. The newest is always empty and is no gap. */
-function wholeSpans(bins: Bins): (number | null)[] {
-  const last = bins.values.length - 1;
-  const gap = (index: number): boolean => index >= 0 && index < last && bins.values[index] === null;
-  const firstIndex = Math.floor((bins.first - bins.from) / bins.binMillis);
-  return bins.values.map((value, index) =>
-    value === null || gap(index - 1) || gap(index + 1) || (bins.first > bins.from && index === firstIndex) ? null : value,
-  );
-}
-
 /** A per-block series' unit, read per block. */
 const perBlock = (key: string): string => (UNIT[key] === "per block" ? "per block" : `${UNIT[key]} per block`);
 
@@ -608,7 +607,9 @@ export function answerFigure(operation: Operation | null, series: Series, bins: 
             : `No ${span} ${series.source === "host" ? "step" : "average"} ${words} ${value} ${where}`,
           value: "",
           detail: notes(
-            extreme === null ? null : `${threshold.above ? "highest" : "lowest"} ${span} average ${withUnit(extreme, series.key)}`,
+            extreme === null
+              ? null
+              : `${threshold.above ? "highest" : "lowest"} ${span} ${series.source === "host" ? "step" : "average"} ${withUnit(extreme, series.key)}`,
             countLine,
             peakLine,
           ),

@@ -12172,6 +12172,16 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* Heard, not seen: the card's figures for a screen reader. */
+.ask-announce {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .ask-unfit {
   margin: 0;
   font-size: 12px;
