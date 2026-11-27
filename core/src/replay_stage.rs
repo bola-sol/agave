@@ -29,7 +29,9 @@ use {
                 AncestorDuplicateSlotsReceiver, DumpedSlotsSender, PopularPrunedForksReceiver,
             },
         },
-        replay_stage::events::{BankFrozenEvent, FrozenOutput, SlotEvent},
+        replay_stage::events::{
+            BankFrozenEvent, FrozenOutput, ReplayCounts, SlotEvent, SlotStatsEvent,
+        },
         unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
         voting_service::VoteOp,
         window_service::DuplicateSlotReceiver,
@@ -862,6 +864,16 @@ impl ReplayStage {
                 },
             )
             .map_err(|err| format!("Failed to create replay bank-frozen stream: {err}"))?;
+        let slot_stats_factory = event_system
+            .create_stream::<SlotStatsEvent>(
+                events::SLOT_STATS_STREAM,
+                StreamConfig {
+                    capacity: 1024,
+                    publisher_slots: 1,
+                    subscriber_slots: 8,
+                },
+            )
+            .map_err(|err| format!("Failed to create replay slot-stats stream: {err}"))?;
         let (frozen_bank_events, frozen_bank_sender) =
             FrozenBankEvents::new(event_system, bank_forks.clone(), exit.clone())?;
         let blocks_factory = event_system
@@ -893,6 +905,9 @@ impl ReplayStage {
                 .expect("fresh replay stream has one publisher slot");
             let mut frozen_output = FrozenOutput {
                 publisher: bank_frozen_factory
+                    .try_create_publisher()
+                    .expect("fresh replay stream has one publisher slot"),
+                stats: slot_stats_factory
                     .try_create_publisher()
                     .expect("fresh replay stream has one publisher slot"),
                 blocks: blocks_factory
@@ -4565,6 +4580,17 @@ impl ReplayStage {
                     r_replay_progress.num_entries,
                     r_replay_progress.num_shreds,
                     bank_complete_time.as_us(),
+                    completed_replay.is_unified_scheduler_enabled,
+                );
+                frozen_output.slot_stats(
+                    bank,
+                    &r_replay_stats,
+                    ReplayCounts {
+                        transactions: r_replay_progress.num_txs,
+                        entries: r_replay_progress.num_entries,
+                        shreds: r_replay_progress.num_shreds,
+                        bank_complete_us: bank_complete_time.as_us(),
+                    },
                     completed_replay.is_unified_scheduler_enabled,
                 );
             } else {
