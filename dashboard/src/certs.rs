@@ -6,7 +6,7 @@ pub use crate::blocks::{Block, FooterFacts, carried_fast, read_block};
 use {
     crate::source::{BankView, Source},
     agave_votor_messages::reward_certificate::NUM_SLOTS_FOR_REWARD,
-    serde::Serialize,
+    serde::{Deserialize, Serialize},
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
     solana_signer_store::{Decoded, decode},
@@ -34,7 +34,7 @@ const PENDING_VOTES: usize = 4096;
 const LOST_LEADERS: usize = 3;
 
 /// The certificate for slot N can only be written by the leader of slot N+8.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reward {
     Paid,

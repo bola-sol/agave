@@ -1,12 +1,15 @@
-//! Our blocks, turns, per-slot reports and host readings read back from the rewind log at startup,
-//! so a restart keeps the slot page's history and the host's.
+//! Our blocks, turns, per-slot reports, every slot's row and host readings read back from the rewind
+//! log at startup, so a restart keeps the history the pages draw.
 
 use {
     crate::{
+        catch_up::IN_STEP_SLOTS,
+        history::{PACKED_SLOTS, ReadBack},
         host_history::HostHistory,
         metrics_tap::{SlotCost, SlotWaterfall, keep_newest},
         produced::{BlockFees, MAX_HELD_BLOCKS, ProducedBlock},
         rewind_log::RewindLog,
+        slots::SlotEntry,
         turns::LeaderTurn,
     },
     serde::de::DeserializeOwned,
@@ -15,6 +18,8 @@ use {
 };
 
 const PREFIX: &str = r#"{"topic":"summary","key":""#;
+
+const SLOT_PREFIX: &str = r#"{"topic":"slot","key":""#;
 
 const VALUE: &str = r#"","value":"#;
 
@@ -29,6 +34,10 @@ pub struct Refilled {
     /// The host's readings, binned by when each was recorded; `None` with none read, and once the
     /// service has taken them.
     pub host: Option<HostHistory>,
+    /// Every slot's row as last recorded; `None` with none read, and once the service has taken it.
+    pub slots: Option<SlotFill>,
+    /// Slots read back below rooted, newest first, for the collector to have the ledger judge.
+    pub unsettled: Vec<Slot>,
     pub segments: usize,
     /// Lines with one of our keys that did not parse.
     pub unread: usize,
@@ -60,6 +69,63 @@ pub fn read(log: &RewindLog, segments: &[(u64, u64, usize)], stop: impl Fn() -> 
     refilled
 }
 
+/// A slot line's key and its value's text.
+fn split_slot(line: &str) -> Option<(&str, &str)> {
+    let (_, json) = line.split_once(' ')?;
+    let (key, value) = json.strip_prefix(SLOT_PREFIX)?.split_once(VALUE)?;
+    Some((key, value.strip_suffix('}')?))
+}
+
+/// The slot rows a recording holds, and which run of the process is being read and whether it was
+/// still catching up then. A run begins where the start time changes.
+pub struct SlotFill {
+    pub read_back: ReadBack,
+    run: u16,
+    started: Option<u64>,
+    catching_up: bool,
+    caught: bool,
+    /// Slot entries read, and those that did not parse.
+    pub entries: usize,
+}
+
+impl SlotFill {
+    fn new() -> Self {
+        Self {
+            read_back: ReadBack::new(PACKED_SLOTS),
+            run: 0,
+            started: None,
+            catching_up: false,
+            caught: false,
+            entries: 0,
+        }
+    }
+
+    fn note_start(&mut self, nanos: u64) {
+        if self.started != Some(nanos) {
+            self.started = Some(nanos);
+            self.run = self.run.wrapping_add(1);
+            self.catching_up = false;
+            self.caught = false;
+        }
+    }
+
+    fn note_behind(&mut self, behind: Option<u64>) {
+        if !self.caught && behind.is_some_and(|slots| slots > IN_STEP_SLOTS) {
+            self.catching_up = true;
+        }
+    }
+
+    fn note_caught(&mut self) {
+        self.caught = true;
+        self.catching_up = false;
+    }
+
+    fn apply(&mut self, entry: &SlotEntry) {
+        self.read_back.apply(entry, self.run, self.catching_up);
+        self.entries = self.entries.saturating_add(1);
+    }
+}
+
 /// When a summary line was recorded, its key and its value's text, the rest unparsed.
 fn split(line: &str) -> Option<(u64, &str, &str)> {
     let (at_ms, json) = line.split_once(' ')?;
@@ -75,9 +141,15 @@ impl Refilled {
     /// `opening` for a line of a segment's own copy of what a joining page is sent.
     fn apply(&mut self, line: &str, opening: bool) {
         let Some((at_ms, key, value)) = split(line) else {
+            self.apply_slot(line);
             return;
         };
         let read = match key {
+            "startup_time_nanos" => parse(value).map(|nanos: u64| self.fill().note_start(nanos)),
+            "behind_cluster" => {
+                parse(value).map(|behind: Option<u64>| self.fill().note_behind(behind))
+            }
+            "caught_up_time_nanos" => parse(value).map(|_: u64| self.fill().note_caught()),
             "host" | "network" | "ingest_paths" => self
                 .host
                 .get_or_insert_with(HostHistory::new)
@@ -123,6 +195,30 @@ impl Refilled {
         }
     }
 
+    fn fill(&mut self) -> &mut SlotFill {
+        self.slots.get_or_insert_with(SlotFill::new)
+    }
+
+    /// A slot's entry, or the overview of the newest, each as the collector last sent it.
+    fn apply_slot(&mut self, line: &str) {
+        let Some((key, value)) = split_slot(line) else {
+            return;
+        };
+        let read = match key {
+            "update" => parse(value).map(|entry: SlotEntry| self.fill().apply(&entry)),
+            "overview" => parse(value).map(|entries: Vec<SlotEntry>| {
+                let fill = self.fill();
+                for entry in &entries {
+                    fill.apply(entry);
+                }
+            }),
+            _ => return,
+        };
+        if read.is_none() {
+            self.unread = self.unread.saturating_add(1);
+        }
+    }
+
     /// The newest blocks as the store held them, so one missing from their span had been dropped.
     fn whole(&mut self, list: Vec<ProducedBlock>) {
         let (Some(first), Some(last)) = (list.first(), list.last()) else {
@@ -159,7 +255,7 @@ mod tests {
         crate::{
             metrics_tap::{SchedulerSource, SchedulerTotals},
             produced::{sample_block as block, tests::turn},
-            proto::{Publisher, TOPIC_SUMMARY},
+            proto::{Publisher, TOPIC_SLOT, TOPIC_SUMMARY},
             rewind_log::{Recorder, Settings},
         },
         std::{
@@ -505,6 +601,140 @@ mod tests {
             max[9] = Some(10.0);
             max
         });
+    }
+
+    fn slot_entry(slot: Slot, level: crate::slots::SlotLevel, fees: Option<u64>) -> SlotEntry {
+        SlotEntry {
+            slot,
+            level,
+            mine: false,
+            block: fees.map(|total_fees| crate::slots::BlockDetail {
+                transactions: 100,
+                non_vote_transactions: 40,
+                failed_transactions: 1,
+                entries: 0,
+                block_cost: 1_000,
+                block_cost_limit: 60_000_000,
+                account_cost_limit: 12_000_000,
+                total_fees,
+                priority_fees: 0,
+                tips: None,
+                replay_micros: Some(8_000),
+            }),
+            duration_nanos: None,
+            time_millis: Some(1_000_000),
+            shreds: None,
+            replayed_millis: None,
+            reward: None,
+            left_out: None,
+        }
+    }
+
+    fn row(refilled: &Refilled, slot: Slot) -> crate::history::PackedSlot {
+        *refilled
+            .slots
+            .as_ref()
+            .expect("slots read")
+            .read_back
+            .history()
+            .get(slot)
+            .expect("slot held")
+    }
+
+    #[test]
+    fn test_each_slot_reads_back_as_its_last_line_left_it() {
+        use crate::{history::HAS_BLOCK, slots::SlotLevel};
+
+        let dir = tempfile::tempdir().unwrap();
+        let refilled = record(dir.path(), |publisher, step| {
+            publisher.publish(TOPIC_SUMMARY, "startup_time_nanos", &1u64);
+            publisher.publish_update(
+                TOPIC_SLOT,
+                "update",
+                10,
+                &slot_entry(10, SlotLevel::Incomplete, None),
+            );
+            step();
+            publisher.publish_update(
+                TOPIC_SLOT,
+                "update",
+                10,
+                &slot_entry(10, SlotLevel::Finalized, Some(500)),
+            );
+            publisher.publish_update(TOPIC_SLOT, "update", 11, &"not an entry");
+            step();
+        });
+        let ten = row(&refilled, 10);
+        assert_eq!((ten.level, ten.fees), (SlotLevel::Finalized as u8, 500));
+        assert_ne!(ten.flags & HAS_BLOCK, 0);
+        assert_eq!(ten.time_millis, 1_000_000);
+        assert_eq!(refilled.unread, 1);
+    }
+
+    #[test]
+    fn test_a_later_run_keeps_a_full_row_and_marks_what_it_replayed_catching_up() {
+        use crate::{history::CATCH_UP, slots::SlotLevel};
+
+        let dir = tempfile::tempdir().unwrap();
+        record_from(dir.path(), 1_000_000, |publisher, step| {
+            publisher.publish(TOPIC_SUMMARY, "startup_time_nanos", &1u64);
+            publisher.publish(TOPIC_SUMMARY, "caught_up_time_nanos", &1u64);
+            publisher.publish_update(
+                TOPIC_SLOT,
+                "update",
+                10,
+                &slot_entry(10, SlotLevel::Finalized, Some(500)),
+            );
+            step();
+        });
+        let refilled = record_from(dir.path(), 1_100_000, |publisher, step| {
+            publisher.publish(TOPIC_SUMMARY, "startup_time_nanos", &2u64);
+            publisher.publish(TOPIC_SUMMARY, "behind_cluster", &Some(50u64));
+            // The seam: the clock walk's line for a slot the first run held whole.
+            publisher.publish_update(
+                TOPIC_SLOT,
+                "update",
+                10,
+                &slot_entry(10, SlotLevel::Skipped, None),
+            );
+            publisher.publish_update(
+                TOPIC_SLOT,
+                "update",
+                11,
+                &slot_entry(11, SlotLevel::Finalized, Some(600)),
+            );
+            step();
+            publisher.publish(TOPIC_SUMMARY, "caught_up_time_nanos", &2u64);
+            publisher.publish_update(
+                TOPIC_SLOT,
+                "update",
+                12,
+                &slot_entry(12, SlotLevel::Finalized, Some(700)),
+            );
+            step();
+        });
+        assert_eq!(row(&refilled, 10).fees, 500);
+        assert_ne!(row(&refilled, 11).flags & CATCH_UP, 0);
+        assert_eq!(row(&refilled, 12).flags & CATCH_UP, 0);
+    }
+
+    #[test]
+    fn test_a_run_that_starts_in_step_marks_nothing_as_catching_up() {
+        use crate::{history::CATCH_UP, slots::SlotLevel};
+
+        let dir = tempfile::tempdir().unwrap();
+        let refilled = record(dir.path(), |publisher, step| {
+            publisher.publish(TOPIC_SUMMARY, "startup_time_nanos", &1u64);
+            publisher.publish(TOPIC_SUMMARY, "behind_cluster", &Some(1u64));
+            publisher.publish_update(
+                TOPIC_SLOT,
+                "update",
+                10,
+                &slot_entry(10, SlotLevel::Finalized, Some(500)),
+            );
+            step();
+        });
+        assert_eq!(row(&refilled, 10).flags & CATCH_UP, 0);
     }
 
     #[test]

@@ -184,8 +184,11 @@ somebody watches runs all the time. A page reaches further back than its own
 fifteen minutes by fetching the blocks it needs, and restarts show as gaps.
 At startup the dashboard reads the recording back for our blocks, turns,
 waterfalls, costs and fee tables, so the Slots page keeps them across a restart,
-and for the host's readings, which `host.range` answers from; without the flag
-those begin again at each start.
+for every slot's row in the slot history, which the Schedule, its searches and
+the Ask page read, and for the host's readings, which `host.range` answers from;
+without the flag those begin again at each start. The notarized stake and the
+finalization path come from block footers and are not recorded, so the Cluster
+page's Notarized Stake and Fast Finalization still begin at the restart.
 Without the flag nothing is written and a page rewinds no further back than
 when it was opened. Replies to requests are not recorded, so schedule searches,
 the Gossip peer table and certificate lists and the Cluster charts are not

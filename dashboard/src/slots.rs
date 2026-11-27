@@ -2,12 +2,12 @@
 
 use {
     crate::certs::Reward,
-    serde::Serialize,
+    serde::{Deserialize, Serialize},
     solana_clock::Slot,
     std::collections::{BTreeMap, btree_map::Entry},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlotLevel {
     Incomplete,
@@ -18,7 +18,7 @@ pub enum SlotLevel {
     Skipped,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlotEntry {
     pub slot: Slot,
     pub level: SlotLevel,
@@ -37,7 +37,7 @@ pub struct SlotEntry {
 }
 
 /// Apart from the block because a slot fills before it freezes, and a dead slot never freezes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShredArrival {
     pub count: u64,
     pub repaired: u64,
@@ -46,7 +46,7 @@ pub struct ShredArrival {
     pub full_millis: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockDetail {
     pub transactions: u64,
     pub non_vote_transactions: u64,

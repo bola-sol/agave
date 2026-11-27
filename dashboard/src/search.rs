@@ -1064,7 +1064,7 @@ impl Sums {
         }
         // A span from catching up measures the backlog, not replay.
         self.replay
-            .add(replay_millis(row).filter(|_| slot >= history.live_from()));
+            .add(replay_millis(row).filter(|_| history.replay_counts(slot, row)));
         self.base_fee
             .add(block.then(|| row.fees.saturating_sub(row.priority_fees)));
         self.priority_fee.add(block.then_some(row.priority_fees));
