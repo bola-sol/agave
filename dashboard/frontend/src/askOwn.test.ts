@@ -5,10 +5,12 @@ import {
   asksEarned,
   asksProduction,
   earningsLine,
+  epochAsked,
   inWindow,
   ownFigure,
   ownLabel,
   ownScope,
+  ownThresholdOf,
   ownValue,
   production,
   readOwnBlocks,
@@ -79,6 +81,13 @@ describe("ownScope", () => {
     }
   });
 
+  it("reads an epoch named by word", () => {
+    expect(epochAsked("what did we earn last epoch")).toBe("last");
+    expect(epochAsked("fees from our blocks in the previous epoch")).toBe("last");
+    expect(epochAsked("our fees this epoch")).toBe("this");
+    expect(epochAsked("our fees in the last hour")).toBeNull();
+  });
+
   it("tells earning and production requests apart", () => {
     expect(asksEarned("how much did we earn")).toBe(true);
     expect(asksEarned("fees from our blocks")).toBe(false);
@@ -131,9 +140,22 @@ describe("ownFigure", () => {
     });
   });
 
-  it("says when there are no blocks of ours, or no tips read", () => {
-    expect(ownFigure("total", series("fees"), [], undefined, context())).toEqual({ unfit: "No blocks of ours in the epoch 1093 so far." });
+  it("says when there are no blocks of ours, and only then whether tips are read", () => {
+    expect(ownFigure("total", series("fees"), [], undefined, context())).toEqual({ unfit: "No blocks of ours, epoch 1093 so far." });
+    expect(ownFigure("total", series("tips"), [], undefined, context())).toEqual({ unfit: "No blocks of ours, epoch 1093 so far." });
     expect(ownFigure("total", series("tips"), held, undefined, context())).toEqual({ unfit: "Tips are not read on this build." });
+    // A build that reads tips gives a figure.
+    const tipped = held.map((one) => ({ ...one, tips: 1_000_000 }));
+    expect(ownFigure("total", series("tips"), tipped, { jito_cut_bps: 300, commission_bps: 800 }, context())).toHaveProperty("value");
+  });
+
+  it("reads a transactions value per block, as our blocks give it", () => {
+    const over = ownThresholdOf("our blocks with transactions over 1,015 per block", series("transactions"));
+    expect(over).toMatchObject({ value: 1015, above: true });
+    expect(ownFigure("when_above", series("transactions"), held, undefined, context({ threshold: over }))).toMatchObject({
+      label: "1 of our 3 blocks over 1,015 per block",
+    });
+    expect(ownThresholdOf("transactions over 1500 tps in our blocks", series("transactions"))).toHaveProperty("wrong");
   });
 
   it("carries a shortfall of blocks held", () => {
@@ -159,6 +181,11 @@ describe("production", () => {
       warn: false,
     });
     expect(production(undefined, { window: "epoch 1093", short: null })).toEqual({ unfit: "The leader slot counts for that epoch are not held." });
+    // After a restart with a short ledger: only 100 of the 400 passed are answered.
+    expect(production({ epoch: 1093, slots: 400, passed: 400, produced: 95, skipped: 5 }, { window: "epoch 1093", short: null })).toMatchObject({
+      value: "95 of 100 produced",
+      detail: "5 skipped · 5% skip rate · 300 too old for the slot history",
+    });
   });
 });
 
@@ -193,7 +220,29 @@ describe("readOwnBlocks", () => {
     const read = await readOwnBlocks(page, { kind: "epoch", epoch: 1, first: 7, last: 100 });
     expect(read.blocks.map((one) => one.slot)).toEqual([8, 10, 12]);
     expect(asked).toEqual([undefined, 10]);
-    expect(read.held).toBe(6);
+    expect(read.reached).toBe(true);
+  });
+
+  it("says when the list runs out before the window, and stops at a time window's start", async () => {
+    const short = await readOwnBlocks(pages([8, 10, 12]).page, { kind: "epoch", epoch: 1, first: 2, last: 100 });
+    expect(short).toMatchObject({ reached: false });
+    expect(short.blocks.map((one) => one.slot)).toEqual([8, 10, 12]);
+    const { asked, page } = pages([2, 4, 6, 8, 10, 12]);
+    const timed = await readOwnBlocks(page, { kind: "time", from: T + 9 * 400, to: T + 100 * 400 });
+    expect(timed.blocks.map((one) => one.slot)).toEqual([10, 12]);
+    expect(timed.reached).toBe(true);
+    expect(asked).toEqual([undefined, 10]);
+    const capped = await readOwnBlocks(pages([2, 4, 6, 8, 10, 12]).page, { kind: "epoch", epoch: 1, first: 0, last: 100 }, 2);
+    expect(capped).toMatchObject({ reached: false });
+  });
+
+  it("fails on a refused page rather than giving a short list", async () => {
+    let calls = 0;
+    const refused = (): Promise<FiguresPage | null> => {
+      calls += 1;
+      return calls === 1 ? pages([2, 4, 6, 8, 10, 12]).page(undefined) : Promise.resolve(null);
+    };
+    await expect(readOwnBlocks(refused, { kind: "epoch", epoch: 1, first: 0, last: 100 })).rejects.toThrow();
   });
 
   it("takes a time window by each block's time", () => {

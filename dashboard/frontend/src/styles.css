@@ -12136,8 +12136,10 @@ body {
   white-space: nowrap;
 }
 
-.ask-windows {
+.ask-windows,
+.ask-scope {
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .ask-headline {
@@ -12273,10 +12275,6 @@ body {
   fill: color-mix(in srgb, var(--flow) 55%, var(--panel));
 }
 
-.ask-scope {
-  font-size: 11px;
-}
-
 /* The spans a condition held: terracotta, as the accent means "now". */
 .ask-span {
   fill: color-mix(in srgb, var(--warn) 16%, transparent);
@@ -12316,7 +12314,8 @@ body {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .ask-windows {
+  .ask-windows,
+  .ask-scope {
     margin-left: 0;
   }
 
