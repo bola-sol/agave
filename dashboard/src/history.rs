@@ -237,10 +237,8 @@ impl SlotHistory {
         row.left_out = entry.left_out.unwrap_or(0);
     }
 
-    /// Takes each slot `older` holds into cells from `from`, `count` at a time so a reader is not
-    /// held up for the whole ring. A slot this run has the block of keeps it, a newer lap keeps
-    /// its cell, and a slot this run holds without a block takes the recorded row with this run's
-    /// footer marks and clock. Returns how many rows it took.
+    /// Takes the slots `older` holds into cells from `from`, `count` at a time, and returns how many.
+    /// A cell with this run's block or a newer lap stays; any other takes the recorded row with this run's footer and clock.
     pub fn merge_read_back(&mut self, older: &SlotHistory, from: usize, count: usize) -> usize {
         if older.rows.len() != self.rows.len() {
             return 0;

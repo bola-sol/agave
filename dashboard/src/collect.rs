@@ -2703,8 +2703,9 @@ fn judge_slots(
             waiting.push(slot);
             continue;
         }
+        // Finalized, as a live row at or below the root rests.
         let level = if is_root(slot) {
-            SlotLevel::Rooted
+            SlotLevel::Finalized
         } else {
             SlotLevel::Skipped
         };
@@ -4401,7 +4402,7 @@ mod tests {
             history.settle(slot, level);
         }
         let level = |slot: Slot| history.get(slot).map(|row| row.level);
-        assert_eq!(level(4), Some(SlotLevel::Rooted as u8));
+        assert_eq!(level(4), Some(SlotLevel::Finalized as u8));
         assert_eq!(level(5), Some(SlotLevel::Skipped as u8));
         // Below the ledger it stays as recorded; above the root it waits.
         assert_eq!(level(2), Some(SlotLevel::Completed as u8));
