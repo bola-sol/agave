@@ -25,10 +25,14 @@ const EARNING = /\bearn\w*|\bincome\b|\brevenue\b|\bpaying\s+us\b|\bpaid\s+us\b|
 
 const PRODUCTION = /\bproduc\w*|\bskip(?:ped|s)?\b|\bleader\s+slots?\b|\bskip\s+rate\b/;
 
+/** A skip with "we" or "our" anywhere is ours: no other leader's skips are asked that way. */
+const SKIP = /\bskip(?:ped|s|ping)?\b/;
+const WE = /\b(?:we|us|our|i|my)\b/;
+
 /** Whether a request asks about this validator's own blocks. */
 export function ownScope(typed: string): boolean {
   const text = typed.toLowerCase();
-  return EARNING.test(text) || OWN.some((pattern) => pattern.test(text));
+  return EARNING.test(text) || OWN.some((pattern) => pattern.test(text)) || (SKIP.test(text) && WE.test(text));
 }
 
 /** Whether a request asks what this validator earned. */

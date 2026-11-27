@@ -116,6 +116,8 @@ export function AskPage(): ReactElement {
   const [items, setItems] = useState<Item[]>([]);
   const nextId = useRef(1);
   const stop = useRef<AbortController | null>(null);
+  const input = useRef<HTMLInputElement>(null);
+  const answers = useRef<HTMLDivElement>(null);
 
   const ready = model.state === "ready";
   useEffect(() => {
@@ -168,7 +170,10 @@ export function AskPage(): ReactElement {
       );
     });
     void askModel.pickSeries(request, controller.signal).then((picked) => {
-      if (picked.kind === "series") {
+      // A question about our leader slots takes no series the request does not name, as "skips" is none.
+      const production = asksProduction(request);
+      const unnamed = picked.kind === "series" && !picked.series.some((series) => namesSeries(request, series));
+      if (picked.kind === "series" && !(production && unnamed)) {
         settle({
           kind: "charts",
           charts: picked.series.map((series) => ({ series, closest: !namesSeries(request, series) })),
@@ -182,7 +187,7 @@ export function AskPage(): ReactElement {
         return;
       }
       // Our leader slots and what we earned are answered without a series of the slot history.
-      if (picked.kind === "none" && (asksProduction(request) || asksEarned(request))) {
+      if (picked.kind !== "failed" && (production || asksEarned(request))) {
         settle({
           kind: "charts",
           charts: [],
@@ -196,8 +201,25 @@ export function AskPage(): ReactElement {
       }
       // Nothing to work a figure out for.
       controller.abort();
-      if (picked.kind === "none") settle({ kind: "none" });
-      else settle(picked.reason === "stopped" ? null : { kind: "failed", reason: picked.reason });
+      if (picked.kind === "failed") settle(picked.reason === "stopped" ? null : { kind: "failed", reason: picked.reason });
+      else settle({ kind: "none" });
+    });
+  };
+
+  const close = (id: number): void => {
+    const at = items.findIndex((item) => item.id === id);
+    const item = items[at];
+    if (!item) return;
+    // A request still being read is stopped, so the box opens again.
+    if (item.answer.kind === "asking" || (item.answer.kind === "charts" && item.answer.operation === "pending")) {
+      stop.current?.abort();
+    }
+    setItems((held) => held.filter((one) => one.id !== id));
+    // The focus goes to the next answer's close button, or back to the box.
+    const next = items[at + 1] ?? items[at - 1];
+    requestAnimationFrame(() => {
+      const button = next && answers.current?.querySelector<HTMLButtonElement>(`[data-item="${next.id}"] > .ask-close`);
+      (button ?? input.current)?.focus();
     });
   };
 
@@ -226,6 +248,7 @@ export function AskPage(): ReactElement {
         </div>
         <form className="ask-form" onSubmit={submit}>
           <input
+            ref={input}
             className="ask-input"
             type="search"
             value={typed}
@@ -248,12 +271,25 @@ export function AskPage(): ReactElement {
         </div>
         {!ready && <AskDownload model={model} />}
       </section>
-      <div className="ask-answers">
+      <div className="ask-answers" ref={answers}>
         {items.map((item) => (
-          <Answer key={item.id} item={item} />
+          <div key={item.id} className="ask-item" data-item={item.id}>
+            <Answer item={item} />
+            <CloseAnswer id={item.id} onClose={close} />
+          </div>
         ))}
       </div>
     </div>
+  );
+}
+
+function CloseAnswer({ id, onClose }: { id: number; onClose: (id: number) => void }): ReactElement {
+  return (
+    <button type="button" className="ask-close" aria-label="Close this answer" title="Close" onClick={() => onClose(id)}>
+      <svg viewBox="0 0 12 12" aria-hidden="true">
+        <path d="M2 2l8 8M10 2l-8 8" />
+      </svg>
+    </button>
   );
 }
 
