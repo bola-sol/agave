@@ -181,7 +181,7 @@ describe("createAskModel", () => {
   });
 
   it("fails without a second try on an answer outside the schema", async () => {
-    const { api, counts } = fake("available", ['{"series":["cpu"]}']);
+    const { api, counts } = fake("available", ['{"series":["gpu"]}']);
     const model = createAskModel(() => api, () => true);
     await settled(model);
     expect(await model.pickSeries("cpu")).toEqual({ kind: "failed", reason: "model" });

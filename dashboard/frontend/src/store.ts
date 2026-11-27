@@ -3,6 +3,7 @@
 
 import type { BlockReply, RangeReply } from "./archive";
 import { leaderAt, NO_LEADER, type LeaderRef } from "./schedule";
+import type { HostRange } from "./ask";
 import type { SlotRange } from "./slotHistory";
 import type { ServerCondition } from "./scheduleConditions";
 import type { Only, SlowCutOffs } from "./scheduleFilters";
@@ -48,6 +49,10 @@ export interface ScanParams {
 /** Each request the server answers, as `topic.key`, with its parameters and reply. */
 export interface Requests {
   "slot.range": { params: { first_slot: number; count: number }; reply: SlotRange };
+  "host.range": {
+    params: { series: readonly string[]; from: number; to: number; points: number };
+    reply: HostRange | null;
+  };
   "slot.search": {
     params: ScanParams & { forward: boolean; until_millis: number | null };
     reply: { turns: SlotRange[]; next: number | null; slow: SlowCutOffs | null };
