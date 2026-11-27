@@ -1,7 +1,7 @@
 /** The Ask page's answers about this validator's own blocks: which requests mean them, and figures
  *  over the blocks it built and the cluster kept, by the Slots page's own arithmetic. */
 
-import { figure, type Series } from "./ask";
+import { amount, figure, type Series } from "./ask";
 import { lasting, thresholdOf, type Answered, type Operation, type Threshold, type ThresholdRead } from "./askFigures";
 import { earningsTotal } from "./earnings";
 import { headOf } from "./producedIndex";
@@ -81,13 +81,8 @@ export function ownThresholdOf(typed: string, series: Series): ThresholdRead {
   );
 }
 
-/** A reading as shown: SOL below one keeps three significant digits, since one block earns little. */
-export function ownAmount(value: number, unit: string): string {
-  if (unit.startsWith("SOL") && value !== 0 && Math.abs(value) < 1) {
-    return value.toLocaleString("en-US", { maximumSignificantDigits: 3 });
-  }
-  return figure(value);
-}
+/** A reading as shown, small SOL figures to three significant digits. */
+export const ownAmount = amount;
 
 /** One block's reading of a series, in the unit shown, or null where the block list lacks it. */
 export function ownValue(key: string, block: BlockHead, rates: TipRates | undefined): number | null {
@@ -286,8 +281,8 @@ export function production(counts: LeaderSlotCounts | undefined, context: { wind
     label: `Our leader slots, ${context.window}`,
     value: `${figure(counts.produced)} of ${figure(answered)} produced`,
     detail: [
-      `${figure(counts.skipped)} skipped`,
-      answered > 0 ? `${figure((counts.skipped / answered) * 100)}% skip rate` : null,
+      counts.skipped === 0 ? "no skips" : `${figure(counts.skipped)} skipped`,
+      answered > 0 && counts.skipped > 0 ? `${figure((counts.skipped / answered) * 100)}% skip rate` : null,
       unread > 0 ? `${figure(unread)} too old for the slot history` : null,
       toCome > 0 ? `${figure(toCome)} to come` : null,
       context.short,

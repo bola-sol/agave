@@ -4,6 +4,7 @@
 
 import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactElement } from "react";
 import {
+  amount,
   asksWhy,
   BIN_COUNT,
   bucket,
@@ -175,6 +176,19 @@ export function AskPage(): ReactElement {
           asked: windowOf(picked.series.reduce((text, series) => withoutThreshold(text, series), request)),
           pickedMillis: performance.now() - began,
           note: notDrawnNote(leftOut(request, picked.series, SERIES), picked.unmatched),
+          operation,
+          operationMillis,
+        });
+        return;
+      }
+      // Our leader slots and what we earned are answered without a series of the slot history.
+      if (picked.kind === "none" && (asksProduction(request) || asksEarned(request))) {
+        settle({
+          kind: "charts",
+          charts: [],
+          asked: windowOf(request),
+          pickedMillis: performance.now() - began,
+          note: null,
           operation,
           operationMillis,
         });
@@ -370,6 +384,8 @@ function ScopedAnswer({ typed, answer }: { typed: string; answer: ChartsAnswered
   }, [scope]);
   const toggle = ownable ? <ScopeToggle scope={scope} onScope={choose} /> : null;
   if (!ownable) return <ChartsAnswer typed={typed} answer={answer} toggle={null} />;
+  // With no series, every leader has nothing to draw.
+  if (answer.charts.length === 0) return <OwnAnswer typed={typed} answer={answer} toggle={null} />;
   return (
     <div ref={holder} className="ask-scoped">
       {shown.has("ours") && (
@@ -990,16 +1006,16 @@ function SeriesPanel({
       {bins ? (
         <>
           <div className="ask-figures">
-            <Figure label="Latest" value={bins.latest} />
-            <Figure label={blocks ? "Mean per block" : "Mean"} value={blocks ? blocks.mean : bins.mean} />
-            <Figure label={blocks ? "Lowest block" : "Lowest"} value={blocks ? blocks.low.value : bins.min} />
+            <Figure label="Latest" value={bins.latest} unit={series.unit} />
+            <Figure label={blocks ? "Mean per block" : "Mean"} value={blocks ? blocks.mean : bins.mean} unit={series.unit} />
+            <Figure label={blocks ? "Lowest block" : "Lowest"} value={blocks ? blocks.low.value : bins.min} unit={series.unit} />
             {bins.peak === undefined ? (
-              <Figure label={blocks ? "Highest block" : "Highest"} value={blocks ? blocks.high.value : bins.max} />
+              <Figure label={blocks ? "Highest block" : "Highest"} value={blocks ? blocks.high.value : bins.max} unit={series.unit} />
             ) : (
-              <Figure label="Peak, 1 s" value={bins.peak} />
+              <Figure label="Peak, 1 s" value={bins.peak} unit={series.unit} />
             )}
           </div>
-          <Chart bins={bins} mark={mark} />
+          <Chart bins={bins} mark={mark} unit={series.unit} />
         </>
       ) : (
         <p className="ask-plain ask-waiting" role={announce ? "status" : undefined}>
@@ -1010,11 +1026,11 @@ function SeriesPanel({
   );
 }
 
-function Figure({ label, value }: { label: string; value: number }): ReactElement {
+function Figure({ label, value, unit }: { label: string; value: number; unit: string }): ReactElement {
   return (
     <div className="ask-figure">
       <span className="ask-figure-label">{label}</span>
-      <span className="ask-figure-value">{figure(value)}</span>
+      <span className="ask-figure-value">{amount(value, unit)}</span>
     </div>
   );
 }
@@ -1022,7 +1038,7 @@ function Figure({ label, value }: { label: string; value: number }): ReactElemen
 const WIDTH = 600;
 const HEIGHT = 150;
 
-const Chart = memo(function Chart({ bins, mark }: { bins: Bins; mark?: Mark }): ReactElement {
+const Chart = memo(function Chart({ bins, mark, unit }: { bins: Bins; mark?: Mark; unit: string }): ReactElement {
   // A value far off the line is told in words, not drawn.
   const shown = mark && mark.threshold > 0 && mark.threshold <= bins.max * 4 ? mark : undefined;
   const top = ceiling(Math.max(bins.max, shown?.threshold ?? 0));
@@ -1035,7 +1051,7 @@ const Chart = memo(function Chart({ bins, mark }: { bins: Bins; mark?: Mark }): 
       <div className="ask-plot">
         {[top, top / 2, 0].map((tick) => (
           <span key={tick} className="ask-tick" style={{ top: `${(1 - tick / top) * 100}%` }}>
-            {figure(tick)}
+            {amount(tick, unit)}
           </span>
         ))}
         <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} preserveAspectRatio="none" role="img" aria-label="The readings over the window">
@@ -1058,7 +1074,7 @@ const Chart = memo(function Chart({ bins, mark }: { bins: Bins; mark?: Mark }): 
         </svg>
         {shown && (
           <span className="ask-threshold-label" aria-hidden="true" style={{ top: `${(y(shown.threshold) / HEIGHT) * 100}%` }}>
-            {figure(shown.threshold)}
+            {amount(shown.threshold, unit)}
           </span>
         )}
       </div>
