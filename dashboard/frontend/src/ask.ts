@@ -479,7 +479,7 @@ export const MAX_PAGES = 30;
 export const MAX_EMPTY_PAGES = 3;
 
 export interface WindowRows {
-  rows: [time: number, row: WireRow][];
+  rows: [time: number, row: WireRow, slot: number][];
   /** False when the history ends inside the window. */
   reached: boolean;
 }
@@ -490,7 +490,7 @@ export async function readWindow(
   tip: number,
   from: number,
 ): Promise<WindowRows> {
-  const rows: [number, WireRow][] = [];
+  const rows: [number, WireRow, number][] = [];
   let end = tip + 1;
   let empty = 0;
   for (let page = 0; page < MAX_PAGES && end > 0 && empty < MAX_EMPTY_PAGES; page += 1) {
@@ -502,7 +502,7 @@ export async function readWindow(
       if (!row || !has(row, HAS_CLOCK)) continue;
       clocked += 1;
       if (row[8] < from) return { rows, reached: true };
-      rows.push([row[8], row]);
+      rows.push([row[8], row, reply.first_slot + index]);
     }
     empty = clocked === 0 ? empty + 1 : 0;
     end = first;
@@ -510,37 +510,84 @@ export async function readWindow(
   return { rows, reached: false };
 }
 
+/** One block's reading, with where it was. */
+export interface Extreme {
+  value: number;
+  time: number;
+  slot: number | null;
+}
+
+/** What the window's blocks add up to, read from each block rather than from the chart's spans. */
+export interface BlockFigures {
+  total: number;
+  count: number;
+  /** Per block. */
+  mean: number;
+  low: Extreme;
+  high: Extreme;
+  /** Blocks over and under the threshold asked about, when one was. */
+  over: number;
+  under: number;
+}
+
 export interface Bins {
   from: number;
   to: number;
+  /** Each span's reading, or null where it holds none; the line drawn. */
   values: (number | null)[];
+  /** Of the line: what the axis is scaled to. */
   min: number;
   max: number;
   mean: number;
   latest: number;
+  /** The length of one span. */
+  binMillis: number;
+  /** When the oldest reading in the window was taken. */
+  first: number;
   /** The highest single reading, where the values drawn are means of several. */
   peak?: number;
+  /** Each step's highest single reading, where the server keeps one. */
+  peaks?: (number | null)[];
+  /** For per-slot series, figures from the blocks themselves. */
+  blocks?: BlockFigures;
 }
 
 export const BIN_COUNT = 120;
 
-/** The readings in equal spans of time, or null when the window holds none. */
+/** The readings in equal spans of time, or null when the window holds none. The same pass adds up
+ *  the blocks in the window and counts those over and under `threshold`. */
 export function bucket(
-  rows: readonly [number, WireRow][],
+  rows: readonly (readonly [number, WireRow, number?])[],
   series: SlotSeries,
   from: number,
   to: number,
   count = BIN_COUNT,
+  threshold?: number,
 ): Bins | null {
   const sums = new Array<number>(count).fill(0);
   const seen = new Array<number>(count).fill(0);
   const width = (to - from) / count;
-  for (const [time, row] of rows) {
+  let total = 0;
+  let readings = 0;
+  let over = 0;
+  let under = 0;
+  let first = Infinity;
+  let low: Extreme | null = null;
+  let high: Extreme | null = null;
+  for (const [time, row, slot] of rows) {
     const value = series.read(row);
     if (value === null) continue;
     const index = Math.min(count - 1, Math.max(0, Math.floor((time - from) / width)));
     sums[index] += value;
     seen[index] += 1;
+    if (time < from || time >= to) continue;
+    total += value;
+    readings += 1;
+    first = Math.min(first, time);
+    if (threshold !== undefined && value > threshold) over += 1;
+    if (threshold !== undefined && value < threshold) under += 1;
+    if (!low || value < low.value) low = { value, time, slot: slot ?? null };
+    if (!high || value > high.value) high = { value, time, slot: slot ?? null };
   }
   // The newest span is still filling, so a rate there reads low.
   const values = sums.map((sum, index) =>
@@ -556,6 +603,10 @@ export function bucket(
     max: Math.max(...real),
     mean: real.reduce((sum, value) => sum + value, 0) / real.length,
     latest: real[real.length - 1],
+    binMillis: width,
+    first: Number.isFinite(first) ? first : from,
+    blocks:
+      low && high ? { total, count: readings, mean: total / readings, low, high, over, under } : undefined,
   };
 }
 
@@ -580,8 +631,9 @@ export function hostBins(range: HostRange, series: HostSeries): Bins | null {
   const values = held.mean.map((value) => (value === null ? null : value * series.scale));
   const real = values.filter((value): value is number => value !== null);
   if (real.length === 0) return null;
-  const peaks = held.max.filter((value): value is number => value !== null).map((value) => value * series.scale);
+  const peaks = held.max.map((value) => (value === null ? null : value * series.scale));
   const max = Math.max(...real);
+  const firstHeld = values.findIndex((value) => value !== null);
   return {
     from: range.from,
     to: range.to,
@@ -590,7 +642,10 @@ export function hostBins(range: HostRange, series: HostSeries): Bins | null {
     max,
     mean: real.reduce((sum, value) => sum + value, 0) / real.length,
     latest: real[real.length - 1],
-    peak: Math.max(max, ...peaks),
+    binMillis: range.step_ms,
+    first: range.from + firstHeld * range.step_ms,
+    peak: Math.max(max, ...peaks.filter((value): value is number => value !== null)),
+    peaks,
   };
 }
 
