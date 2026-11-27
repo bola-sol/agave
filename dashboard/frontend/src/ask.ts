@@ -525,7 +525,9 @@ export interface BlockFigures {
   mean: number;
   low: Extreme;
   high: Extreme;
-  /** Blocks over and under the threshold asked about, when one was. */
+  /** The value the blocks were counted against, if any, and how many were over and under it, or
+   *  at least and at most it where `inclusive`. */
+  threshold?: number;
   over: number;
   under: number;
 }
@@ -563,6 +565,7 @@ export function bucket(
   to: number,
   count = BIN_COUNT,
   threshold?: number,
+  inclusive = false,
 ): Bins | null {
   const sums = new Array<number>(count).fill(0);
   const seen = new Array<number>(count).fill(0);
@@ -584,8 +587,8 @@ export function bucket(
     total += value;
     readings += 1;
     first = Math.min(first, time);
-    if (threshold !== undefined && value > threshold) over += 1;
-    if (threshold !== undefined && value < threshold) under += 1;
+    if (threshold !== undefined && (inclusive ? value >= threshold : value > threshold)) over += 1;
+    if (threshold !== undefined && (inclusive ? value <= threshold : value < threshold)) under += 1;
     if (!low || value < low.value) low = { value, time, slot: slot ?? null };
     if (!high || value > high.value) high = { value, time, slot: slot ?? null };
   }
@@ -606,7 +609,7 @@ export function bucket(
     binMillis: width,
     first: Number.isFinite(first) ? first : from,
     blocks:
-      low && high ? { total, count: readings, mean: total / readings, low, high, over, under } : undefined,
+      low && high ? { total, count: readings, mean: total / readings, low, high, threshold, over, under } : undefined,
   };
 }
 
