@@ -3,6 +3,7 @@ import {
   createAskModel,
   FIRST_PROMPT_TIMEOUT_MS,
   modelState,
+  OPERATION_TIMEOUT_MS,
   PROMPT_TIMEOUT_MS,
   tabShown,
   type AskState,
@@ -323,5 +324,75 @@ describe("createAskModel", () => {
     model.download();
     expect(model.get().state).toBe("ready");
     expect(counts.created).toBe(0);
+  });
+});
+
+describe("pickOperation", () => {
+  it("reads the operation from its own session, apart from the series pick", async () => {
+    const { api, counts } = fake("available", ['{"operation":"total"}', '{"series":["fees"]}']);
+    const created: string[] = [];
+    const create = api.create.bind(api);
+    api.create = (options) => {
+      created.push(options.initialPrompts[0].content.split("\n")[0]);
+      return create(options);
+    };
+    const model = createAskModel(() => api, () => true);
+    await settled(model);
+    expect(await model.pickOperation("total fees")).toBe("total");
+    expect(await model.pickSeries("total fees")).toMatchObject({ kind: "series", series: [{ key: "fees" }] });
+    expect(counts.created).toBe(2);
+    expect(created[0]).toMatch(/Answer the operation it asks for\.$/);
+    expect(created[1]).toMatch(/^A request asks to see charts/);
+  });
+
+  it("is null for an answer outside the schema, with no second try", async () => {
+    const { api, counts } = fake("available", ['{"operation":"sum"}']);
+    const model = createAskModel(() => api, () => true);
+    await settled(model);
+    expect(await model.pickOperation("sum of fees")).toBeNull();
+    expect(counts.cloned).toBe(1);
+  });
+
+  it("is null after an error and one new session, and never says it failed", async () => {
+    const { api, counts } = fake("available", [new Error("gone"), new Error("gone")]);
+    const model = createAskModel(() => api, () => true);
+    await settled(model);
+    expect(await model.pickOperation("total fees")).toBeNull();
+    expect(counts.created).toBe(2);
+  });
+
+  it("is null once its own, shorter wait runs out", async () => {
+    const { api } = fake("available", ['{"operation":"chart"}', "hang"]);
+    const model = createAskModel(() => api, () => true);
+    await settled(model);
+    expect(await model.pickOperation("shreds")).toBe("chart");
+    vi.useFakeTimers();
+    let read: unknown = "pending";
+    const waiting = model.pickOperation("total fees").then((operation) => (read = operation));
+    await vi.advanceTimersByTimeAsync(OPERATION_TIMEOUT_MS - 1);
+    expect(read).toBe("pending");
+    await vi.advanceTimersByTimeAsync(1);
+    await waiting;
+    expect(read).toBeNull();
+  });
+
+  it("leaves the series pick alone when it fails", async () => {
+    const { api } = fake("available", [new Error("gone"), new Error("gone"), '{"series":["replay"]}']);
+    const model = createAskModel(() => api, () => true);
+    await settled(model);
+    expect(await model.pickOperation("replay")).toBeNull();
+    expect(await model.pickSeries("replay")).toMatchObject({ kind: "series", series: [{ key: "replay" }] });
+  });
+
+  it("opens its session ahead of the first request only when asked to", async () => {
+    const { api, counts } = fake("available");
+    const model = createAskModel(() => api, () => true);
+    await settled(model);
+    model.warm();
+    expect(counts.created).toBe(1);
+    model.warmFigures();
+    expect(counts.created).toBe(2);
+    await model.pickOperation("total fees");
+    expect(counts.created).toBe(2);
   });
 });

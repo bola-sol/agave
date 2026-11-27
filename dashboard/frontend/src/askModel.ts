@@ -3,6 +3,7 @@
 
 import { useSyncExternalStore } from "react";
 import { parseReply, SERIES, seriesSchema, systemPrompt, type Series } from "./ask";
+import { OPERATION_PROMPT, operationSchema, parseOperation, type Operation } from "./askFigures";
 
 interface PromptOptions {
   responseConstraint?: object;
@@ -73,10 +74,13 @@ export type Picked =
 export const PROMPT_TIMEOUT_MS = 10_000;
 /** The first prompt also waits for the session and the model to load. */
 export const FIRST_PROMPT_TIMEOUT_MS = 30_000;
+/** The operation runs after the series pick on the device, so its wait covers both. */
+export const OPERATION_TIMEOUT_MS = 8_000;
 /** How often a download started elsewhere is looked at again. */
 const RECHECK_MS = 5_000;
 
 const SCHEMA = seriesSchema(SERIES);
+const OPERATION_SCHEMA = operationSchema();
 
 function aborted(signal: AbortSignal): Promise<never> {
   return new Promise((_, reject) => {
@@ -92,45 +96,33 @@ export interface AskModel {
   /** Opens the session ahead of the first request. */
   warm: () => void;
   pickSeries: (text: string, stop?: AbortSignal) => Promise<Picked>;
+  /** Opens the operation's own session ahead of the first request. */
+  warmFigures: () => void;
+  /** The operation a request asks for, or null where it could not be read; never an error. */
+  pickOperation: (text: string, stop?: AbortSignal) => Promise<Operation | null>;
   /** Called from a click, which the browser requires before it fetches the model. */
   download: () => void;
 }
 
-export function createAskModel(api: () => LanguageModelApi | undefined, secure: () => boolean): AskModel {
-  let snapshot: AskModelSnapshot = { state: "checking", progress: null, downloadFailed: false };
-  const listeners = new Set<() => void>();
-  let started = false;
-  let downloading = false;
+type Asked = { reply: string } | { failed: "timeout" | "model" | "stopped" };
+
+/** One session with its prompt and schema, kept open and copied per request. */
+interface Lane {
+  hold: (opening: Promise<ModelSession>) => Promise<ModelSession>;
+  drop: () => void;
+  warm: () => void;
+  /** One request, with one new session tried after an error before giving up. */
+  run: (text: string, stop: AbortSignal | undefined) => Promise<Asked>;
+}
+
+function lane(
+  create: () => Promise<ModelSession>,
+  schema: object,
+  waits: { first: number; later: number },
+): Lane {
   let base: Promise<ModelSession> | null = null;
   let opened = false;
   let prompted = false;
-
-  const set = (next: Partial<AskModelSnapshot>): void => {
-    snapshot = { ...snapshot, ...next };
-    for (const listener of listeners) listener();
-  };
-
-  const detect = async (): Promise<void> => {
-    const model = api();
-    let availability: string | null = null;
-    if (model && secure()) {
-      try {
-        availability = await model.availability(LANGUAGES);
-      } catch {
-        availability = "unavailable";
-      }
-    }
-    if (downloading) return;
-    const state = modelState(model !== undefined, secure(), availability);
-    if (state !== snapshot.state) set({ state });
-    if (state === "downloading" && listeners.size > 0) setTimeout(() => void detect(), RECHECK_MS);
-  };
-
-  const create = (monitor?: (monitor: EventTarget) => void): Promise<ModelSession> => {
-    const model = api();
-    if (!model) return Promise.reject(new Error("no model"));
-    return model.create({ ...LANGUAGES, initialPrompts: [{ role: "system", content: systemPrompt(SERIES) }], monitor });
-  };
 
   const hold = (opening: Promise<ModelSession>): Promise<ModelSession> => {
     opened = false;
@@ -164,14 +156,14 @@ export function createAskModel(api: () => LanguageModelApi | undefined, secure: 
     // A copy per request, so one request's text never reaches the next and the context never fills.
     const copy = await held.clone();
     try {
-      return await copy.prompt(text, { responseConstraint: SCHEMA, signal });
+      return await copy.prompt(text, { responseConstraint: schema, signal });
     } finally {
       copy.destroy();
     }
   };
 
-  const attempt = async (text: string, stop: AbortSignal | undefined): Promise<Picked | "retry"> => {
-    if (stop?.aborted) return { kind: "failed", reason: "stopped" };
+  const attempt = async (text: string, stop: AbortSignal | undefined): Promise<Asked | "retry"> => {
+    if (stop?.aborted) return { failed: "stopped" };
     const controller = new AbortController();
     let late = false;
     const timer = setTimeout(
@@ -179,7 +171,7 @@ export function createAskModel(api: () => LanguageModelApi | undefined, secure: 
         late = true;
         controller.abort();
       },
-      prompted ? PROMPT_TIMEOUT_MS : FIRST_PROMPT_TIMEOUT_MS,
+      prompted ? waits.later : waits.first,
     );
     const halt = (): void => controller.abort();
     stop?.addEventListener("abort", halt);
@@ -189,20 +181,82 @@ export function createAskModel(api: () => LanguageModelApi | undefined, secure: 
       work.catch(() => undefined);
       const reply = await Promise.race([work, aborted(controller.signal)]);
       prompted = true;
-      const parsed = parseReply(reply, SERIES);
-      if (parsed === null) return { kind: "failed", reason: "model" };
-      return parsed.series.length === 0 ? { kind: "none" } : { kind: "series", ...parsed };
+      return { reply };
     } catch {
       // A session that never opened would hold up every later request.
       if (late && !opened) drop();
-      if (late) return { kind: "failed", reason: "timeout" };
-      if (stop?.aborted) return { kind: "failed", reason: "stopped" };
+      if (late) return { failed: "timeout" };
+      if (stop?.aborted) return { failed: "stopped" };
       return "retry";
     } finally {
       clearTimeout(timer);
       stop?.removeEventListener("abort", halt);
     }
   };
+
+  return {
+    hold,
+    drop,
+    warm() {
+      const opening = session();
+      opening.catch(() => {
+        if (base === opening) drop();
+      });
+    },
+    async run(text, stop) {
+      const first = await attempt(text, stop);
+      if (first !== "retry") return first;
+      // The browser can close a session; one new one is tried before giving up.
+      drop();
+      const second = await attempt(text, stop);
+      if (second !== "retry") return second;
+      drop();
+      return { failed: "model" };
+    },
+  };
+}
+
+export function createAskModel(api: () => LanguageModelApi | undefined, secure: () => boolean): AskModel {
+  let snapshot: AskModelSnapshot = { state: "checking", progress: null, downloadFailed: false };
+  const listeners = new Set<() => void>();
+  let started = false;
+  let downloading = false;
+
+  const set = (next: Partial<AskModelSnapshot>): void => {
+    snapshot = { ...snapshot, ...next };
+    for (const listener of listeners) listener();
+  };
+
+  const detect = async (): Promise<void> => {
+    const model = api();
+    let availability: string | null = null;
+    if (model && secure()) {
+      try {
+        availability = await model.availability(LANGUAGES);
+      } catch {
+        availability = "unavailable";
+      }
+    }
+    if (downloading) return;
+    const state = modelState(model !== undefined, secure(), availability);
+    if (state !== snapshot.state) set({ state });
+    if (state === "downloading" && listeners.size > 0) setTimeout(() => void detect(), RECHECK_MS);
+  };
+
+  const create = (prompt: string, monitor?: (monitor: EventTarget) => void): Promise<ModelSession> => {
+    const model = api();
+    if (!model) return Promise.reject(new Error("no model"));
+    return model.create({ ...LANGUAGES, initialPrompts: [{ role: "system", content: prompt }], monitor });
+  };
+
+  const series = lane(() => create(systemPrompt(SERIES)), SCHEMA, {
+    first: FIRST_PROMPT_TIMEOUT_MS,
+    later: PROMPT_TIMEOUT_MS,
+  });
+  const operations = lane(() => create(OPERATION_PROMPT), OPERATION_SCHEMA, {
+    first: FIRST_PROMPT_TIMEOUT_MS,
+    later: OPERATION_TIMEOUT_MS,
+  });
 
   return {
     subscribe(listener) {
@@ -217,40 +271,40 @@ export function createAskModel(api: () => LanguageModelApi | undefined, secure: 
     },
     get: () => snapshot,
     warm() {
-      if (snapshot.state !== "ready") return;
-      const opening = session();
-      opening.catch(() => {
-        if (base === opening) drop();
-      });
+      if (snapshot.state === "ready") series.warm();
+    },
+    warmFigures() {
+      if (snapshot.state === "ready") operations.warm();
     },
     async pickSeries(text, stop) {
-      const first = await attempt(text, stop);
-      if (first !== "retry") return first;
-      // The browser can close a session; one new one is tried before giving up.
-      drop();
-      const second = await attempt(text, stop);
-      if (second !== "retry") return second;
-      drop();
-      return { kind: "failed", reason: "model" };
+      const asked = await series.run(text, stop);
+      if ("failed" in asked) return { kind: "failed", reason: asked.failed };
+      const parsed = parseReply(asked.reply, SERIES);
+      if (parsed === null) return { kind: "failed", reason: "model" };
+      return parsed.series.length === 0 ? { kind: "none" } : { kind: "series", ...parsed };
+    },
+    async pickOperation(text, stop) {
+      const asked = await operations.run(text, stop);
+      return "failed" in asked ? null : parseOperation(asked.reply);
     },
     download() {
       if (snapshot.state !== "downloadable" || downloading) return;
       downloading = true;
       set({ state: "downloading", progress: 0, downloadFailed: false });
-      const fetched = create((monitor) => {
+      const fetched = create(systemPrompt(SERIES), (monitor) => {
         monitor.addEventListener("downloadprogress", (event) => {
           const loaded = (event as ProgressEvent).loaded;
           if (downloading && Number.isFinite(loaded)) set({ progress: Math.min(1, Math.max(0, loaded)) });
         });
       });
-      hold(fetched).then(
+      series.hold(fetched).then(
         () => {
           downloading = false;
           set({ state: "ready", progress: null });
         },
         () => {
           downloading = false;
-          drop();
+          series.drop();
           set({ state: "downloadable", progress: null, downloadFailed: true });
         },
       );
