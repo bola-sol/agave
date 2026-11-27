@@ -297,7 +297,9 @@ function leads(lead: string, series: Series): boolean {
   if (!namesSeries(lead, series)) return false;
   return !Object.entries(HOLDS).some(([longer, held]) => {
     const other = byKey(longer);
-    return held === series.key && other !== undefined && namesSeries(lead, other);
+    // Our blocks' transactions are still transactions, held by "failed transactions".
+    const key = series.key === "own_transactions" ? "transactions" : series.key;
+    return held === key && other !== undefined && namesSeries(lead, other);
   });
 }
 
