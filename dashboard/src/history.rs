@@ -176,7 +176,8 @@ impl SlotHistory {
     }
 
     /// A row read back from the recording gives way to this run's only once this run has the
-    /// block; before then, a line without one leaves it, as a restart writes such lines at its seam.
+    /// block; before then, a line without one leaves it but for a reward verdict, as a restart
+    /// writes such lines at its seam. The row keeps its clock and footer marks either way.
     pub fn record(&mut self, entry: &SlotEntry) {
         let index = self.index(entry.slot);
         if let Some((held, row)) = self.rows.get_mut(index)
@@ -184,9 +185,15 @@ impl SlotHistory {
             && row.flags & READ_BACK != 0
         {
             if entry.block.is_none() {
+                take_reward(row, entry);
                 return;
             }
-            *row = PackedSlot::default();
+            *row = PackedSlot {
+                flags: row.flags & (HAS_CLOCK | FOOTER),
+                time_millis: row.time_millis,
+                notarized: row.notarized,
+                ..PackedSlot::default()
+            };
         }
         self.write(entry);
     }
@@ -233,7 +240,7 @@ impl SlotHistory {
     /// Takes each slot `older` holds into cells from `from`, `count` at a time so a reader is not
     /// held up for the whole ring. A slot this run has the block of keeps it, a newer lap keeps
     /// its cell, and a slot this run holds without a block takes the recorded row with this run's
-    /// footer marks. Returns how many rows it took.
+    /// footer marks and clock. Returns how many rows it took.
     pub fn merge_read_back(&mut self, older: &SlotHistory, from: usize, count: usize) -> usize {
         if older.rows.len() != self.rows.len() {
             return 0;
@@ -258,6 +265,10 @@ impl SlotHistory {
             if *held == slot {
                 row.flags = (row.flags & !FOOTER) | (ours.flags & FOOTER);
                 row.notarized = ours.notarized;
+                if ours.flags & HAS_CLOCK != 0 {
+                    row.flags |= HAS_CLOCK;
+                    row.time_millis = ours.time_millis;
+                }
             }
             *cell = (slot, row);
             taken = taken.saturating_add(1);
@@ -394,7 +405,12 @@ impl ReadBack {
         let same_run = self.runs.get(index) == Some(&run);
         let mut kept = None;
         match before {
-            Some(row) if !same_run && entry.block.is_none() && row.flags & HAS_BLOCK != 0 => return,
+            Some(row) if !same_run && entry.block.is_none() && row.flags & HAS_BLOCK != 0 => {
+                if let Some(cell) = self.history.rows.get_mut(index) {
+                    take_reward(&mut cell.1, entry);
+                }
+                return;
+            }
             Some(_) if !same_run => {
                 if let Some(cell) = self.history.rows.get_mut(index) {
                     cell.1 = PackedSlot::default();
@@ -424,6 +440,14 @@ impl ReadBack {
         if let Some(held) = self.runs.get_mut(index) {
             *held = run;
         }
+    }
+}
+
+/// A block-less line's reward verdict onto a row it otherwise leaves.
+fn take_reward(row: &mut PackedSlot, entry: &SlotEntry) {
+    if entry.reward.is_some() {
+        row.flags = (row.flags & !REWARD_MASK) | reward_bits(entry.reward);
+        row.left_out = entry.left_out.unwrap_or(0);
     }
 }
 
@@ -850,6 +874,53 @@ mod tests {
         let row = fill.history().get(10).unwrap();
         assert_eq!(row.fees, 900);
         assert_ne!(row.flags & CATCH_UP, 0);
+    }
+
+    #[test]
+    fn test_a_later_run_takes_a_reward_verdict_without_a_block() {
+        let mut mark = entry(10);
+        mark.reward = Some(Reward::Unpaid);
+        mark.left_out = Some(7);
+        let fill = read_back(&[(finalized(10, 500), 1, false), (mark.clone(), 2, false)]);
+        let row = fill.history().get(10).unwrap();
+        assert_eq!(
+            (row.fees, row.flags & REWARD_MASK, row.left_out),
+            (500, REWARD_UNPAID, 7)
+        );
+
+        let mut live = SlotHistory::new(64);
+        live.merge_read_back(
+            read_back(&[(finalized(10, 500), 1, false)]).history(),
+            0,
+            64,
+        );
+        live.record(&mark);
+        let row = live.get(10).unwrap();
+        assert_eq!(
+            (row.fees, row.flags & REWARD_MASK, row.left_out),
+            (500, REWARD_UNPAID, 7)
+        );
+    }
+
+    #[test]
+    fn test_a_replayed_read_back_row_keeps_its_clock_and_footer() {
+        let mut live = SlotHistory::new(64);
+        live.record_time(10, 1_764_000_000_000);
+        live.record_notarized(10, 9_000);
+        live.merge_read_back(
+            read_back(&[(finalized(10, 500), 1, false)]).history(),
+            0,
+            64,
+        );
+        live.record(&finalized(10, 900));
+        let row = live.get(10).unwrap();
+        assert_eq!(
+            (row.fees, row.time_millis, row.notarized),
+            (900, 1_764_000_000_000, 9_000)
+        );
+        assert_ne!(row.flags & HAS_CLOCK, 0);
+        assert_ne!(row.flags & HAS_NOTARIZED, 0);
+        assert_eq!(row.flags & READ_BACK, 0);
     }
 
     #[test]
