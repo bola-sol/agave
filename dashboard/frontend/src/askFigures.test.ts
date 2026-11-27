@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { bucket, SERIES, windowOf, type Bins, type Series, type SlotSeries } from "./ask";
+import { bucket, onWholeSpans, SERIES, windowOf, type Bins, type Series, type SlotSeries } from "./ask";
 import {
   answerFigure,
   comparing,
@@ -494,6 +494,26 @@ describe("answerFigure", () => {
     expect((answerFigure("when_above", series("replay"), inclusive, context({ threshold: atLeast })) as { detail: string }).detail).toContain(
       "360 of 360 blocks were at least 8 ms",
     );
+  });
+
+  it("gives the same figures from a rate drawn on its whole spans as from its raw spans", () => {
+    // From half an hour in, the first whole span at 180 a block and the rest at 250.
+    const rows: [number, WireRow, number][] = [];
+    const begun = T + 1_800_000 - 4000;
+    for (let time = begun; time < T + 3_600_000; time += 10_000) {
+      const span = Math.floor((time - T) / 30_000);
+      rows.push([time, row(time, 1, 1, span === 60 ? 1800 : 2500), 1]);
+    }
+    const raw = bucket(rows, slot("transactions"), T, T + 3_600_000, 120);
+    const drawn = raw && onWholeSpans(raw);
+    expect(drawn?.min).toBe(180);
+    for (const bins of [raw, drawn]) {
+      expect(answerFigure("lowest", series("transactions"), bins, context())).toMatchObject({ value: "180 per second" });
+      const under = threshold(thresholdOf("tps under 200", series("transactions")));
+      expect((answerFigure("when_below", series("transactions"), bins, context({ threshold: under })) as { label: string }).label).toMatch(
+        /^Under 200 per second in 1 span/,
+      );
+    }
   });
 
   it("keeps a rate's first span where the history covers the whole window", () => {

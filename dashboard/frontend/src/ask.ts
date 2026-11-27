@@ -553,6 +553,8 @@ export interface Bins {
   peaks?: (number | null)[];
   /** For per-slot series, figures from the blocks themselves. */
   blocks?: BlockFigures;
+  /** The part-filled spans are already left out, so they are not looked for again. */
+  whole?: true;
 }
 
 export const BIN_COUNT = 120;
@@ -621,8 +623,8 @@ export function wholeSpans(bins: Bins): (number | null)[] {
   const last = bins.values.length - 1;
   const gap = (index: number): boolean => index >= 0 && index < last && bins.values[index] === null;
   const firstIndex = Math.floor((bins.first - bins.from) / bins.binMillis);
-  // A first block a tenth of a span late is the slot's own timing, not a history that began there.
-  const late = bins.first - (bins.from + firstIndex * bins.binMillis) > bins.binMillis / 10;
+  // A first block a little late is the slot's own timing, not a history that began there.
+  const late = bins.first - (bins.from + firstIndex * bins.binMillis) > Math.min(bins.binMillis / 2, Math.max(bins.binMillis / 10, 1000));
   return bins.values.map((value, index) =>
     value === null || gap(index - 1) || gap(index + 1) || (late && index === firstIndex) ? null : value,
   );
@@ -640,6 +642,7 @@ export function onWholeSpans(bins: Bins): Bins | null {
     max: Math.max(...real),
     mean: real.reduce((sum, value) => sum + value, 0) / real.length,
     latest: real[real.length - 1],
+    whole: true,
   };
 }
 
