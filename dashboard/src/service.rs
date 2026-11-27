@@ -136,7 +136,7 @@ impl DashboardService {
                         if let Some(read_back) = refilled.host.take()
                             && let Ok(mut history) = host_history.write()
                         {
-                            history.merge(&read_back);
+                            history.merge(&read_back, timestamp());
                         }
                         log::info!(
                             "dashboard: read back {} blocks and {} turns from {} segments in \
