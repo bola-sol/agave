@@ -494,7 +494,7 @@ export function answerFigure(operation: Operation | null, series: Series, bins: 
   const at = (index: number): number => bins.from + index * bins.binMillis;
   const warn = Boolean(short);
   // A rate's figures leave out spans that held blocks for only part of their seconds.
-  const drawn = rate ? wholeSpans(bins) : bins.values;
+  const drawn = rate && !bins.whole ? wholeSpans(bins) : bins.values;
   switch (operation) {
     case "total": {
       if (series.source === "host") {
