@@ -857,7 +857,7 @@ const OwnChart = memo(function OwnChart({
   const shown = threshold !== undefined && threshold > 0 && threshold <= max * 4 ? threshold : undefined;
   const top = ceiling(Math.max(max, shown ?? 0));
   const slot = WIDTH / readings.length;
-  // Narrower than a pixel the bars touch; a gap there would only thin them.
+  // Bars under three units wide touch; a gap there would only thin them.
   const gap = slot > 3 ? Math.min(2, slot / 4) : 0;
   const y = (value: number): number => HEIGHT - (Math.max(0, value) / top) * HEIGHT;
   return (

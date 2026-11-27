@@ -156,6 +156,7 @@ describe("ownFigure", () => {
       label: "1 of our 3 blocks over 1,015 per block",
     });
     expect(ownThresholdOf("transactions over 1500 tps in our blocks", series("transactions"))).toHaveProperty("wrong");
+    expect(ownThresholdOf("failed transactions over 50 and transactions over 2,000 in our blocks", series("transactions"))).toMatchObject({ value: 2000 });
   });
 
   it("carries a shortfall of blocks held", () => {
