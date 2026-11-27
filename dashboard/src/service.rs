@@ -10,6 +10,7 @@ use {
         config::DashboardConfig,
         context::{DashboardContext, StartProgress},
         history::{PACKED_SLOTS, SlotHistory},
+        host_history::HostHistory,
         meters::{METER_INTERVAL, Meters},
         metrics_tap::MetricsTap,
         proto::{Publisher, TOPIC_SUMMARY},
@@ -57,6 +58,7 @@ pub struct DashboardService {
     tip_payment_program_id: Option<Pubkey>,
     commission_bps: Option<u16>,
     history: Arc<RwLock<SlotHistory>>,
+    host_history: Arc<RwLock<HostHistory>>,
     info_cache: Arc<RwLock<ValidatorInfoCache>>,
     epochs: Arc<RwLock<Vec<EpochInfo>>>,
     replies: Arc<Replies>,
@@ -113,12 +115,15 @@ impl DashboardService {
                 }
             });
 
+        let host_history = Arc::new(RwLock::new(HostHistory::new()));
+
         // Listed before the recorder opens a segment of its own.
         let (refill, filler) = match &rewind {
             Some(rewind_log) => {
                 let segments = rewind_log.range();
                 let rewind_log = rewind_log.clone();
                 let exit = exit.clone();
+                let host_history = host_history.clone();
                 let (sender, receiver) = crossbeam_channel::bounded(1);
                 let filler = thread::Builder::new()
                     .name("solDashFill".to_string())
@@ -126,6 +131,10 @@ impl DashboardService {
                         let started = Instant::now();
                         let refilled =
                             refill::read(&rewind_log, &segments, || exit.load(Ordering::Relaxed));
+                        // Behind whatever the meters have read while this ran.
+                        if let Ok(mut history) = host_history.write() {
+                            history.merge(&refilled.host);
+                        }
                         log::info!(
                             "dashboard: read back {} blocks and {} turns from {} segments in \
                              {:?}, {} lines unread",
@@ -164,6 +173,7 @@ impl DashboardService {
                 epochs: epochs.clone(),
                 replies: replies.clone(),
                 rewind: rewind.clone(),
+                host: host_history.clone(),
             };
             let exit = exit.clone();
             thread::Builder::new()
@@ -282,6 +292,7 @@ impl DashboardService {
             tip_payment_program_id: config.tip_payment_program_id,
             commission_bps: config.commission_bps,
             history,
+            host_history,
             info_cache,
             epochs,
             replies,
@@ -334,6 +345,7 @@ impl DashboardService {
             let src = src.clone();
             let metrics_tap = self.metrics_tap.clone();
             let failed_total = failed_total.clone();
+            let host_history = self.host_history.clone();
             thread::Builder::new()
                 .name("solDashMeter".to_string())
                 .spawn(move || {
@@ -345,6 +357,7 @@ impl DashboardService {
                         metrics_tap,
                         failed_total,
                     );
+                    meters.keep_host_history(host_history);
                     while !exit.load(Ordering::Relaxed) {
                         meters.tick();
                         thread::sleep(METER_INTERVAL);

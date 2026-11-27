@@ -1,8 +1,9 @@
-//! Our blocks, turns and per-slot reports read back from the rewind log at startup, so a restart keeps
-//! the slot page's history.
+//! Our blocks, turns, per-slot reports and host readings read back from the rewind log at startup,
+//! so a restart keeps the slot page's history and the host's.
 
 use {
     crate::{
+        host_history::HostHistory,
         metrics_tap::{SlotCost, SlotWaterfall, keep_newest},
         produced::{BlockFees, MAX_HELD_BLOCKS, ProducedBlock},
         rewind_log::RewindLog,
@@ -18,13 +19,15 @@ const PREFIX: &str = r#"{"topic":"summary","key":""#;
 const VALUE: &str = r#"","value":"#;
 
 /// What the log held of ours, each slot as last recorded.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Refilled {
     pub blocks: BTreeMap<Slot, ProducedBlock>,
     pub turns: BTreeMap<Slot, LeaderTurn>,
     pub waterfalls: BTreeMap<Slot, SlotWaterfall>,
     pub costs: BTreeMap<Slot, SlotCost>,
     pub fees: BTreeMap<Slot, BlockFees>,
+    /// The host's readings, binned by when each was recorded.
+    pub host: HostHistory,
     pub segments: usize,
     /// Lines with one of our keys that did not parse.
     pub unread: usize,
@@ -53,11 +56,11 @@ pub fn read(log: &RewindLog, segments: &[(u64, u64, usize)], stop: impl Fn() -> 
     refilled
 }
 
-/// The key and the value's text of a summary line, the rest unparsed.
-fn split(line: &str) -> Option<(&str, &str)> {
-    let (_, json) = line.split_once(' ')?;
+/// When a summary line was recorded, its key and its value's text, the rest unparsed.
+fn split(line: &str) -> Option<(u64, &str, &str)> {
+    let (at_ms, json) = line.split_once(' ')?;
     let (key, value) = json.strip_prefix(PREFIX)?.split_once(VALUE)?;
-    Some((key, value.strip_suffix('}')?))
+    Some((at_ms.parse().ok()?, key, value.strip_suffix('}')?))
 }
 
 fn parse<T: DeserializeOwned>(value: &str) -> Option<T> {
@@ -66,10 +69,14 @@ fn parse<T: DeserializeOwned>(value: &str) -> Option<T> {
 
 impl Refilled {
     fn apply(&mut self, line: &str) {
-        let Some((key, value)) = split(line) else {
+        let Some((at_ms, key, value)) = split(line) else {
             return;
         };
         let read = match key {
+            "host" | "network" | "ingest_paths" => self
+                .host
+                .note_recorded(at_ms, key, value)
+                .and_then(|read| read.then_some(())),
             "produced_block" => parse(value).map(|block: ProducedBlock| {
                 self.blocks.insert(block.slot, block);
             }),
@@ -202,8 +209,8 @@ mod tests {
     fn round_trip<T: serde::Serialize + DeserializeOwned>(key: &str, value: &T) -> T {
         let message = crate::proto::encode(TOPIC_SUMMARY, key, value);
         let line = format!("1 {}", message.text());
-        let (read_key, text) = split(&line).unwrap();
-        assert_eq!(read_key, key);
+        let (at_ms, read_key, text) = split(&line).unwrap();
+        assert_eq!((at_ms, read_key), (1, key));
         parse(text).unwrap()
     }
 
@@ -421,6 +428,32 @@ mod tests {
         assert_eq!(slots(&refilled.waterfalls), [10]);
         assert_eq!(slots(&refilled.turns), [8]);
         assert_eq!(slots(&refilled.fees), [10]);
+    }
+
+    #[test]
+    fn test_host_readings_are_binned_by_when_they_were_recorded() {
+        use crate::{host_history::SeriesKey, meters::Network};
+
+        let dir = tempfile::tempdir().unwrap();
+        let refilled = record(dir.path(), |publisher, step| {
+            for received_per_second in [100, 200, 300] {
+                let network = Network {
+                    received_per_second,
+                    sent_per_second: 0,
+                };
+                publisher.publish(TOPIC_SUMMARY, "network", &network);
+                step();
+            }
+            publisher.publish(TOPIC_SUMMARY, "host", &"not a host");
+        });
+        // The recorder's clock starts at a thousand seconds and moves a second a step.
+        let range = refilled
+            .host
+            .range(&[SeriesKey::NetIn], 1_000_000, 1_010_000, 1);
+        assert_eq!(range.series[0].mean, [Some(200.0)]);
+        assert_eq!(range.series[0].max, [Some(300.0)]);
+        assert_eq!(range.held_from, Some(1_000_000));
+        assert_eq!(refilled.unread, 1);
     }
 
     #[test]

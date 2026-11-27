@@ -16,6 +16,7 @@ pub mod event_input;
 pub(crate) mod fixture;
 pub mod geoip;
 pub mod history;
+pub mod host_history;
 pub mod host_stats;
 pub mod meters;
 pub mod metrics_tap;

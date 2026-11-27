@@ -6,6 +6,7 @@ use {
     crate::{
         collect::{EpochInfo, Replies},
         history::SlotHistory,
+        host_history::{HostHistory, MAX_SERIES as MAX_HOST_SERIES, SeriesKey},
         proto::{
             DEFLATE_PROTOCOL, Frame, Message, Publisher, Request, coalesce, encode_json_with_id,
             encode_with_id,
@@ -126,6 +127,7 @@ pub struct Handles {
     pub replies: Arc<Replies>,
     /// Only when the feed is recorded.
     pub rewind: Option<Arc<RewindLog>>,
+    pub host: Arc<RwLock<HostHistory>>,
 }
 
 pub async fn serve(listener: TcpListener, handles: Handles, allowed_hosts: Arc<[String]>) {
@@ -733,6 +735,16 @@ struct HandoffBinParams {
 }
 
 #[derive(serde::Deserialize)]
+struct HostRangeParams {
+    /// A name outside the history's own fails the request as a whole.
+    series: Vec<SeriesKey>,
+    /// In unix milliseconds; held to what the history keeps rather than refused.
+    from: u64,
+    to: u64,
+    points: usize,
+}
+
+#[derive(serde::Deserialize)]
 struct SlotRangeParams {
     first_slot: Slot,
     /// Clamped by the history rather than refused.
@@ -931,6 +943,7 @@ fn answer(
         info_cache,
         epochs,
         replies,
+        host,
         ..
     } = handles;
     Ok(match (topic, key) {
@@ -1013,6 +1026,21 @@ fn answer(
             };
             encode_with_id("rewind", "range", id, &reply)
         }
+        ("host", "range") => {
+            let params: HostRangeParams = serde_json::from_value(params)
+                .map_err(|_| "range needs series the host keeps, a from, a to and points")?;
+            if params.series.is_empty() || params.series.len() > MAX_HOST_SERIES {
+                return Err("range needs one to three series");
+            }
+            if params.from >= params.to {
+                return Err("range needs a from before its to");
+            }
+            let range = match host.read() {
+                Ok(host) => host.range(&params.series, params.from, params.to, params.points),
+                Err(_) => return Ok(encode_with_id("host", "range", id, &())),
+            };
+            encode_with_id("host", "range", id, &range)
+        }
         ("slot", "range") => {
             // A client waiting on an id cannot tell silence from slowness.
             let params: SlotRangeParams = serde_json::from_value(params)
@@ -1039,6 +1067,8 @@ mod tests {
     use {
         super::*,
         crate::{
+            host_history::HostReading,
+            meters::Network,
             proto::{DEFLATE_FROM, TOPIC_SLOT},
             search::LeaderTraits,
         },
@@ -1056,6 +1086,7 @@ mod tests {
             epochs: Arc::default(),
             replies: Arc::default(),
             rewind: None,
+            host: Arc::default(),
         }
     }
 
@@ -1103,6 +1134,86 @@ mod tests {
         .unwrap();
         assert!(reply.contains(r#""id":12"#), "{reply}");
         assert!(reply.contains(r#""value":null"#), "{reply}");
+    }
+
+    /// A history with the cpu half busy and a megabyte a second in, a minute from `at`.
+    fn host_handles(at: u64) -> Handles {
+        let mut history = HostHistory::new();
+        for second in 0..60u64 {
+            let at = at.saturating_add(second.saturating_mul(1000));
+            history.note_host(
+                at,
+                &HostReading {
+                    cpu: Some(0.5),
+                    ..HostReading::default()
+                },
+            );
+            history.note_network(
+                at,
+                &Network {
+                    received_per_second: 1_000_000,
+                    sent_per_second: 0,
+                },
+            );
+        }
+        Handles {
+            host: Arc::new(RwLock::new(history)),
+            ..handles()
+        }
+    }
+
+    #[test]
+    fn test_a_host_range_answers_each_series_over_the_window() {
+        const AT: u64 = 1_764_000_000_000;
+        let request = format!(
+            r#"{{"topic":"host","key":"range","id":21,"params":{{"series":["net_in","cpu"],"from":{AT},"to":{},"points":3}}}}"#,
+            AT.saturating_add(60_000)
+        );
+        let reply = respond(request.as_bytes(), &host_handles(AT)).unwrap();
+        assert!(reply.contains(r#""id":21"#), "{reply}");
+        assert!(reply.contains(&format!(r#""from":{AT}"#)), "{reply}");
+        assert!(reply.contains(r#""step_ms":20000"#), "{reply}");
+        assert!(reply.contains(&format!(r#""held_from":{AT}"#)), "{reply}");
+        assert!(
+            reply.contains(r#"{"key":"net_in","mean":[1000000.0,1000000.0,1000000.0],"max":[1000000.0,1000000.0,1000000.0]}"#),
+            "{reply}"
+        );
+        assert!(
+            reply.contains(r#"{"key":"cpu","mean":[0.5,0.5,0.5],"max":[0.5,0.5,0.5]}"#),
+            "{reply}"
+        );
+    }
+
+    #[test]
+    fn test_a_host_range_past_what_is_held_answers_with_empty_points() {
+        const AT: u64 = 1_764_000_000_000;
+        let request = format!(
+            r#"{{"topic":"host","key":"range","id":22,"params":{{"series":["cpu"],"from":{},"to":{},"points":4}}}}"#,
+            AT.saturating_sub(20_000),
+            AT.saturating_add(20_000)
+        );
+        let reply = respond(request.as_bytes(), &host_handles(AT)).unwrap();
+        assert!(reply.contains(r#""mean":[null,null,0.5,0.5]"#), "{reply}");
+    }
+
+    #[test]
+    fn test_a_host_range_asking_for_what_is_not_kept_is_refused() {
+        let ask = |params: &str| {
+            let request = format!(r#"{{"topic":"host","key":"range","id":23,"params":{params}}}"#);
+            respond(request.as_bytes(), &handles()).unwrap()
+        };
+        for params in [
+            r#"{"series":["swap"],"from":1,"to":2,"points":1}"#,
+            r#"{"series":[],"from":1,"to":2,"points":1}"#,
+            r#"{"series":["cpu","load","memory","net_in"],"from":1,"to":2,"points":1}"#,
+            r#"{"series":["cpu"],"from":2,"to":2,"points":1}"#,
+            r#"{"series":["cpu"],"from":1,"to":2}"#,
+            r#"{"series":"cpu","from":1,"to":2,"points":1}"#,
+        ] {
+            let reply = ask(params);
+            assert!(reply.contains(r#""id":23"#), "{reply}");
+            assert!(reply.contains(r#""error":"#), "{params}: {reply}");
+        }
     }
 
     #[test]
