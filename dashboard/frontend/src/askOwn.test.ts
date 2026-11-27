@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { SERIES, type Series } from "./ask";
+import { amount, SERIES, type Series } from "./ask";
 import { thresholdOf } from "./askFigures";
 import {
   asksEarned,
@@ -97,6 +97,16 @@ describe("ownScope", () => {
   });
 });
 
+describe("amount", () => {
+  it("keeps three significant digits of a small SOL figure, and leaves the rest as figures are", () => {
+    expect(amount(0.0000978, "SOL per block")).toBe("0.0000978");
+    expect(amount(0.000123456, "SOL")).toBe("0.000123");
+    expect(amount(0, "SOL per block")).toBe("0");
+    expect(amount(17.7, "SOL")).toBe("17.7");
+    expect(amount(0.0004, "per second")).toBe("0");
+  });
+});
+
 describe("ownValue", () => {
   it("gives the fees a block earned by the Slots page's arithmetic, and the rest of its figures", () => {
     // 10,000 lamports in all, 4,000 of them priority: half the base is burned.
@@ -182,6 +192,10 @@ describe("production", () => {
       warn: false,
     });
     expect(production(undefined, { window: "epoch 1093", short: null })).toEqual({ unfit: "The leader slot counts for that epoch are not held." });
+    expect(production({ epoch: 1093, slots: 312, passed: 200, produced: 200, skipped: 0 }, { window: "epoch 1093 so far", short: null })).toMatchObject({
+      value: "200 of 200 produced",
+      detail: "no skips · 112 to come",
+    });
     // After a restart with a short ledger: only 100 of the 400 passed are answered.
     expect(production({ epoch: 1093, slots: 400, passed: 400, produced: 95, skipped: 5 }, { window: "epoch 1093", short: null })).toMatchObject({
       value: "95 of 100 produced",

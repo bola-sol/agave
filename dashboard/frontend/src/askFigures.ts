@@ -1,7 +1,7 @@
 /** Figures the Ask page works out beside a chart: a total, a mean, a peak, a share, or when a series
  *  was over or under a value. The model only names the operation; the value is read here. */
 
-import { figure, namesSeries, SERIES, wholeSpans, type Bins, type Series } from "./ask";
+import { amount, figure, namesSeries, SERIES, wholeSpans, type Bins, type Series } from "./ask";
 
 export const OPERATIONS = ["chart", "total", "mean", "highest", "lowest", "share", "when_above", "when_below"] as const;
 
@@ -141,7 +141,8 @@ const UNIT: Readonly<Record<string, string>> = {
   udp_drops: "per second",
 };
 
-const withUnit = (value: number, key: string): string => `${figure(value)}${UNIT[key] ? ` ${UNIT[key]}` : ""}`;
+const withUnit = (value: number, key: string): string =>
+  `${amount(value, UNIT[key] ?? "")}${UNIT[key] ? ` ${UNIT[key]}` : ""}`;
 
 /** The units a value may come in for each kind of series, each with what turns it into the series' own. */
 type Units = readonly [pattern: RegExp, factor: (value: number) => number][];
@@ -523,14 +524,14 @@ export function answerFigure(operation: Operation | null, series: Series, bins: 
       const whose = series.key === "fees" || series.key === "priority_fees" || series.key === "tips" ? " from every leader" : "";
       return {
         label: `Total ${name}, ${over}`,
-        value: `${figure(total)} ${TOTALS[series.key]}`,
+        value: `${amount(total, TOTALS[series.key] ?? "")} ${TOTALS[series.key]}`,
         detail: notes(`${plural(blocks.count, "block", "blocks")}${whose}`),
         warn,
       };
     }
     case "mean": {
       if (blocks && !rate) {
-        return { label: `Mean ${name}, ${over}`, value: `${figure(blocks.mean)} ${perBlock(series.key)}`, detail: notes(plural(blocks.count, "block", "blocks")), warn };
+        return { label: `Mean ${name}, ${over}`, value: `${amount(blocks.mean, perBlock(series.key))} ${perBlock(series.key)}`, detail: notes(plural(blocks.count, "block", "blocks")), warn };
       }
       const real = drawn.filter((value): value is number => value !== null);
       if (real.length === 0) return null;

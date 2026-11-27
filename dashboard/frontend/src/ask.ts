@@ -691,6 +691,14 @@ export function figure(value: number): string {
   return value.toLocaleString("en-US", { maximumFractionDigits: digits });
 }
 
+/** A figure in its unit: SOL below one keeps three significant digits, as one block's fees are small. */
+export function amount(value: number, unit: string): string {
+  if (unit.startsWith("SOL") && value !== 0 && Math.abs(value) < 1) {
+    return value.toLocaleString("en-US", { maximumSignificantDigits: 3 });
+  }
+  return figure(value);
+}
+
 /** The next round figure at or above the highest reading. */
 export function ceiling(max: number): number {
   if (max <= 0) return 1;
