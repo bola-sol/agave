@@ -102,6 +102,9 @@ export function directed(operation: Operation | null, typed: string, series: Ser
   return operation;
 }
 
+/** Totals given in a unit of measure rather than as a count of the things named. */
+const MEASURES = new Set(["SOL", "GB", "billion CU"]);
+
 /** Null where the operation fits the series, otherwise why it does not. */
 export function unfit(operation: Operation, series: Series): string | null {
   if (operation === "total" && !(series.key in TOTALS)) return `A total of ${inSentence(series.label)} is not meaningful.`;
@@ -398,8 +401,12 @@ export function readAs(operation: Operation | null, series: Series, threshold: T
   const unit = UNIT[series.key] ?? "";
   const name = inSentence(series.label);
   switch (operation) {
-    case "total":
-      return unfit(operation, series) ? { head: series.label, unit } : { head: `Total of ${name}`, unit: TOTALS[series.key] ?? "" };
+    case "total": {
+      if (unfit(operation, series)) return { head: series.label, unit };
+      // A count's things are named by the series itself; only a measure needs its unit.
+      const measure = TOTALS[series.key] ?? "";
+      return { head: `Total of ${name}`, unit: MEASURES.has(measure) ? measure : "" };
+    }
     case "mean":
       return { head: `Mean of ${name}`, unit };
     case "highest":
