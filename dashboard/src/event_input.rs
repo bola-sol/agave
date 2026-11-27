@@ -518,7 +518,7 @@ fn fill_point(event: &LedgerSlotEvent) -> solana_metrics::datapoint::DataPoint {
 /// The `replay-slot-stats` point a slot stats event stands for, for the metrics tap.
 fn stats_point(event: &SlotStatsEvent) -> solana_metrics::datapoint::DataPoint {
     let int = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
-    let (confirmation, replay) = if event.unified_scheduler {
+    let (confirmation, replay) = if event.scheduler_collected {
         ("confirmation_without_replay_us", "task_submission_us")
     } else {
         ("confirmation_time_us", "replay_time")
@@ -785,7 +785,6 @@ impl EventInput {
         // Banks and footers ahead of the roots that name them, as they were sent.
         let mirror = &self.mirror;
         self.bank_frozen.drain(|event| mirror.apply_frozen(&event));
-        // Right after the banks, which freeze first.
         let tap = &self.tap;
         let (monotonic_now, unix_now) = (monotonic_timestamp_ns(), solana_time_utils::timestamp());
         self.slot_stats.drain(|event| {
@@ -1061,15 +1060,15 @@ mod tests {
         }
     }
 
-    /// Distinct primes, so a field mapped to the wrong name changes the figures.
-    fn slot_stats(unified_scheduler: bool) -> SlotStatsEvent {
+    /// Distinct primes, so a value under the wrong name shows.
+    fn slot_stats(scheduler_collected: bool) -> SlotStatsEvent {
         SlotStatsEvent {
             pid: 1,
             tid: 1,
             timestamp_ns: 0,
             slot: 77,
             bank_id: 3,
-            unified_scheduler,
+            scheduler_collected,
             fetch_us: 2,
             fetch_fail_us: 3,
             poh_verify_us: 5,
@@ -1147,9 +1146,11 @@ mod tests {
             ] {
                 point.add_field_i64(name, value);
             }
+            let event_point = stats_point(&slot_stats(unified));
+            assert_eq!(event_point.fields, point.fields);
             let (from_point, from_event) = (MetricsTap::default(), MetricsTap::default());
             from_point.observe_external(&point, 5_000);
-            from_event.observe_external(&stats_point(&slot_stats(unified)), 5_000);
+            from_event.observe_external(&event_point, 5_000);
             assert!(from_point.replayed(77).is_some());
             assert_eq!(from_event.replayed(77), from_point.replayed(77));
         }

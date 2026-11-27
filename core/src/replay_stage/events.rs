@@ -191,9 +191,9 @@ impl BankFrozenEvent {
     }
 }
 
-/// What replaying a completed bank cost, as the `replay-slot-stats` datapoint reports it. Times are
-/// microseconds; the timestamp is monotonic nanoseconds. Our own banks, not replayed from shreds,
-/// carry only `bank_complete_us`.
+/// What replaying a completed bank cost, as the `replay-slot-stats` datapoint reports it, in
+/// microseconds and with a monotonic timestamp. Our own banks are not replayed, so their fetch,
+/// verify, replay and execute times are zero.
 #[event]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotStatsEvent {
@@ -202,9 +202,10 @@ pub struct SlotStatsEvent {
     pub timestamp_ns: u64,
     pub slot: Slot,
     pub bank_id: BankId,
-    /// The unified scheduler ran the block, so `confirmation_us` excludes execution and
-    /// `replay_us` is task submission.
-    pub unified_scheduler: bool,
+    /// Replay collected the unified scheduler's results when the bank completed, which the
+    /// datapoint marks by naming the two times `confirmation_without_replay_us` and
+    /// `task_submission_us`.
+    pub scheduler_collected: bool,
     pub fetch_us: u64,
     pub fetch_fail_us: u64,
     pub poh_verify_us: u64,
@@ -253,7 +254,7 @@ impl SlotStatsEvent {
         bank_id: BankId,
         timing: &ConfirmationTiming,
         counts: ReplayCounts,
-        unified_scheduler: bool,
+        scheduler_collected: bool,
     ) -> Self {
         let (tid, pid) = cached_thread_and_process_id();
         let totals = &timing.batch_execute.totals;
@@ -267,7 +268,7 @@ impl SlotStatsEvent {
             timestamp_ns: monotonic_timestamp_ns(),
             slot,
             bank_id,
-            unified_scheduler,
+            scheduler_collected,
             fetch_us: timing.fetch_elapsed,
             fetch_fail_us: timing.fetch_fail_elapsed,
             poh_verify_us: timing.poh_verify_elapsed,
@@ -338,7 +339,7 @@ impl FrozenOutput {
         bank: &Bank,
         timing: &ConfirmationTiming,
         counts: ReplayCounts,
-        unified_scheduler: bool,
+        scheduler_collected: bool,
     ) {
         if self.stats.is_enabled() {
             let _ = self.stats.publish(&SlotStatsEvent::new(
@@ -346,7 +347,7 @@ impl FrozenOutput {
                 bank.bank_id().into(),
                 timing,
                 counts,
-                unified_scheduler,
+                scheduler_collected,
             ));
         }
     }
@@ -450,11 +451,11 @@ mod tests {
             shreds: 107,
             bank_complete_us: 109,
         };
-        for unified in [false, true] {
-            let event = SlotStatsEvent::new(9, 4, &timing, counts, unified);
+        for collected in [false, true] {
+            let event = SlotStatsEvent::new(9, 4, &timing, counts, collected);
             assert_eq!(
-                (event.slot, event.bank_id, event.unified_scheduler),
-                (9, 4, unified)
+                (event.slot, event.bank_id, event.scheduler_collected),
+                (9, 4, collected)
             );
             assert_eq!(
                 [
