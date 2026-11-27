@@ -111,9 +111,10 @@ collector, the cluster-wide validator list; on the meters, the walk over every
 thread behind the thread panel. With nobody watching, the collector does slot
 bookkeeping, and the meters keep the clock, throughput, network counters and
 the totals lifted from metrics points. They also read the host and the sockets
-once a second, viewer or not: `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`,
-a `statvfs` on each data path and `/proc/net/udp`. That keeps two days of the
-host's readings without holes for `host.range`. A viewer connecting finds the
+once a second, viewer or not: everything INPUTS.md lists under the host but the
+threads, which includes a `statvfs` on each data path and a listing of the
+snapshot archives. That keeps the two days of host readings `host.range`
+answers from whole while the dashboard runs. A viewer connecting finds the
 throughput, network, host and socket figures current; the thread panel fills
 from that moment.
 

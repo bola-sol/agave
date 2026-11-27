@@ -1692,7 +1692,8 @@ struct SocketMeter {
     /// Set once the table has been read, so an empty table before then does not say the TPU port is
     /// bound elsewhere.
     sampled: bool,
-    /// Each port's drop total at the latest tick, until the history takes them.
+    /// Each port's drop counter as the kernel holds it at the latest tick, until the history
+    /// takes them. Not the totals shown, which stay at nought after a socket is bound again.
     drop_totals: Option<Vec<(u16, u64)>>,
     published: Debounced<IngestSummary>,
 }
@@ -1805,9 +1806,9 @@ impl SocketMeter {
             return;
         }
         self.drop_totals = Some(
-            paths
+            ports
                 .iter()
-                .map(|path| (path.port, path.drops_total))
+                .filter_map(|port| Some((port.port, self.known_sockets.get(&port.port)?.drops)))
                 .collect(),
         );
         let summary = IngestSummary {
@@ -3204,7 +3205,7 @@ mod tests {
 
     #[test]
     fn test_an_unread_socket_table_does_not_say_tpu_moved() {
-        // The socket meter waits for a viewer, so an empty table may never have been read.
+        // Before the socket meter's first tick an empty table has not been read.
         let harness = fixture();
         let mut meters = harness.meters();
         let used = quic_tap(1);
