@@ -1704,25 +1704,31 @@ impl Collector {
         }
     }
 
-    /// Merges what the rewind log held of ours once read, and returns whether any block was added.
-    /// Kept: blocks older than the ledger, rooted ones, and those above the root, checked later.
     /// Read-back rows the recording left below rooted, judged by the ledger once the root passes
-    /// them.
+    /// them; judged before the history is locked.
     fn settle_read_back(&mut self, root: Slot) {
         if self.unsettled.is_empty() {
             return;
         }
         let src = self.src.clone();
-        let mut history = self.history.write().unwrap();
-        self.unsettled = settle_slots(
-            &mut history,
+        let (verdicts, waiting) = judge_slots(
             std::mem::take(&mut self.unsettled),
             root,
             src.lowest_slot(),
             |slot| src.is_root(slot),
         );
+        self.unsettled = waiting;
+        if verdicts.is_empty() {
+            return;
+        }
+        let mut history = self.history.write().unwrap();
+        for (slot, level) in verdicts {
+            history.settle(slot, level);
+        }
     }
 
+    /// Merges what the rewind log held of ours once read, and returns whether any block was added.
+    /// Kept: blocks older than the ledger, rooted ones, and those above the root, checked later.
     fn merge_refill(&mut self, root: Slot) -> bool {
         let refilled = match self.refill.as_ref().map(|receiver| receiver.try_recv()) {
             None | Some(Err(crossbeam_channel::TryRecvError::Empty)) => return false,
@@ -2679,15 +2685,15 @@ pub(crate) fn system_time_nanos(time: SystemTime) -> u64 {
         .as_nanos() as u64
 }
 
-/// Settles each of `slots` the root has passed, rooted or skipped by the ledger's word, and returns
-/// those still above it. Below what the ledger holds a slot stays as recorded.
-fn settle_slots(
-    history: &mut SlotHistory,
+/// The ledger's word on each of `slots` the root has passed, rooted or skipped, and those still
+/// above it. Below what the ledger holds a slot stays as recorded.
+fn judge_slots(
     slots: Vec<Slot>,
     root: Slot,
     lowest: Slot,
     is_root: impl Fn(Slot) -> bool,
-) -> Vec<Slot> {
+) -> (Vec<(Slot, SlotLevel)>, Vec<Slot>) {
+    let mut verdicts = Vec::new();
     let mut waiting = Vec::new();
     for slot in slots {
         if slot < lowest {
@@ -2697,16 +2703,14 @@ fn settle_slots(
             waiting.push(slot);
             continue;
         }
-        history.settle(
-            slot,
-            if is_root(slot) {
-                SlotLevel::Rooted
-            } else {
-                SlotLevel::Skipped
-            },
-        );
+        let level = if is_root(slot) {
+            SlotLevel::Rooted
+        } else {
+            SlotLevel::Skipped
+        };
+        verdicts.push((slot, level));
     }
-    waiting
+    (verdicts, waiting)
 }
 
 #[cfg(test)]
@@ -4392,7 +4396,10 @@ mod tests {
             fill.apply(&completed(slot), 1, false);
         }
         assert_eq!(history.merge_read_back(fill.history(), 0, 64), 4);
-        let waiting = settle_slots(&mut history, vec![9, 5, 4, 2], 6, 3, |slot| slot == 4);
+        let (verdicts, waiting) = judge_slots(vec![9, 5, 4, 2], 6, 3, |slot| slot == 4);
+        for (slot, level) in verdicts {
+            history.settle(slot, level);
+        }
         let level = |slot: Slot| history.get(slot).map(|row| row.level);
         assert_eq!(level(4), Some(SlotLevel::Rooted as u8));
         assert_eq!(level(5), Some(SlotLevel::Skipped as u8));

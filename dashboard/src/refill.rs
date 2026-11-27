@@ -59,9 +59,7 @@ pub fn read(log: &RewindLog, segments: &[(u64, u64, usize)], stop: impl Fn() -> 
             let Some(block) = log.read(*start, block) else {
                 break;
             };
-            for line in block.text.lines() {
-                refilled.apply(line, block.keyframe);
-            }
+            refilled.apply_block(&block.text, block.keyframe);
         }
         refilled.segments = refilled.segments.saturating_add(1);
     }
@@ -84,7 +82,7 @@ pub struct SlotFill {
     started: Option<u64>,
     catching_up: bool,
     caught: bool,
-    /// Slot entries read, and those that did not parse.
+    /// Slot entries read.
     pub entries: usize,
 }
 
@@ -138,6 +136,22 @@ fn parse<T: DeserializeOwned>(value: &str) -> Option<T> {
 }
 
 impl Refilled {
+    /// A segment's opening copy is in key order, so its start time is taken first: a run's state
+    /// read from that copy is the run's, not the one before.
+    fn apply_block(&mut self, text: &str, keyframe: bool) {
+        if keyframe {
+            for line in text
+                .lines()
+                .filter(|line| split(line).is_some_and(|(_, key, _)| key == "startup_time_nanos"))
+            {
+                self.apply(line, true);
+            }
+        }
+        for line in text.lines() {
+            self.apply(line, keyframe);
+        }
+    }
+
     /// `opening` for a line of a segment's own copy of what a joining page is sent.
     fn apply(&mut self, line: &str, opening: bool) {
         let Some((at_ms, key, value)) = split(line) else {
@@ -716,6 +730,23 @@ mod tests {
         assert_eq!(row(&refilled, 10).fees, 500);
         assert_ne!(row(&refilled, 11).flags & CATCH_UP, 0);
         assert_eq!(row(&refilled, 12).flags & CATCH_UP, 0);
+    }
+
+    #[test]
+    fn test_a_segment_opening_copy_takes_its_start_time_before_the_run_state() {
+        let summary = |key: &str, text: &str| format!("1 {PREFIX}{key}{VALUE}{text}}}");
+        let mut refilled = Refilled::default();
+        let opening = [
+            summary("behind_cluster", "0"),
+            summary("caught_up_time_nanos", "1"),
+            summary("startup_time_nanos", "1"),
+        ]
+        .join("\n");
+        refilled.apply_block(&opening, true);
+        refilled.apply_block(&summary("behind_cluster", "5"), false);
+        let fill = refilled.slots.as_ref().unwrap();
+        assert!(fill.caught);
+        assert!(!fill.catching_up);
     }
 
     #[test]
