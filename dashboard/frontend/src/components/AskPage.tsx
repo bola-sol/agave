@@ -4,9 +4,13 @@
 import { memo, useEffect, useRef, useState, useSyncExternalStore, type FormEvent, type ReactElement } from "react";
 import {
   asksWhy,
+  BIN_COUNT,
   bucket,
   ceiling,
   figure,
+  HOST_SERIES,
+  HOST_STEP_MILLIS,
+  hostBins,
   leftOut,
   namesSeries,
   notDrawnNote,
@@ -14,6 +18,7 @@ import {
   readWindow,
   recordedList,
   SERIES,
+  SLOT_SERIES,
   windowLabel,
   windowOf,
   WINDOWS,
@@ -57,6 +62,7 @@ const EXAMPLES: readonly string[] = [
   "Shreds per second over the past hour",
   "Replay time, last 15 minutes",
   "Failed transactions over the past 6 hours",
+  "CPU use over the past hour",
 ];
 
 /** Older answers fall off the end. */
@@ -212,12 +218,17 @@ function Answer({ item }: { item: Item }): ReactElement {
       <p className="ask-plain" role="status">
         {PLAIN[answer.kind === "failed" ? answer.reason : answer.kind]}
       </p>
-      {answer.kind === "none" && <p className="ask-source">Recorded per slot: {RECORDED}.</p>}
+      {answer.kind === "none" && (
+        <p className="ask-source">
+          Recorded per slot: {RECORDED_SLOTS}. Recorded for the host: {RECORDED_HOST}.
+        </p>
+      )}
     </section>
   );
 }
 
-const RECORDED = recordedList(SERIES);
+const RECORDED_SLOTS = recordedList(SLOT_SERIES);
+const RECORDED_HOST = recordedList(HOST_SERIES);
 
 const PLAIN: Record<"asking" | "why" | "none" | "timeout" | "model", string> = {
   asking: "Asking Chrome's model…",
@@ -231,11 +242,21 @@ type Loaded =
   | { state: "loading" }
   | { state: "empty" }
   | { state: "failed" }
-  | { state: "ready"; bins: readonly (Bins | null)[]; slots: number; reached: boolean };
+  | {
+      state: "ready";
+      from: number;
+      bins: readonly (Bins | null)[];
+      /** What the slot history gave, or null for a request with no per-slot series. */
+      slots: { count: number; reached: boolean } | null;
+      /** How the host's readings came, or null for a request with none. */
+      host: { stepMillis: number; heldFrom: number | null } | null;
+    };
 
-/** Whether the validator can be asked now; a boolean, so a card redraws only when it flips. */
-function useCanRead(live: Store): boolean {
-  const read = (): boolean => live.getConnection() === "open" && live.get("summary", "completed_slot") !== undefined;
+/** Whether the validator can be asked now, and for the slot history whether its tip is known; a
+ *  boolean, so a card redraws only when it flips. */
+function useCanRead(live: Store, needsTip: boolean): boolean {
+  const read = (): boolean =>
+    live.getConnection() === "open" && (!needsTip || live.get("summary", "completed_slot") !== undefined);
   return useSyncExternalStore(live.subscribe, read, read);
 }
 
@@ -250,7 +271,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
   const { charts, asked, pickedMillis, note } = answer;
   // Always the live validator: a request for the past hour means the hour up to now.
   const live = useRequests();
-  const canRead = useCanRead(live);
+  const canRead = useCanRead(live, charts.some((chart) => chart.series.source === "slots"));
   // A window and how often it was picked: picking the one shown reads it again.
   const [pick, setPick] = useState({ millis: asked.millis, turn: 0 });
   const { millis } = pick;
@@ -260,19 +281,50 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
   useEffect(() => {
     // A reconnect reads again only what is not yet drawn, and leaves a drawn chart at its own time.
     if (!canRead || drawn.current === pick) return;
+    const perSlot = charts.some((chart) => chart.series.source === "slots");
+    const hostKeys = charts.filter((chart) => chart.series.source === "host").map((chart) => chart.series.key);
     const tip = live.get("summary", "completed_slot");
-    if (tip === undefined) return;
+    if (perSlot && tip === undefined) return;
     let stale = false;
-    // Row times are the validator's clock.
-    const to = Date.now() - (live.getClockOffset() ?? 0);
+    // Row times are the validator's clock. The end is a whole host step, so every chart of the
+    // request covers the same span.
+    const now = Date.now() - (live.getClockOffset() ?? 0);
+    const to = Math.floor(now / HOST_STEP_MILLIS) * HOST_STEP_MILLIS;
+    const from = to - pick.millis;
     setLoaded({ state: "loading" });
-    // One read for every chart of the request, so they share a time axis.
-    readWindow((first, size) => live.request("slot.range", { first_slot: first, count: size }), tip, to - pick.millis)
-      .then(({ rows, reached }) => {
+    // One read of each source for every chart of the request.
+    const rows =
+      perSlot && tip !== undefined
+        ? readWindow((first, size) => live.request("slot.range", { first_slot: first, count: size }), tip, from)
+        : null;
+    const host =
+      hostKeys.length > 0 ? live.request("host.range", { series: hostKeys, from, to, points: BIN_COUNT }) : null;
+    Promise.all([rows, host])
+      .then(([window, range]) => {
         if (stale) return;
-        const bins = charts.map((chart) => bucket(rows, chart.series, to - pick.millis, to));
+        // A refusal comes back as a value too, without the series.
+        const readings = range && Array.isArray(range.series) ? range : null;
+        if (host !== null && readings === null) {
+          setLoaded({ state: "failed" });
+          return;
+        }
+        const bins = charts.map(({ series }) =>
+          series.source === "slots"
+            ? window && bucket(window.rows, series, from, to)
+            : readings && hostBins(readings, series),
+        );
         drawn.current = pick;
-        setLoaded(bins.some((held) => held !== null) ? { state: "ready", bins, slots: rows.length, reached } : { state: "empty" });
+        setLoaded(
+          bins.some((held) => held !== null)
+            ? {
+                state: "ready",
+                from,
+                bins,
+                slots: window && { count: window.rows.length, reached: window.reached },
+                host: readings && { stepMillis: readings.step_ms, heldFrom: readings.held_from },
+              }
+            : { state: "empty" },
+        );
       })
       .catch(() => {
         if (!stale) setLoaded({ state: "failed" });
@@ -319,13 +371,37 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
         ))}
       </div>
       <p className="ask-source">
-        {loaded.state === "ready" && `${count(loaded.slots)} slots from the slot history, ${windowLabel(millis)} · `}
-        series chosen by Chrome's built-in model in {(pickedMillis / 1000).toFixed(1)} s
-        {loaded.state === "ready" && !loaded.reached && " · the history does not reach back that far"}
-        {asked.clamped && " · windows run from 5 minutes to 6 hours"}
+        {[
+          ...(loaded.state === "ready" ? sources(loaded, millis) : []),
+          `series chosen by Chrome's built-in model in ${(pickedMillis / 1000).toFixed(1)} s`,
+          ...(loaded.state === "ready" ? shortfalls(loaded) : []),
+          ...(asked.clamped ? ["windows run from 5 minutes to 6 hours"] : []),
+        ].join(" · ")}
       </p>
     </section>
   );
+}
+
+type Ready = Extract<Loaded, { state: "ready" }>;
+
+/** Where a drawn answer's readings came from, as the source line opens. */
+function sources(loaded: Ready, millis: number): string[] {
+  const parts: string[] = [];
+  if (loaded.slots) parts.push(`${count(loaded.slots.count)} slots from the slot history`);
+  if (loaded.host) parts.push(`host readings every ${Math.round(loaded.host.stepMillis / 1000)} s`);
+  return [`${parts.join(" and ")}, ${windowLabel(millis)}`];
+}
+
+/** What a drawn answer's window asked for and the server does not hold. */
+function shortfalls(loaded: Ready): string[] {
+  const parts: string[] = [];
+  if (loaded.slots && !loaded.slots.reached) parts.push("the slot history does not reach back that far");
+  if (loaded.host) {
+    const { heldFrom } = loaded.host;
+    if (heldFrom === null) parts.push("no host readings are held yet");
+    else if (heldFrom > loaded.from) parts.push(`host readings begin ${clockTime(heldFrom)}`);
+  }
+  return parts;
 }
 
 /** One series of a request: what it was read as, then its figures and chart, or why there are none. */

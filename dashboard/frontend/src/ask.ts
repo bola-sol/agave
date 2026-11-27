@@ -3,24 +3,39 @@
 
 import { HAS_BLOCK, HAS_CLOCK, HAS_REPLAY, HAS_SHREDS, HAS_TIPS, type SlotRange, type WireRow } from "./slotHistory";
 
-export interface Series {
+interface Named {
   key: string;
   label: string;
   unit: string;
-  /** Summed over a bin and divided by its seconds, rather than averaged per block. */
-  rate: boolean;
   /** What the model is told the series is. */
   hint: string;
   /** Word stems a request for this series usually holds, its own name first. */
   stems: readonly string[];
+}
+
+/** A column of the slot history, one reading a block. */
+export interface SlotSeries extends Named {
+  source: "slots";
+  /** Summed over a bin and divided by its seconds, rather than averaged per block. */
+  rate: boolean;
   read: (row: WireRow) => number | null;
 }
+
+/** A reading of the machine, kept by the server in ten-second bins. */
+export interface HostSeries extends Named {
+  source: "host";
+  /** Turns the server's figure into the unit shown. */
+  scale: number;
+}
+
+export type Series = SlotSeries | HostSeries;
 
 const has = (row: WireRow, flags: number): boolean => (row[1] & flags) === flags;
 const LAMPORTS_PER_SOL = 1e9;
 
-export const SERIES: readonly Series[] = [
+export const SLOT_SERIES: readonly SlotSeries[] = [
   {
+    source: "slots",
     key: "shreds",
     label: "Shreds",
     unit: "per second",
@@ -30,6 +45,7 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_SHREDS) ? row[10] : null),
   },
   {
+    source: "slots",
     key: "repaired",
     label: "Repaired shreds",
     unit: "per block",
@@ -39,6 +55,7 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_SHREDS) ? row[11] : null),
   },
   {
+    source: "slots",
     key: "recovered",
     label: "Recovered shreds",
     unit: "per block",
@@ -48,6 +65,7 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_SHREDS) ? row[15] : null),
   },
   {
+    source: "slots",
     key: "transactions",
     label: "Transactions",
     unit: "per second",
@@ -57,6 +75,7 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_BLOCK) ? row[3] : null),
   },
   {
+    source: "slots",
     key: "votes",
     label: "Vote transactions",
     unit: "per second",
@@ -66,6 +85,7 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_BLOCK) ? row[2] : null),
   },
   {
+    source: "slots",
     key: "failed",
     label: "Failed transactions",
     unit: "per block",
@@ -75,15 +95,17 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_BLOCK) ? row[16] : null),
   },
   {
+    source: "slots",
     key: "compute",
     label: "Compute",
     unit: "million CU per block",
     rate: false,
-    hint: "compute units used per block; how full blocks are",
+    hint: "CU: compute units used per block; how full blocks are",
     stems: ["comput", "cus?\\b"],
     read: (row) => (has(row, HAS_BLOCK) ? row[4] / 1e6 : null),
   },
   {
+    source: "slots",
     key: "fees",
     label: "Fees",
     unit: "SOL per block",
@@ -93,6 +115,7 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_BLOCK) ? row[5] / LAMPORTS_PER_SOL : null),
   },
   {
+    source: "slots",
     key: "priority_fees",
     label: "Priority fees",
     unit: "SOL per block",
@@ -102,6 +125,7 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_BLOCK) ? row[6] / LAMPORTS_PER_SOL : null),
   },
   {
+    source: "slots",
     key: "tips",
     label: "Tips",
     unit: "SOL per block",
@@ -111,6 +135,7 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_BLOCK | HAS_TIPS) ? row[7] / LAMPORTS_PER_SOL : null),
   },
   {
+    source: "slots",
     key: "replay",
     label: "Replay time",
     unit: "ms per block",
@@ -120,6 +145,7 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_REPLAY) ? row[9] / 1000 : null),
   },
   {
+    source: "slots",
     key: "fill",
     label: "Time to full",
     unit: "ms per block",
@@ -129,6 +155,95 @@ export const SERIES: readonly Series[] = [
     read: (row) => (has(row, HAS_SHREDS) ? row[12] : null),
   },
 ];
+
+const GIB = 2 ** 30;
+
+/** Named as `host.range` names them. */
+export const HOST_SERIES: readonly HostSeries[] = [
+  {
+    source: "host",
+    key: "cpu",
+    label: "CPU use",
+    unit: "percent",
+    hint: "share of the machine's processors in use, percent; CPU usage",
+    stems: ["cpu", "processor"],
+    scale: 100,
+  },
+  {
+    source: "host",
+    key: "load",
+    label: "Load",
+    unit: "one-minute average",
+    hint: "the machine's load average",
+    stems: ["load"],
+    scale: 1,
+  },
+  {
+    source: "host",
+    key: "memory",
+    label: "Memory in use",
+    unit: "GiB",
+    hint: "memory in use on the whole machine, all processes together; RAM",
+    stems: ["memor", "ram\\b"],
+    scale: 1 / GIB,
+  },
+  {
+    source: "host",
+    key: "validator_memory",
+    label: "Validator memory",
+    unit: "GiB",
+    hint: "memory used by the validator process alone; resident, RSS",
+    stems: ["validator(?:'s)? memor", "resident", "rss\\b", "process memor"],
+    scale: 1 / GIB,
+  },
+  {
+    source: "host",
+    key: "net_in",
+    label: "Network in",
+    unit: "MB per second",
+    hint: "network traffic the machine receives; ingress, inbound, download",
+    stems: ["network in", "ingress", "inbound", "receiv", "download"],
+    scale: 1e-6,
+  },
+  {
+    source: "host",
+    key: "net_out",
+    label: "Network out",
+    unit: "MB per second",
+    hint: "network traffic the machine sends; egress, outbound, upload",
+    stems: ["network out", "egress", "outbound", "sent\\b", "upload"],
+    scale: 1e-6,
+  },
+  {
+    source: "host",
+    key: "disk_used",
+    label: "Disk used",
+    unit: "percent of the fullest filesystem",
+    hint: "how full the disks are, the fullest one; disk space, storage",
+    stems: ["disk (?:us|space|full)", "storage", "filesystem"],
+    scale: 100,
+  },
+  {
+    source: "host",
+    key: "disk_busy",
+    label: "Disk busy",
+    unit: "percent of the busiest disk",
+    hint: "how busy the disks are, the busiest one; disk I/O, utilisation",
+    stems: ["disk (?:bus|i/?o|util|activ|load)", "iops\\b", "i/o"],
+    scale: 100,
+  },
+  {
+    source: "host",
+    key: "udp_drops",
+    label: "UDP drops",
+    unit: "per second",
+    hint: "packets the kernel dropped on the validator's UDP ports",
+    stems: ["udp", "drop"],
+    scale: 1,
+  },
+];
+
+export const SERIES: readonly Series[] = [...SLOT_SERIES, ...HOST_SERIES];
 
 /** The model's answer for a request no series fits. */
 export const NONE = "none";
@@ -266,8 +381,8 @@ export function seriesSchema(series: readonly Series[]): object {
 
 export function systemPrompt(series: readonly Series[]): string {
   return [
-    "A request asks to see charts of things a Solana validator records. Answer with the key of each series it asks for, in the order asked. Most requests ask for one; never add a series the request does not ask for.",
-    `Answer ${NONE} for anything asked for that is not listed. Do not pick the nearest.`,
+    "A request asks to see charts of things recorded about a Solana validator and the machine it runs on. Answer with the key of each series it asks for, in the order asked. Most requests ask for one; never add a series the request does not ask for.",
+    `Answer ${NONE} for anything asked for that is not listed, such as a temperature, a price, a latency or one protocol's traffic. Do not pick the nearest.`,
     "Series:",
     ...series.map((entry) => `${entry.key}: ${entry.hint}`),
   ].join("\n");
@@ -304,7 +419,7 @@ export function parseReply(text: string, series: readonly Series[]): Reply | nul
 }
 
 /** A request for more than one thing joins them with one of these. */
-const JOINER = /[,&]|\b(?:and|plus|vs|versus|separate|both)\b/;
+const JOINER = /[,&]|\b(?:and|plus|vs|versus|against|separate|both)\b/;
 
 /** The series a request asked for and did not get, in the order asked. Only a request that joins
  *  several things has any, and a series counts by its first stem alone, outside a "per" unit and
@@ -328,16 +443,21 @@ export function leftOut(typed: string, picked: readonly Series[], all: readonly 
 export function notDrawnNote(left: readonly Series[], unmatched: boolean): string | null {
   const parts: string[] = [];
   if (left.length > 0) {
-    const names = left.map((entry) => entry.label.toLowerCase()).join(", ");
+    const names = left.map((entry) => inSentence(entry.label)).join(", ");
     parts.push(`Not drawn: ${names}. Ask for ${left.length === 1 ? "it on its own" : "them on their own"}.`);
   }
   if (unmatched) parts.push("Part of this request matches nothing recorded.");
   return parts.length > 0 ? parts.join(" ") : null;
 }
 
+/** A label as it reads inside a sentence: lower case, but for a leading acronym. */
+function inSentence(label: string): string {
+  return /^[A-Z][a-z]/.test(label) ? label.charAt(0).toLowerCase() + label.slice(1) : label;
+}
+
 /** What a refusal lists as recorded. */
 export function recordedList(series: readonly Series[]): string {
-  return series.map((entry) => entry.label.toLowerCase()).join(", ");
+  return series.map((entry) => inSentence(entry.label)).join(", ");
 }
 
 export function windowLabel(millis: number): string {
@@ -405,7 +525,7 @@ export const BIN_COUNT = 120;
 /** The readings in equal spans of time, or null when the window holds none. */
 export function bucket(
   rows: readonly [number, WireRow][],
-  series: Series,
+  series: SlotSeries,
   from: number,
   to: number,
   count = BIN_COUNT,
@@ -432,6 +552,39 @@ export function bucket(
     values,
     min: Math.min(...real),
     max: Math.max(...real),
+    mean: real.reduce((sum, value) => sum + value, 0) / real.length,
+    latest: real[real.length - 1],
+  };
+}
+
+/** What `host.range` answers. */
+export interface HostRange {
+  from: number;
+  to: number;
+  step_ms: number;
+  /** When the readings held begin, or null with none held. */
+  held_from: number | null;
+  series: { key: string; mean: (number | null)[]; max: (number | null)[] }[];
+}
+
+/** How far apart the server keeps host readings, which a window is lined up to. */
+export const HOST_STEP_MILLIS = 10_000;
+
+/** One host series of a reply as a chart's readings, or null when the window holds none. The line
+ *  is each step's mean; the highest is the highest single reading, which the line may not reach. */
+export function hostBins(range: HostRange, series: HostSeries): Bins | null {
+  const held = range.series.find((entry) => entry.key === series.key);
+  if (!held) return null;
+  const values = held.mean.map((value) => (value === null ? null : value * series.scale));
+  const real = values.filter((value): value is number => value !== null);
+  if (real.length === 0) return null;
+  const peaks = held.max.filter((value): value is number => value !== null).map((value) => value * series.scale);
+  return {
+    from: range.from,
+    to: range.to,
+    values,
+    min: Math.min(...real),
+    max: Math.max(...real, ...peaks),
     mean: real.reduce((sum, value) => sum + value, 0) / real.length,
     latest: real[real.length - 1],
   };

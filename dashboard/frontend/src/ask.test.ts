@@ -4,6 +4,8 @@ import {
   bucket,
   ceiling,
   figure,
+  HOST_SERIES,
+  hostBins,
   leftOut,
   MAX_EMPTY_PAGES,
   MAX_PAGES,
@@ -19,11 +21,15 @@ import {
   recordedList,
   SERIES,
   seriesSchema,
+  SLOT_SERIES,
   systemPrompt,
   windowLabel,
   windowOf,
   windowShort,
+  type HostRange,
+  type HostSeries,
   type Series,
+  type SlotSeries,
 } from "./ask";
 import {
   HAS_BLOCK,
@@ -41,6 +47,18 @@ const HOUR = 3_600_000;
 function series(key: string): Series {
   const found = SERIES.find((entry) => entry.key === key);
   if (!found) throw new Error(`no series ${key}`);
+  return found;
+}
+
+function slot(key: string): SlotSeries {
+  const found = SLOT_SERIES.find((entry) => entry.key === key);
+  if (!found) throw new Error(`no slot series ${key}`);
+  return found;
+}
+
+function host(key: string): HostSeries {
+  const found = HOST_SERIES.find((entry) => entry.key === key);
+  if (!found) throw new Error(`no host series ${key}`);
   return found;
 }
 
@@ -151,28 +169,102 @@ describe("SERIES", () => {
   });
 
   it("reads nothing from a row without the flag its column needs", () => {
-    for (const entry of SERIES) expect(entry.read(row(HAS_CLOCK))).toBeNull();
+    for (const entry of SLOT_SERIES) expect(entry.read(row(HAS_CLOCK))).toBeNull();
   });
 
   it("reads each column, scaled to its unit", () => {
     const full = row(HAS_BLOCK | HAS_CLOCK | HAS_TIPS | HAS_REPLAY | HAS_SHREDS);
-    expect(series("shreds").read(full)).toBe(1300);
-    expect(series("repaired").read(full)).toBe(7);
-    expect(series("recovered").read(full)).toBe(31);
-    expect(series("transactions").read(full)).toBe(1500);
-    expect(series("votes").read(full)).toBe(2000);
-    expect(series("failed").read(full)).toBe(180);
-    expect(series("compute").read(full)).toBe(40);
-    expect(series("fees").read(full)).toBe(3);
-    expect(series("priority_fees").read(full)).toBe(1);
-    expect(series("tips").read(full)).toBe(0.5);
-    expect(series("replay").read(full)).toBe(9);
-    expect(series("fill").read(full)).toBe(380);
+    expect(slot("shreds").read(full)).toBe(1300);
+    expect(slot("repaired").read(full)).toBe(7);
+    expect(slot("recovered").read(full)).toBe(31);
+    expect(slot("transactions").read(full)).toBe(1500);
+    expect(slot("votes").read(full)).toBe(2000);
+    expect(slot("failed").read(full)).toBe(180);
+    expect(slot("compute").read(full)).toBe(40);
+    expect(slot("fees").read(full)).toBe(3);
+    expect(slot("priority_fees").read(full)).toBe(1);
+    expect(slot("tips").read(full)).toBe(0.5);
+    expect(slot("replay").read(full)).toBe(9);
+    expect(slot("fill").read(full)).toBe(380);
   });
 
   it("reads tips only where the block's tips were read", () => {
-    expect(series("tips").read(row(HAS_BLOCK))).toBeNull();
-    expect(series("tips").read(row(HAS_TIPS))).toBeNull();
+    expect(slot("tips").read(row(HAS_BLOCK))).toBeNull();
+    expect(slot("tips").read(row(HAS_TIPS))).toBeNull();
+  });
+});
+
+describe("HOST_SERIES", () => {
+  it("is named as the server names its readings, each apart from every per-slot key", () => {
+    expect(HOST_SERIES.map((entry) => entry.key)).toEqual([
+      "cpu",
+      "load",
+      "memory",
+      "validator_memory",
+      "net_in",
+      "net_out",
+      "disk_used",
+      "disk_busy",
+      "udp_drops",
+    ]);
+    const keys = SERIES.map((entry) => entry.key);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(SERIES).toHaveLength(SLOT_SERIES.length + HOST_SERIES.length);
+  });
+
+  it("is found by the words a request for the host uses", () => {
+    expect(namesSeries("cpu usgae", host("cpu"))).toBe(true);
+    expect(namesSeries("Host network ingress", host("net_in"))).toBe(true);
+    expect(namesSeries("outbound traffic", host("net_out"))).toBe(true);
+    expect(namesSeries("how much RAM is in use", host("memory"))).toBe(true);
+    expect(namesSeries("the validator's memory", host("validator_memory"))).toBe(true);
+    expect(namesSeries("disk space left", host("disk_used"))).toBe(true);
+    expect(namesSeries("disk I/O", host("disk_busy"))).toBe(true);
+    expect(namesSeries("kernel drops", host("udp_drops"))).toBe(true);
+  });
+
+  it("is not found in a word that only holds one of them", () => {
+    expect(namesSeries("program cache", host("memory"))).toBe(false);
+    expect(namesSeries("downloads", host("load"))).toBe(false);
+    expect(namesSeries("shreds sent per second", host("net_in"))).toBe(false);
+  });
+});
+
+describe("hostBins", () => {
+  const range = (mean: (number | null)[], max: (number | null)[]): HostRange => ({
+    from: 1000,
+    to: 41_000,
+    step_ms: 10_000,
+    held_from: 1000,
+    series: [
+      { key: "load", mean: [1, 1, 1, 1], max: [1, 1, 1, 1] },
+      { key: "cpu", mean, max },
+    ],
+  });
+
+  it("scales the server's figures to the unit shown and keeps the reply's own span", () => {
+    const bins = hostBins(range([0.2, 0.4, null, 0.3], [0.5, 0.9, null, 0.3]), host("cpu"));
+    expect(bins).toMatchObject({ from: 1000, to: 41_000, min: 20, latest: 30 });
+    expect(bins?.values).toEqual([20, 40, null, 30]);
+    expect(bins?.mean).toBeCloseTo(30);
+  });
+
+  it("gives the highest single reading, which the line of means may not reach", () => {
+    expect(hostBins(range([0.2, 0.4, null, 0.3], [0.5, 0.9, null, 0.3]), host("cpu"))?.max).toBe(90);
+  });
+
+  it("is null for a series the reply lacks or a window with no reading", () => {
+    expect(hostBins(range([null, null, null, null], [null, null, null, null]), host("cpu"))).toBeNull();
+    expect(hostBins(range([0.2], [0.2]), host("memory"))).toBeNull();
+  });
+
+  it("shows memory in GiB and network in megabytes", () => {
+    const one = (key: string, value: number): number | undefined =>
+      hostBins({ from: 0, to: 10_000, step_ms: 10_000, held_from: 0, series: [{ key, mean: [value], max: [value] }] }, host(key))
+        ?.latest;
+    expect(one("memory", 3 * 2 ** 30)).toBe(3);
+    expect(one("net_in", 60_000_000)).toBe(60);
+    expect(one("disk_used", 0.61)).toBeCloseTo(61);
   });
 });
 
@@ -214,7 +306,7 @@ describe("systemPrompt", () => {
     const prompt = systemPrompt(SERIES);
     for (const entry of SERIES) expect(prompt).toContain(`${entry.key}: ${entry.hint}`);
     expect(prompt).toContain(NONE);
-    expect(prompt.length).toBeLessThan(2000);
+    expect(prompt.length).toBeLessThan(3000);
   });
 });
 
@@ -246,8 +338,8 @@ describe("parseReply", () => {
 
   it("returns null for anything outside the schema", () => {
     expect(parseReply('{"series":"shreds"}', SERIES)).toBeNull();
-    expect(parseReply('{"series":["cpu"]}', SERIES)).toBeNull();
-    expect(parseReply('{"series":["shreds","cpu"]}', SERIES)).toBeNull();
+    expect(parseReply('{"series":["gpu"]}', SERIES)).toBeNull();
+    expect(parseReply('{"series":["shreds","gpu"]}', SERIES)).toBeNull();
     expect(parseReply('{"series":[7]}', SERIES)).toBeNull();
     expect(parseReply('{"chart":["shreds"]}', SERIES)).toBeNull();
     expect(parseReply("shreds", SERIES)).toBeNull();
@@ -301,6 +393,15 @@ describe("leftOut", () => {
     expect(keys("Replay time, last 15 minutes", "replay")).toEqual([]);
   });
 
+  it("tells the host's own pairs apart", () => {
+    expect(keys("memory and validator memory", "validator_memory")).toEqual([]);
+    expect(keys("cpu and memory usage", "cpu")).toEqual(["memory"]);
+    expect(keys("disk space and disk busy", "disk_used")).toEqual(["disk_busy"]);
+    expect(keys("Host network ingress against tps", "transactions")).toEqual(["net_in"]);
+    expect(keys("network in and network out", "net_in")).toEqual(["net_out"]);
+    expect(keys("shreds and CPU usage over the past hour", "shreds")).toEqual(["cpu"]);
+  });
+
   it("never fires on a series asked for by its own label", () => {
     for (const entry of SERIES) expect(leftOut(entry.label, [entry], SERIES)).toEqual([]);
   });
@@ -318,6 +419,12 @@ describe("notDrawnNote", () => {
     );
   });
 
+  it("keeps an acronym as it is written", () => {
+    expect(notDrawnNote([host("cpu"), host("disk_busy")], false)).toBe(
+      "Not drawn: CPU use, disk busy. Ask for them on their own.",
+    );
+  });
+
   it("says when part of the request is not recorded, beside anything left out", () => {
     expect(notDrawnNote([], true)).toBe("Part of this request matches nothing recorded.");
     expect(notDrawnNote([series("replay")], true)).toBe(
@@ -329,6 +436,7 @@ describe("notDrawnNote", () => {
 describe("recordedList", () => {
   it("lists every series by its label", () => {
     expect(recordedList(SERIES.slice(0, 3))).toBe("shreds, repaired shreds, recovered shreds");
+    expect(recordedList([host("cpu"), host("memory"), host("udp_drops")])).toBe("CPU use, memory in use, UDP drops");
   });
 });
 
@@ -421,35 +529,35 @@ describe("bucket", () => {
 
   it("turns a rate into readings per second of each span", () => {
     // Four spans of ten seconds; two blocks of 1300 shreds in the first.
-    const bins = bucket([timed(1000), timed(5000)], series("shreds"), 0, 40_000, 4);
+    const bins = bucket([timed(1000), timed(5000)], slot("shreds"), 0, 40_000, 4);
     expect(bins?.values).toEqual([260, null, null, null]);
   });
 
   it("averages a per-block series over the blocks in each span", () => {
-    const bins = bucket([timed(1000), timed(5000), timed(12_000)], series("failed"), 0, 40_000, 4);
+    const bins = bucket([timed(1000), timed(5000), timed(12_000)], slot("failed"), 0, 40_000, 4);
     expect(bins?.values).toEqual([180, 180, null, null]);
   });
 
   it("leaves the newest span out, which is still filling", () => {
-    const bins = bucket([timed(1000), timed(39_000)], series("shreds"), 0, 40_000, 4);
+    const bins = bucket([timed(1000), timed(39_000)], slot("shreds"), 0, 40_000, 4);
     expect(bins?.values).toEqual([130, null, null, null]);
   });
 
   it("holds a reading outside the window to the nearest span", () => {
-    const bins = bucket([timed(-5000), timed(15_000)], series("failed"), 0, 40_000, 4);
+    const bins = bucket([timed(-5000), timed(15_000)], slot("failed"), 0, 40_000, 4);
     expect(bins?.values).toEqual([180, 180, null, null]);
   });
 
   it("gives the lowest, highest, mean and latest of the spans drawn", () => {
     const light: [number, WireRow] = [15_000, [...row(HAS_BLOCK, 15_000)] as WireRow];
     light[1][16] = 20;
-    const bins = bucket([timed(1000), light], series("failed"), 0, 40_000, 4);
+    const bins = bucket([timed(1000), light], slot("failed"), 0, 40_000, 4);
     expect(bins).toMatchObject({ from: 0, to: 40_000, min: 20, max: 180, mean: 100, latest: 20 });
   });
 
   it("is null when no row in the window carries the series", () => {
-    expect(bucket([], series("shreds"), 0, 40_000, 4)).toBeNull();
-    expect(bucket([[1000, row(HAS_CLOCK, 1000)]], series("shreds"), 0, 40_000, 4)).toBeNull();
+    expect(bucket([], slot("shreds"), 0, 40_000, 4)).toBeNull();
+    expect(bucket([[1000, row(HAS_CLOCK, 1000)]], slot("shreds"), 0, 40_000, 4)).toBeNull();
   });
 });
 

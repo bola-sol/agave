@@ -91,7 +91,9 @@ the domain in the site block is the name to allow, and nothing else is needed.
 - The Ask page hands what a viewer types to the language model built into
   their own browser, and shows only where the browser has one. Neither the
   text nor the model's answer is sent to the dashboard or anywhere else; the
-  page then asks the dashboard for slot history, as the schedule does.
+  page then asks the dashboard for slot history, as the schedule does, and for
+  the host's readings, which anyone who can reach the page can chart two days
+  back: CPU, load, memory, network, disk and UDP drops.
 - The machine card shows what is not on chain: the host's memory and the
   validator's share of it, its core count, load, CPU use, governor and swap,
   each disk's device name and fill, the absolute paths of the ledger, accounts
