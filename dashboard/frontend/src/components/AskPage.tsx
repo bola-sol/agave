@@ -32,6 +32,7 @@ import {
 import {
   answerFigure,
   comparing,
+  directed,
   readAs,
   shareFigure,
   sharePair,
@@ -404,7 +405,10 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
       clock: clockTime,
     };
     const panels = charts.map((chart, index) =>
-      answerFigure(read, chart.series, loaded.bins[index] ?? null, { ...base, threshold: thresholds[index] }),
+      answerFigure(directed(read, typed, chart.series), chart.series, loaded.bins[index] ?? null, {
+        ...base,
+        threshold: thresholds[index],
+      }),
     );
     let share: Worked = null;
     if (read === "share") {
@@ -453,7 +457,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
             bins={loaded.state === "ready" ? loaded.bins[index] : null}
             waiting={WAITING[waiting]}
             announce={loaded.state === "ready" || index === 0}
-            operation={read}
+            operation={directed(read, typed, chart.series)}
             threshold={thresholds[index]}
             worked={worked.panels[index]}
           />

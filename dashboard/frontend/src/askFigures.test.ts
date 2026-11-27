@@ -3,6 +3,7 @@ import { bucket, SERIES, windowOf, type Bins, type Series, type SlotSeries } fro
 import {
   answerFigure,
   comparing,
+  directed,
   lasting,
   NO_SHARE,
   OPERATION_PROMPT,
@@ -106,6 +107,24 @@ describe("sharePair", () => {
     expect(sharePair([series("transactions")])).toBeNull();
     expect(sharePair([series("fees"), series("tips")])).toBeNull();
     expect(sharePair([])).toBeNull();
+  });
+});
+
+describe("directed", () => {
+  it("takes the worst, slowest or longest of a time for its highest, and the best for its lowest", () => {
+    expect(directed("lowest", "worst replay time today", series("replay"))).toBe("highest");
+    expect(directed("lowest", "slowest block fill in the past hour", series("fill"))).toBe("highest");
+    expect(directed("lowest", "longest replay this hour", series("replay"))).toBe("highest");
+    expect(directed("highest", "fastest replay this hour", series("replay"))).toBe("lowest");
+    expect(directed("highest", "best time to full today", series("fill"))).toBe("lowest");
+  });
+
+  it("leaves other series, other operations and plain requests as read", () => {
+    expect(directed("lowest", "worst tps today", series("transactions"))).toBe("lowest");
+    expect(directed("mean", "worst replay time", series("replay"))).toBe("mean");
+    expect(directed("chart", "slowest replay", series("replay"))).toBe("chart");
+    expect(directed("lowest", "lowest replay time", series("replay"))).toBe("lowest");
+    expect(directed(null, "worst replay time", series("replay"))).toBeNull();
   });
 });
 
