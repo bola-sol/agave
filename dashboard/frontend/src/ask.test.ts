@@ -251,7 +251,9 @@ describe("hostBins", () => {
 
   it("scales the server's figures to the unit shown and keeps the reply's own span", () => {
     const bins = hostBins(range([0.2, 0.4, null, 0.3], [0.5, 0.9, null, 0.3]), host("cpu"));
-    expect(bins).toMatchObject({ from: 1000, to: 41_000, min: 20, latest: 30 });
+    expect(bins).toMatchObject({ from: 1000, to: 41_000, min: 20, latest: 30, binMillis: 10_000, first: 1000 });
+    expect(bins?.peaks).toEqual([50, 90, null, 30]);
+    expect(hostBins(range([null, 0.4], [null, 0.4]), host("cpu"))?.first).toBe(11_000);
     expect(bins?.values).toEqual([20, 40, null, 30]);
     expect(bins?.mean).toBeCloseTo(30);
   });
@@ -491,6 +493,9 @@ describe("readWindow", () => {
     expect(read.rows).toHaveLength(1000);
     expect(read.rows.every(([time]) => time >= 9_000_000)).toBe(true);
     expect(read.reached).toBe(true);
+    // Each row carries its own slot.
+    expect(read.rows[0][2]).toBe(9999);
+    expect(read.rows[0][0]).toBe(9_999_000);
   });
 
   it("walks back a page at a time until the window is covered", async () => {
