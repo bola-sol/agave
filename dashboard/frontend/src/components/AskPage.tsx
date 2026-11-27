@@ -45,8 +45,26 @@ import {
   type ThresholdRead,
 } from "../askFigures";
 import { askModel, useAskModel, type AskModelSnapshot } from "../askModel";
+import {
+  asksEarned,
+  asksProduction,
+  earningsLine,
+  OWN_KEYS,
+  ownAmount,
+  ownFigure,
+  ownLabel,
+  ownReadings,
+  ownScope,
+  production,
+  readOwnBlocks,
+  type OwnReading,
+  type OwnWindow,
+} from "../askOwn";
+import { useBalancesHidden } from "../balances";
 import { clockTime, count } from "../format";
+import { heldShortLabel, type BlockHead } from "../produced";
 import type { Store } from "../store";
+import type { EpochEarnings, LeaderSlotCounts, TipRates } from "../types";
 import { useRequests } from "../useStore";
 
 type Answered =
@@ -257,7 +275,7 @@ function AskDownload({ model }: { model: AskModelSnapshot }): ReactElement | nul
 
 function Answer({ item }: { item: Item }): ReactElement {
   const { answer, typed } = item;
-  if (answer.kind === "charts") return <ChartsAnswer typed={typed} answer={answer} />;
+  if (answer.kind === "charts") return <ScopedAnswer typed={typed} answer={answer} />;
   return (
     <section className="card ask-answer">
       <p className="ask-asked">{typed}</p>
@@ -321,8 +339,50 @@ const WAITING: Record<"offline" | "loading" | "empty" | "failed", string> = {
   failed: "The validator did not answer.",
 };
 
-function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answered, { kind: "charts" }> }): ReactElement {
-  const { charts, asked, pickedMillis, note, operation, operationMillis } = answer;
+type ChartsAnswered = Extract<Answered, { kind: "charts" }>;
+
+type Scope = "ours" | "all";
+
+/** A request our own blocks can answer starts on them when it says so, and either way can switch. */
+function ScopedAnswer({ typed, answer }: { typed: string; answer: ChartsAnswered }): ReactElement {
+  const ownable = useMemo(
+    () => answer.charts.some((chart) => OWN_KEYS.has(chart.series.key)) || asksProduction(typed) || asksEarned(typed),
+    [answer.charts, typed],
+  );
+  const [scope, setScope] = useState<Scope>(() => (ownable && ownScope(typed) ? "ours" : "all"));
+  const toggle = ownable ? <ScopeToggle scope={scope} onScope={setScope} /> : null;
+  return scope === "ours" ? (
+    <OwnAnswer typed={typed} answer={answer} toggle={toggle} />
+  ) : (
+    <ChartsAnswer typed={typed} answer={answer} toggle={toggle} />
+  );
+}
+
+function ScopeToggle({ scope, onScope }: { scope: Scope; onScope: (scope: Scope) => void }): ReactElement {
+  return (
+    <div className="toggle-group ask-scope" role="group" aria-label="Blocks">
+      <button type="button" aria-pressed={scope === "ours"} onClick={() => onScope("ours")}>
+        Our blocks
+      </button>
+      <button type="button" aria-pressed={scope === "all"} onClick={() => onScope("all")}>
+        Every leader
+      </button>
+    </div>
+  );
+}
+
+function ChartsAnswer({
+  typed,
+  answer,
+  toggle,
+}: {
+  typed: string;
+  answer: ChartsAnswered;
+  toggle: ReactElement | null;
+}): ReactElement {
+  const { charts, asked, pickedMillis, operation, operationMillis } = answer;
+  // Asked of our own blocks with nothing they measure: every leader's chart, said so.
+  const note = [answer.note, toggle === null && ownScope(typed) ? NOT_OURS : null].filter(Boolean).join(" ") || null;
   // Always the live validator: a request for the past hour means the hour up to now.
   const live = useRequests();
   const perSlot = charts.some((chart) => chart.series.source === "slots");
@@ -432,6 +492,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
     <section className="card ask-answer">
       <div className="ask-head">
         <p className="ask-asked">{typed}</p>
+        {toggle}
         <div className="toggle-group ask-windows" role="group" aria-label="Window">
           {!own && (
             <button type="button" aria-pressed={asked.millis === millis} onClick={() => choose(asked.millis)}>
@@ -481,6 +542,313 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
 }
 
 type Ready = Extract<Loaded, { state: "ready" }>;
+
+const NOT_OURS = "Not measured for our own blocks; this is every leader's.";
+
+/** A window over our blocks: this epoch or the last by slot, or a span of time. */
+type OwnPick = { window: "this" | "last" | number; turn: number };
+
+type OwnLoaded =
+  | { state: "loading" }
+  | { state: "failed" }
+  | {
+      state: "ready";
+      label: string;
+      /** The epoch the window is, or null for a span of time. */
+      epoch: number | null;
+      current: boolean;
+      blocks: readonly BlockHead[];
+      counts: LeaderSlotCounts | undefined;
+      earnings: EpochEarnings | null;
+      rates: TipRates | undefined;
+    };
+
+const EPOCH_WINDOWS: readonly { key: "this" | "last"; label: string }[] = [
+  { key: "this", label: "This epoch" },
+  { key: "last", label: "Last epoch" },
+];
+
+/** The fees series, which a request for what we earned answers when the model picked none. */
+const FEES = SERIES.find((series) => series.key === "fees");
+
+/** Figures over the blocks this validator built and the cluster kept, from the Slots page's list. */
+function OwnAnswer({ typed, answer, toggle }: { typed: string; answer: ChartsAnswered; toggle: ReactElement | null }): ReactElement {
+  const { charts, asked, pickedMillis, operation, operationMillis } = answer;
+  const live = useRequests();
+  const canRead = useCanRead(live, false);
+  const balancesHidden = useBalancesHidden();
+  // A window the request named stands; otherwise this epoch.
+  const [pick, setPick] = useState<OwnPick>({ window: asked.given ? asked.millis : "this", turn: 0 });
+  const [loaded, setLoaded] = useState<OwnLoaded>({ state: "loading" });
+  const drawn = useRef<OwnPick | null>(null);
+  const earned = asksEarned(typed);
+  const shown = useMemo(() => {
+    const own = charts.filter((chart) => OWN_KEYS.has(chart.series.key)).map((chart) => chart.series);
+    return own.length === 0 && earned && FEES ? [FEES] : own;
+  }, [charts, earned]);
+  const others = charts.filter((chart) => !OWN_KEYS.has(chart.series.key)).map((chart) => chart.series.label);
+  const thresholds = useMemo(() => shown.map((series) => thresholdOf(typed, series)), [typed, shown]);
+
+  useEffect(() => {
+    if (!canRead || drawn.current === pick) return;
+    const info = live.get("epoch", "new");
+    let window: OwnWindow;
+    let label: string;
+    let epoch: number | null = null;
+    if (typeof pick.window === "number") {
+      const now = Date.now() - (live.getClockOffset() ?? 0);
+      window = { kind: "time", from: now - pick.window, to: now };
+      label = windowLabel(pick.window);
+    } else {
+      if (!info) return;
+      const last = pick.window === "last";
+      epoch = last ? info.epoch - 1 : info.epoch;
+      const first = last ? info.start_slot - info.slots_in_epoch : info.start_slot;
+      window = { kind: "epoch", epoch, first, last: last ? info.start_slot - 1 : info.end_slot };
+      label = last ? `epoch ${count(epoch)}` : `epoch ${count(epoch)} so far`;
+    }
+    let stale = false;
+    setLoaded({ state: "loading" });
+    readOwnBlocks((before) => live.request("produced.figures", before === undefined ? {} : { before }), window)
+      .then((read) => {
+        if (stale) return;
+        drawn.current = pick;
+        setLoaded({
+          state: "ready",
+          label,
+          epoch,
+          current: epoch !== null && epoch === info?.epoch,
+          blocks: read.blocks,
+          counts: epoch === null ? undefined : live.get("summary", "leader_slot_counts")?.find((held) => held.epoch === epoch),
+          earnings: live.get("summary", "epoch_earnings") ?? null,
+          rates: live.get("summary", "tip_rates"),
+        });
+      })
+      .catch(() => {
+        if (!stale) setLoaded({ state: "failed" });
+      });
+    return () => {
+      stale = true;
+    };
+  }, [canRead, live, pick]);
+
+  const read = operation === "pending" ? null : operation;
+  const ready = loaded.state === "ready" ? loaded : null;
+  const short = ready ? heldShortLabel(ready.blocks.length, ready.counts) : null;
+  const worked = useMemo(() => {
+    if (!ready || read === null) return shown.map(() => null);
+    return shown.map((series, index) => {
+      const directedOp = directed(read, typed, series);
+      // What we earned is a total where nothing else was asked.
+      const op = earned && (directedOp === null || directedOp === "chart") ? "total" : directedOp;
+      return ownFigure(op, series, ready.blocks, ready.rates, {
+        window: ready.label,
+        threshold: thresholds[index],
+        clock: clockTime,
+        short,
+      });
+    });
+  }, [ready, read, shown, typed, earned, thresholds, short]);
+  const readings = useMemo(
+    () => (ready ? shown.map((series) => ownReadings(ready.blocks, series.key, ready.rates)) : null),
+    [ready, shown],
+  );
+  const headlines: Worked[] = [];
+  if (ready && asksProduction(typed)) {
+    headlines.push(
+      ready.epoch === null
+        ? { unfit: "Leader slot counts are kept by epoch: This epoch or Last epoch gives them." }
+        : production(ready.counts, { window: ready.label, short: null }),
+    );
+  }
+  if (ready && earned && ready.current && !balancesHidden) headlines.push(earningsLine(ready.earnings, ready.epoch));
+
+  const choose = (next: OwnPick["window"]): void => setPick((held) => ({ window: next, turn: held.turn + 1 }));
+  const named = asked.given && !WINDOWS.some((entry) => entry.millis === asked.millis);
+  const waiting = loaded.state === "failed" ? WAITING.failed : canRead ? WAITING.loading : WAITING.offline;
+  return (
+    <section className="card ask-answer">
+      <div className="ask-head">
+        <p className="ask-asked">{typed}</p>
+        {toggle}
+        <div className="toggle-group ask-windows" role="group" aria-label="Window">
+          {EPOCH_WINDOWS.map((entry) => (
+            <button key={entry.key} type="button" aria-pressed={pick.window === entry.key} onClick={() => choose(entry.key)}>
+              {entry.label}
+            </button>
+          ))}
+          {named && (
+            <button type="button" aria-pressed={pick.window === asked.millis} onClick={() => choose(asked.millis)}>
+              {windowShort(asked.millis)}
+            </button>
+          )}
+          {WINDOWS.map((entry) => (
+            <button key={entry.label} type="button" aria-pressed={pick.window === entry.millis} onClick={() => choose(entry.millis)}>
+              {entry.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {others.length > 0 && (
+        <p className="ask-note" role="status">
+          {others.join(", ")}: not measured for our own blocks; Every leader shows {others.length === 1 ? "it" : "them"}.
+        </p>
+      )}
+      <p className="ask-announce" role="status">
+        {announcement({ panels: worked, share: null })}
+        {headlines.length > 0 ? ` ${announcement({ panels: headlines, share: null })}` : ""}
+      </p>
+      {headlines.map((headline, index) => (
+        <FigureLine key={index} worked={headline} />
+      ))}
+      {shown.length > 0 && (
+        <div className="ask-charts">
+          {shown.map((series, index) => (
+            <OwnPanel
+              key={series.key}
+              series={series}
+              readings={readings?.[index] ?? null}
+              waiting={ready ? `No blocks of ours in the ${ready.label}.` : waiting}
+              worked={worked[index]}
+              threshold={thresholds[index]}
+            />
+          ))}
+        </div>
+      )}
+      {shown.length === 0 && !ready && <p className="ask-plain">{waiting}</p>}
+      <p className="ask-source">
+        {[
+          ready ? `${count(ready.blocks.length)} of our blocks from the Slots page's list, ${ready.label}` : null,
+          modelLine(pickedMillis, operation, operationMillis),
+          short,
+          asked.clamped ? "windows run from 5 minutes to 6 hours" : null,
+        ]
+          .filter(Boolean)
+          .join(" · ")}
+      </p>
+    </section>
+  );
+}
+
+/** One series over our blocks: what it was read as, the figure, its tiles and a bar per block. */
+function OwnPanel({
+  series,
+  readings,
+  waiting,
+  worked,
+  threshold,
+}: {
+  series: Series;
+  readings: readonly OwnReading[] | null;
+  waiting: string;
+  worked: Worked;
+  threshold: ThresholdRead;
+}): ReactElement {
+  const as = ownLabel(series);
+  const held = readings && readings.length > 0 ? readings : null;
+  const fits = threshold && !("wrong" in threshold) ? threshold.value : undefined;
+  const tiles = useMemo(() => {
+    if (!held) return null;
+    let low = held[0];
+    let high = held[0];
+    let sum = 0;
+    for (const reading of held) {
+      if (reading.value < low.value) low = reading;
+      if (reading.value > high.value) high = reading;
+      sum += reading.value;
+    }
+    return { latest: held[held.length - 1].value, mean: sum / held.length, low: low.value, high: high.value };
+  }, [held]);
+  return (
+    <div className="ask-series">
+      <div className="ask-read">
+        <span className="ask-read-label">Read as</span>
+        <span className="ask-read-series">
+          {as.head} {as.unit && <span className="ask-read-unit">{as.unit}</span>}
+        </span>
+      </div>
+      {held && <FigureLine worked={worked} />}
+      {held && tiles ? (
+        <>
+          <div className="ask-figures">
+            <OwnTile label="Latest block" value={tiles.latest} unit={as.unit} />
+            <OwnTile label="Mean per block" value={tiles.mean} unit={as.unit} />
+            <OwnTile label="Lowest block" value={tiles.low} unit={as.unit} />
+            <OwnTile label="Highest block" value={tiles.high} unit={as.unit} />
+          </div>
+          <OwnChart readings={held} unit={as.unit} threshold={fits} />
+        </>
+      ) : (
+        <p className="ask-plain ask-waiting">{waiting}</p>
+      )}
+    </div>
+  );
+}
+
+function OwnTile({ label, value, unit }: { label: string; value: number; unit: string }): ReactElement {
+  return (
+    <div className="ask-figure">
+      <span className="ask-figure-label">{label}</span>
+      <span className="ask-figure-value">{ownAmount(value, unit)}</span>
+    </div>
+  );
+}
+
+/** A bar per block of ours, oldest first, spaced evenly whatever the time between them. */
+const OwnChart = memo(function OwnChart({
+  readings,
+  unit,
+  threshold,
+}: {
+  readings: readonly OwnReading[];
+  unit: string;
+  threshold: number | undefined;
+}): ReactElement {
+  const max = readings.reduce((high, reading) => Math.max(high, reading.value), 0);
+  const shown = threshold !== undefined && threshold > 0 && threshold <= max * 4 ? threshold : undefined;
+  const top = ceiling(Math.max(max, shown ?? 0));
+  const slot = WIDTH / readings.length;
+  const gap = slot > 3 ? Math.min(2, slot / 4) : 0;
+  const y = (value: number): number => HEIGHT - (Math.max(0, value) / top) * HEIGHT;
+  const middle = readings[Math.floor(readings.length / 2)];
+  return (
+    <div className="ask-chart">
+      <div className="ask-plot">
+        {[top, top / 2, 0].map((tick) => (
+          <span key={tick} className="ask-tick" style={{ top: `${(1 - tick / top) * 100}%` }}>
+            {ownAmount(tick, unit)}
+          </span>
+        ))}
+        <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} preserveAspectRatio="none" role="img" aria-label="A bar per block of ours">
+          <line className="ask-grid" x1={0} x2={WIDTH} y1={0.5} y2={0.5} />
+          <line className="ask-grid" x1={0} x2={WIDTH} y1={HEIGHT / 2} y2={HEIGHT / 2} />
+          {readings.map((reading, index) => (
+            <rect
+              key={reading.slot}
+              className="ask-bar"
+              x={index * slot + gap / 2}
+              y={y(reading.value)}
+              width={Math.max(0.5, slot - gap)}
+              height={HEIGHT - y(reading.value)}
+            />
+          ))}
+          <line className="ask-base" x1={0} x2={WIDTH} y1={HEIGHT - 0.5} y2={HEIGHT - 0.5} />
+          {shown !== undefined && <line className="ask-threshold" x1={0} x2={WIDTH} y1={y(shown)} y2={y(shown)} />}
+        </svg>
+        {shown !== undefined && (
+          <span className="ask-threshold-label" aria-hidden="true" style={{ top: `${(y(shown) / HEIGHT) * 100}%` }}>
+            {ownAmount(shown, unit)}
+          </span>
+        )}
+      </div>
+      <div className="ask-x" aria-hidden="true">
+        <span>slot {figure(readings[0].slot)}</span>
+        {readings.length > 2 && <span>slot {figure(middle.slot)}</span>}
+        <span>slot {figure(readings[readings.length - 1].slot)}</span>
+      </div>
+    </div>
+  );
+});
 
 /** What the model read and how long it took, as the source line says it. */
 function modelLine(pickedMillis: number, operation: Operation | null | "pending", operationMillis: number | null): string {

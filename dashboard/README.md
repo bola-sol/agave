@@ -95,6 +95,9 @@ the domain in the site block is the name to allow, and nothing else is needed.
   the host's readings, six hours at a time: CPU, load, memory, network, disk
   and UDP drops. Where a figure is asked for, such as a total or when a series
   was over a value, the page works it out from those readings beside the chart.
+  A request about our own blocks, or what we earned, is answered from the
+  Slots page's block list instead, this epoch or the last, with the header's
+  leader slot counts and the This epoch card's earnings line.
   The request behind it answers anyone who can reach the page, two days back.
 - The machine card shows what is not on chain: the host's memory and the
   validator's share of it, its core count, load, CPU use, governor and swap,
