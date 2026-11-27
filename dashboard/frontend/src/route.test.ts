@@ -15,6 +15,7 @@ describe("readRoute", () => {
     expect(readRoute("/slots").page).toBe("slots");
     expect(readRoute("/gossip").page).toBe("gossip");
     expect(readRoute("/cluster").page).toBe("cluster");
+    expect(readRoute("/ask").page).toBe("ask");
   });
 
   it("falls back to the overview rather than showing nothing", () => {
@@ -103,6 +104,7 @@ describe("routeAddress", () => {
     expect(routeAddress(HOME)).toBe("/");
     expect(routeAddress({ ...HOME, page: "slots" })).toBe("/slots");
     expect(routeAddress({ ...HOME, page: "schedule" })).toBe("/schedule");
+    expect(routeAddress({ ...HOME, page: "ask" })).toBe("/ask");
   });
 
   it("writes filters to be read", () => {

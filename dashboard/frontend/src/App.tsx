@@ -12,10 +12,12 @@ import { SlotDetailsPage } from "./components/SlotDetailsPage";
 import { StartupCard } from "./components/Verdict";
 import { TpuPathCard } from "./components/TpuPathCard";
 import { GossipPage } from "./components/GossipPage";
+import { AskPage } from "./components/AskPage";
 import { ClusterPage } from "./components/ClusterPage";
 import { GossipStakeCard } from "./components/GossipStakeCard";
 import { MissesPanel } from "./components/MissesPanel";
 import { SlotStrip } from "./components/SlotStrip";
+import { tabShown, useAskModel } from "./askModel";
 import { HOME, plainClick, routeAddress, useRoute, type Page } from "./route";
 import { useRewindGeneration, useStore } from "./useStore";
 import { pageTitle } from "./title";
@@ -78,6 +80,7 @@ export function App(): ReactElement {
         )}
         {page === "cluster" && <ClusterPage />}
         {page === "gossip" && <GossipPage />}
+        {page === "ask" && <AskPage />}
         <footer className="footer">
           <a href="https://db-ip.com" target="_blank" rel="noreferrer">
             IP Geolocation by DB-IP
@@ -116,21 +119,24 @@ function Overview() {
   );
 }
 
-/** `short` is the label on a phone, where five tabs do not fit at full length. */
+/** `short` is the label on a phone, where the tabs do not fit at full length. */
 const PAGES: { page: Page; label: string; short?: string }[] = [
   { page: "overview", label: "Overview" },
   { page: "slots", label: "Slot details", short: "Slots" },
   { page: "schedule", label: "Schedule" },
   { page: "gossip", label: "Gossip" },
   { page: "cluster", label: "Cluster" },
+  { page: "ask", label: "Ask" },
 ];
 
 /** Anchors rather than buttons, so a page can open in a new tab; the click is
  *  still handled to avoid a reload. */
 function Nav({ page, onSelect }: { page: Page; onSelect: (page: Page) => void }) {
+  // The Ask tab is there only where the browser has a model to answer with.
+  const ask = tabShown(useAskModel().state);
   return (
     <nav className="nav" aria-label="Pages">
-      {PAGES.map((entry) => (
+      {PAGES.filter((entry) => entry.page !== "ask" || ask).map((entry) => (
         <a
           key={entry.page}
           href={routeAddress({ ...HOME, page: entry.page })}
