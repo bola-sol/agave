@@ -2,7 +2,7 @@
  *  over the blocks it built and the cluster kept, by the Slots page's own arithmetic. */
 
 import { figure, type Series } from "./ask";
-import { lasting, type Answered, type Operation, type Threshold, type ThresholdRead } from "./askFigures";
+import { lasting, thresholdOf, type Answered, type Operation, type Threshold, type ThresholdRead } from "./askFigures";
 import { earningsTotal } from "./earnings";
 import { headOf } from "./producedIndex";
 import { earnedOf, type BlockHead } from "./produced";
@@ -42,11 +42,23 @@ export function asksProduction(typed: string): boolean {
   return PRODUCTION.test(text) && ownScope(text);
 }
 
+/** The epoch a request names by word, or null where it names none. */
+export function epochAsked(typed: string): "this" | "last" | null {
+  const text = typed.toLowerCase();
+  if (/\b(?:last|previous|prior|past)\s+epoch\b/.test(text)) return "last";
+  if (/\b(?:this|current)\s+epoch\b/.test(text)) return "this";
+  return null;
+}
+
+type OwnKey = "fees" | "priority_fees" | "compute" | "transactions" | "tips";
+
 /** The per-slot series our own blocks answer, each from what the block list holds. */
-export const OWN_KEYS: ReadonlySet<string> = new Set(["fees", "priority_fees", "compute", "transactions", "tips"]);
+export const OWN_KEYS: ReadonlySet<string> = new Set<OwnKey>(["fees", "priority_fees", "compute", "transactions", "tips"]);
+
+const isOwnKey = (key: string): key is OwnKey => OWN_KEYS.has(key);
 
 /** What a series means for our blocks, as the Read as line names it. */
-const OWN_LABEL: Readonly<Record<string, { head: string; unit: string; total: string }>> = {
+const OWN_LABEL: Readonly<Record<OwnKey, { head: string; unit: string; total: string }>> = {
   fees: { head: "Fees earned from our blocks", unit: "SOL", total: "SOL" },
   priority_fees: { head: "Priority fees in our blocks", unit: "SOL", total: "SOL" },
   compute: { head: "Compute in our blocks", unit: "million CU per block", total: "billion CU" },
@@ -54,9 +66,19 @@ const OWN_LABEL: Readonly<Record<string, { head: string; unit: string; total: st
   tips: { head: "Our share of tips in our blocks", unit: "SOL", total: "SOL" },
 };
 
+/** A series as the Read as line names it for our blocks. */
 export function ownLabel(series: Series): { head: string; unit: string } {
+  if (!isOwnKey(series.key)) return { head: series.label, unit: series.unit };
   const label = OWN_LABEL[series.key];
-  return label ? { head: label.head, unit: label.unit } : { head: series.label, unit: series.unit };
+  return { head: label.head, unit: label.unit };
+}
+
+/** A value compared against, read in the unit our blocks give: transactions per block, not per second. */
+export function ownThresholdOf(typed: string, series: Series): ThresholdRead {
+  return thresholdOf(
+    typed,
+    series.key === "transactions" ? { ...series, key: "own_transactions", label: "transactions in our blocks" } : series,
+  );
 }
 
 /** A reading as shown: SOL below one keeps three significant digits, since one block earns little. */
@@ -90,38 +112,38 @@ export function ownValue(key: string, block: BlockHead, rates: TipRates | undefi
 /** The span our blocks are read over: a time window, or this epoch or the last by slot. */
 export type OwnWindow = { kind: "time"; from: number; to: number } | { kind: "epoch"; epoch: number; first: number; last: number };
 
+/** Whether one of our blocks falls in a window. */
 export function inWindow(block: BlockHead, window: OwnWindow): boolean {
   if (window.kind === "epoch") return block.slot >= window.first && block.slot <= window.last;
   const time = block.slot_time_millis;
   return time !== null && time >= window.from && time < window.to;
 }
 
-/** Pages of the block list read newest first until one reaches back past the window. */
+/** Pages of the block list read newest first until one reaches back past the window; `reached`
+ *  is false where the list ran out first. A refused page fails the whole read. */
 export async function readOwnBlocks(
   page: (before: number | undefined) => Promise<FiguresPage | null>,
   window: OwnWindow,
   maxPages = 64,
-): Promise<{ blocks: BlockHead[]; held: number | null; floor: number | null }> {
+): Promise<{ blocks: BlockHead[]; reached: boolean }> {
   const blocks: BlockHead[] = [];
   let before: number | undefined;
-  let held: number | null = null;
-  let floor: number | null = null;
+  let reached = false;
   for (let count = 0; count < maxPages; count += 1) {
     const reply = await page(before);
-    if (!reply) break;
-    held = reply.held;
-    floor = reply.floor;
+    if (!reply) throw new Error("the block list was refused");
     let passed = false;
     for (const row of reply.figures) {
       const block = headOf(row);
       if (inWindow(block, window)) blocks.push(block);
       else if (window.kind === "epoch" ? block.slot < window.first : (block.slot_time_millis ?? Infinity) < window.from) passed = true;
     }
+    if (passed) reached = true;
     if (passed || reply.next === null) break;
     before = reply.next;
   }
   blocks.sort((a, b) => a.slot - b.slot);
-  return { blocks, held, floor };
+  return { blocks, reached };
 }
 
 /** One of our blocks with its reading. */
@@ -131,6 +153,7 @@ export interface OwnReading {
   value: number;
 }
 
+/** Our blocks' readings of a series, leaving out blocks that lack it. */
 export function ownReadings(blocks: readonly BlockHead[], key: string, rates: TipRates | undefined): OwnReading[] {
   return blocks.flatMap((block) => {
     const value = ownValue(key, block, rates);
@@ -167,15 +190,13 @@ export function ownFigure(
   rates: TipRates | undefined,
   context: OwnContext,
 ): Answered {
-  if (!operation || operation === "chart" || operation === "share") return null;
+  if (!operation || operation === "chart" || operation === "share" || !isOwnKey(series.key)) return null;
   const readings = ownReadings(held, series.key, rates);
-  if (series.key === "tips" && readings.length === 0) return { unfit: "Tips are not read on this build." };
+  if (readings.length === 0) return { unfit: ownEmpty(series, held.length, context.window) };
   const label = OWN_LABEL[series.key];
-  if (!label) return null;
   const blocks = `${figure(readings.length)} of our block${readings.length === 1 ? "" : "s"}`;
   const notes = (...parts: (string | null)[]): string => [...parts, context.short].filter(Boolean).join(" · ");
   const name = label.head.charAt(0).toLowerCase() + label.head.slice(1);
-  if (readings.length === 0) return { unfit: `No blocks of ours in the ${context.window}.` };
   const total = readings.reduce((sum, reading) => sum + reading.value, 0);
   const warn = context.short !== null;
   switch (operation) {
@@ -225,6 +246,14 @@ export function ownFigure(
   }
 }
 
+/** Why a series has no readings over our blocks: none in the window, or none read. */
+export function ownEmpty(series: Series, blocks: number, window: string): string {
+  if (blocks === 0) return `No blocks of ours, ${window}.`;
+  return series.key === "tips" ? "Tips are not read on this build." : NOT_READ;
+}
+
+const NOT_READ = "Not read for these blocks.";
+
 /** A unit as said of one block. */
 function perBlock(unit: string): string {
   return unit.endsWith("per block") ? unit : `${unit} per block`;
@@ -246,17 +275,20 @@ function feeParts(held: readonly BlockHead[], rates: TipRates | undefined): stri
   return parts.join(", ");
 }
 
-/** How many of its leader slots this validator produced in an epoch, as the header counts them. */
+/** How many of its leader slots this validator produced in an epoch, as the Slots page's epoch row
+ *  counts them; slots too old for the slot history are said apart, not counted as either. */
 export function production(counts: LeaderSlotCounts | undefined, context: { window: string; short: string | null }): Answered {
   if (!counts) return { unfit: "The leader slot counts for that epoch are not held." };
-  const passed = counts.passed;
-  const toCome = counts.slots - passed;
+  const answered = counts.produced + counts.skipped;
+  const unread = counts.passed - answered;
+  const toCome = counts.slots - counts.passed;
   return {
     label: `Our leader slots, ${context.window}`,
-    value: `${figure(counts.produced)} of ${figure(passed)} produced`,
+    value: `${figure(counts.produced)} of ${figure(answered)} produced`,
     detail: [
       `${figure(counts.skipped)} skipped`,
-      passed > 0 ? `${figure((counts.skipped / passed) * 100)}% skip rate` : null,
+      answered > 0 ? `${figure((counts.skipped / answered) * 100)}% skip rate` : null,
+      unread > 0 ? `${figure(unread)} too old for the slot history` : null,
       toCome > 0 ? `${figure(toCome)} to come` : null,
       context.short,
     ]
@@ -273,7 +305,7 @@ export function earningsLine(earnings: EpochEarnings | null | undefined, epoch: 
   return {
     label: `Voting and producer bonus, epoch ${figure(earnings.epoch)} so far`,
     value: `${kept} ${rest}`,
-    detail: "as the This epoch card counts it, and apart from the fees above",
+    detail: "as the This epoch card counts it, and apart from the fees below",
     warn: false,
   };
 }

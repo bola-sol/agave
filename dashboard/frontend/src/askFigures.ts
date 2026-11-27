@@ -117,6 +117,7 @@ function inSentence(label: string): string {
 
 /** The unit a series is read in, as a figure line names it. */
 const UNIT: Readonly<Record<string, string>> = {
+  own_transactions: "per block",
   shreds: "per second",
   transactions: "per second",
   votes: "per second",
@@ -208,6 +209,8 @@ function unitsOf(key: string): Units {
       return SOL_UNITS;
     case "compute":
       return COMPUTE_UNITS;
+    case "own_transactions":
+      return BLOCK_UNITS;
     case "failed":
     case "repaired":
     case "recovered":

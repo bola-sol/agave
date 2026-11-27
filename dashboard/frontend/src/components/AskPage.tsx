@@ -49,12 +49,15 @@ import {
   asksEarned,
   asksProduction,
   earningsLine,
+  epochAsked,
   OWN_KEYS,
   ownAmount,
+  ownEmpty,
   ownFigure,
   ownLabel,
   ownReadings,
   ownScope,
+  ownThresholdOf,
   production,
   readOwnBlocks,
   type OwnReading,
@@ -350,11 +353,36 @@ function ScopedAnswer({ typed, answer }: { typed: string; answer: ChartsAnswered
     [answer.charts, typed],
   );
   const [scope, setScope] = useState<Scope>(() => (ownable && ownScope(typed) ? "ours" : "all"));
-  const toggle = ownable ? <ScopeToggle scope={scope} onScope={setScope} /> : null;
-  return scope === "ours" ? (
-    <OwnAnswer typed={typed} answer={answer} toggle={toggle} />
-  ) : (
-    <ChartsAnswer typed={typed} answer={answer} toggle={toggle} />
+  // Each side is drawn once first shown and kept, so switching back keeps its window and readings.
+  const [shown, setShown] = useState<ReadonlySet<Scope>>(() => new Set([scope]));
+  const holder = useRef<HTMLDivElement>(null);
+  const switched = useRef(false);
+  const choose = (next: Scope): void => {
+    switched.current = true;
+    setScope(next);
+    setShown((held) => (held.has(next) ? held : new Set([...held, next])));
+  };
+  // The pressed button of the side now shown takes the focus the other side's button had.
+  useEffect(() => {
+    if (!switched.current) return;
+    switched.current = false;
+    holder.current?.querySelector<HTMLButtonElement>(`[data-scope="${scope}"] .ask-scope [aria-pressed="true"]`)?.focus();
+  }, [scope]);
+  const toggle = ownable ? <ScopeToggle scope={scope} onScope={choose} /> : null;
+  if (!ownable) return <ChartsAnswer typed={typed} answer={answer} toggle={null} />;
+  return (
+    <div ref={holder} className="ask-scoped">
+      {shown.has("ours") && (
+        <div data-scope="ours" hidden={scope !== "ours"}>
+          <OwnAnswer typed={typed} answer={answer} toggle={toggle} />
+        </div>
+      )}
+      {shown.has("all") && (
+        <div data-scope="all" hidden={scope !== "all"}>
+          <ChartsAnswer typed={typed} answer={answer} toggle={toggle} />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -382,7 +410,9 @@ function ChartsAnswer({
 }): ReactElement {
   const { charts, asked, pickedMillis, operation, operationMillis } = answer;
   // Asked of our own blocks with nothing they measure: every leader's chart, said so.
-  const note = [answer.note, toggle === null && ownScope(typed) ? NOT_OURS : null].filter(Boolean).join(" ") || null;
+  const perSlotAsked = charts.some((chart) => chart.series.source === "slots");
+  const note =
+    [answer.note, toggle === null && perSlotAsked && ownScope(typed) ? NOT_OURS : null].filter(Boolean).join(" ") || null;
   // Always the live validator: a request for the past hour means the hour up to now.
   const live = useRequests();
   const perSlot = charts.some((chart) => chart.series.source === "slots");
@@ -558,7 +588,10 @@ type OwnLoaded =
       epoch: number | null;
       current: boolean;
       blocks: readonly BlockHead[];
+      /** False where the block list ran out before the window began. */
+      reached: boolean;
       counts: LeaderSlotCounts | undefined;
+      /** The This epoch card's line, or null where the card would not show it. */
       earnings: EpochEarnings | null;
       rates: TipRates | undefined;
     };
@@ -576,9 +609,13 @@ function OwnAnswer({ typed, answer, toggle }: { typed: string; answer: ChartsAns
   const { charts, asked, pickedMillis, operation, operationMillis } = answer;
   const live = useRequests();
   const canRead = useCanRead(live, false);
+  const hasEpoch = useSyncExternalStore(live.subscribe, () => live.get("epoch", "new") !== undefined);
   const balancesHidden = useBalancesHidden();
-  // A window the request named stands; otherwise this epoch.
-  const [pick, setPick] = useState<OwnPick>({ window: asked.given ? asked.millis : "this", turn: 0 });
+  // An epoch or window the request named stands; otherwise this epoch.
+  const [pick, setPick] = useState<OwnPick>(() => ({
+    window: epochAsked(typed) ?? (asked.given ? asked.millis : "this"),
+    turn: 0,
+  }));
   const [loaded, setLoaded] = useState<OwnLoaded>({ state: "loading" });
   const drawn = useRef<OwnPick | null>(null);
   const earned = asksEarned(typed);
@@ -587,7 +624,7 @@ function OwnAnswer({ typed, answer, toggle }: { typed: string; answer: ChartsAns
     return own.length === 0 && earned && FEES ? [FEES] : own;
   }, [charts, earned]);
   const others = charts.filter((chart) => !OWN_KEYS.has(chart.series.key)).map((chart) => chart.series.label);
-  const thresholds = useMemo(() => shown.map((series) => thresholdOf(typed, series)), [typed, shown]);
+  const thresholds = useMemo(() => shown.map((series) => ownThresholdOf(typed, series)), [typed, shown]);
 
   useEffect(() => {
     if (!canRead || drawn.current === pick) return;
@@ -613,14 +650,17 @@ function OwnAnswer({ typed, answer, toggle }: { typed: string; answer: ChartsAns
       .then((read) => {
         if (stale) return;
         drawn.current = pick;
+        const admission = live.get("summary", "admission");
+        const seated = !admission || admission.seat;
         setLoaded({
           state: "ready",
           label,
           epoch,
           current: epoch !== null && epoch === info?.epoch,
           blocks: read.blocks,
+          reached: read.reached,
           counts: epoch === null ? undefined : live.get("summary", "leader_slot_counts")?.find((held) => held.epoch === epoch),
-          earnings: live.get("summary", "epoch_earnings") ?? null,
+          earnings: seated ? (live.get("summary", "epoch_earnings") ?? null) : null,
           rates: live.get("summary", "tip_rates"),
         });
       })
@@ -630,15 +670,20 @@ function OwnAnswer({ typed, answer, toggle }: { typed: string; answer: ChartsAns
     return () => {
       stale = true;
     };
-  }, [canRead, live, pick]);
+  }, [canRead, hasEpoch, live, pick]);
 
-  const read = operation === "pending" ? null : operation;
   const ready = loaded.state === "ready" ? loaded : null;
-  const short = ready ? heldShortLabel(ready.blocks.length, ready.counts) : null;
+  const short = ready
+    ? ready.epoch === null
+      ? ready.reached
+        ? null
+        : "the block list does not reach back that far"
+      : heldShortLabel(ready.blocks.length, ready.counts)
+    : null;
   const worked = useMemo(() => {
-    if (!ready || read === null) return shown.map(() => null);
+    if (!ready || operation === "pending") return shown.map(() => null);
     return shown.map((series, index) => {
-      const directedOp = directed(read, typed, series);
+      const directedOp = directed(operation, typed, series);
       // What we earned is a total where nothing else was asked.
       const op = earned && (directedOp === null || directedOp === "chart") ? "total" : directedOp;
       return ownFigure(op, series, ready.blocks, ready.rates, {
@@ -648,7 +693,7 @@ function OwnAnswer({ typed, answer, toggle }: { typed: string; answer: ChartsAns
         short,
       });
     });
-  }, [ready, read, shown, typed, earned, thresholds, short]);
+  }, [ready, operation, shown, typed, earned, thresholds, short]);
   const readings = useMemo(
     () => (ready ? shown.map((series) => ownReadings(ready.blocks, series.key, ready.rates)) : null),
     [ready, shown],
@@ -671,12 +716,14 @@ function OwnAnswer({ typed, answer, toggle }: { typed: string; answer: ChartsAns
       <div className="ask-head">
         <p className="ask-asked">{typed}</p>
         {toggle}
-        <div className="toggle-group ask-windows" role="group" aria-label="Window">
+        <div className="toggle-group ask-windows" role="group" aria-label="Epoch">
           {EPOCH_WINDOWS.map((entry) => (
             <button key={entry.key} type="button" aria-pressed={pick.window === entry.key} onClick={() => choose(entry.key)}>
               {entry.label}
             </button>
           ))}
+        </div>
+        <div className="toggle-group ask-windows" role="group" aria-label="Window">
           {named && (
             <button type="button" aria-pressed={pick.window === asked.millis} onClick={() => choose(asked.millis)}>
               {windowShort(asked.millis)}
@@ -708,7 +755,7 @@ function OwnAnswer({ typed, answer, toggle }: { typed: string; answer: ChartsAns
               key={series.key}
               series={series}
               readings={readings?.[index] ?? null}
-              waiting={ready ? `No blocks of ours in the ${ready.label}.` : waiting}
+              waiting={ready ? ownEmpty(series, ready.blocks.length, ready.label) : waiting}
               worked={worked[index]}
               threshold={thresholds[index]}
             />
@@ -779,7 +826,9 @@ function OwnPanel({
           <OwnChart readings={held} unit={as.unit} threshold={fits} />
         </>
       ) : (
-        <p className="ask-plain ask-waiting">{waiting}</p>
+        <p className="ask-plain ask-waiting" role="status">
+          {waiting}
+        </p>
       )}
     </div>
   );
@@ -808,9 +857,9 @@ const OwnChart = memo(function OwnChart({
   const shown = threshold !== undefined && threshold > 0 && threshold <= max * 4 ? threshold : undefined;
   const top = ceiling(Math.max(max, shown ?? 0));
   const slot = WIDTH / readings.length;
+  // Narrower than a pixel the bars touch; a gap there would only thin them.
   const gap = slot > 3 ? Math.min(2, slot / 4) : 0;
   const y = (value: number): number => HEIGHT - (Math.max(0, value) / top) * HEIGHT;
-  const middle = readings[Math.floor(readings.length / 2)];
   return (
     <div className="ask-chart">
       <div className="ask-plot">
@@ -828,7 +877,7 @@ const OwnChart = memo(function OwnChart({
               className="ask-bar"
               x={index * slot + gap / 2}
               y={y(reading.value)}
-              width={Math.max(0.5, slot - gap)}
+              width={slot - gap}
               height={HEIGHT - y(reading.value)}
             />
           ))}
@@ -843,7 +892,6 @@ const OwnChart = memo(function OwnChart({
       </div>
       <div className="ask-x" aria-hidden="true">
         <span>slot {figure(readings[0].slot)}</span>
-        {readings.length > 2 && <span>slot {figure(middle.slot)}</span>}
         <span>slot {figure(readings[readings.length - 1].slot)}</span>
       </div>
     </div>
