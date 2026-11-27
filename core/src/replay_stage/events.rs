@@ -13,13 +13,16 @@ use {
     crossbeam_channel::Receiver,
     solana_clock::{BankId, Epoch, Slot, UnixTimestamp},
     solana_entry::block_component::{BlockFooterV1, VersionedBlockFooter},
+    solana_ledger::blockstore_processor::ConfirmationTiming,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
+    solana_svm_timings::ExecuteTimingType,
     std::sync::Arc,
 };
 
 pub const SLOT_EVENT_STREAM: StreamName = agave_event_system::stream_name!("replay.slot_event");
 pub const BANK_FROZEN_STREAM: StreamName = agave_event_system::stream_name!("replay.bank_frozen");
+pub const SLOT_STATS_STREAM: StreamName = agave_event_system::stream_name!("replay.slot_stats");
 
 /// Slot lifecycle events observed by replay.
 /// All timestamps are monotonic nanoseconds.
@@ -188,6 +191,117 @@ impl BankFrozenEvent {
     }
 }
 
+/// What replaying a completed bank cost, as the `replay-slot-stats` datapoint reports it. Times are
+/// microseconds; the timestamp is monotonic nanoseconds. Our own banks, not replayed from shreds,
+/// carry only `bank_complete_us`.
+#[event]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotStatsEvent {
+    pub pid: i32,
+    pub tid: i32,
+    pub timestamp_ns: u64,
+    pub slot: Slot,
+    pub bank_id: BankId,
+    /// The unified scheduler ran the block, so `confirmation_us` excludes execution and
+    /// `replay_us` is task submission.
+    pub unified_scheduler: bool,
+    pub fetch_us: u64,
+    pub fetch_fail_us: u64,
+    pub poh_verify_us: u64,
+    pub transaction_verify_us: u64,
+    pub confirmation_us: u64,
+    pub replay_us: u64,
+    pub bank_switches: u64,
+    /// From the slot's first shred to now.
+    pub replay_total_us: u64,
+    pub bank_complete_us: u64,
+    pub transactions: u64,
+    pub entries: u64,
+    pub shreds: u64,
+    pub validate_transactions_us: u64,
+    pub validate_fees_us: u64,
+    pub filter_executable_us: u64,
+    pub program_cache_us: u64,
+    pub load_us: u64,
+    pub execute_us: u64,
+    pub collect_balances_us: u64,
+    pub collect_logs_us: u64,
+    pub store_us: u64,
+    pub update_stakes_cache_us: u64,
+    pub update_transaction_statuses_us: u64,
+    pub check_block_limits_us: u64,
+    pub execute_inner_us: u64,
+    pub serialize_us: u64,
+    pub deserialize_us: u64,
+    pub load_elf_us: u64,
+    pub verify_code_us: u64,
+    pub jit_compile_us: u64,
+}
+
+/// A completed bank's replay counts, beside its timings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplayCounts {
+    pub transactions: usize,
+    pub entries: usize,
+    pub shreds: u64,
+    pub bank_complete_us: u64,
+}
+
+impl SlotStatsEvent {
+    pub fn new(
+        slot: Slot,
+        bank_id: BankId,
+        timing: &ConfirmationTiming,
+        counts: ReplayCounts,
+        unified_scheduler: bool,
+    ) -> Self {
+        let (tid, pid) = cached_thread_and_process_id();
+        let totals = &timing.batch_execute.totals;
+        let metric = |kind: ExecuteTimingType| totals.metrics[kind].0;
+        let details = &totals.details;
+        let micros =
+            |elapsed: std::time::Duration| u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        Self {
+            pid,
+            tid,
+            timestamp_ns: monotonic_timestamp_ns(),
+            slot,
+            bank_id,
+            unified_scheduler,
+            fetch_us: timing.fetch_elapsed,
+            fetch_fail_us: timing.fetch_fail_elapsed,
+            poh_verify_us: timing.poh_verify_elapsed,
+            transaction_verify_us: timing.transaction_verify_elapsed,
+            confirmation_us: timing.confirmation_elapsed,
+            replay_us: timing.replay_elapsed,
+            bank_switches: timing.num_bank_switches,
+            replay_total_us: micros(timing.started.elapsed()),
+            bank_complete_us: counts.bank_complete_us,
+            transactions: u64::try_from(counts.transactions).unwrap_or(u64::MAX),
+            entries: u64::try_from(counts.entries).unwrap_or(u64::MAX),
+            shreds: counts.shreds,
+            validate_transactions_us: metric(ExecuteTimingType::CheckUs),
+            validate_fees_us: metric(ExecuteTimingType::ValidateFeesUs),
+            filter_executable_us: metric(ExecuteTimingType::FilterExecutableUs),
+            program_cache_us: metric(ExecuteTimingType::ProgramCacheUs),
+            load_us: metric(ExecuteTimingType::LoadUs),
+            execute_us: metric(ExecuteTimingType::ExecuteUs),
+            collect_balances_us: metric(ExecuteTimingType::CollectBalancesUs),
+            collect_logs_us: metric(ExecuteTimingType::CollectLogsUs),
+            store_us: metric(ExecuteTimingType::StoreUs),
+            update_stakes_cache_us: metric(ExecuteTimingType::UpdateStakesCacheUs),
+            update_transaction_statuses_us: metric(ExecuteTimingType::UpdateTransactionStatuses),
+            check_block_limits_us: metric(ExecuteTimingType::CheckBlockLimitsUs),
+            execute_inner_us: details.execute_us.0,
+            serialize_us: details.serialize_us.0,
+            deserialize_us: details.deserialize_us.0,
+            load_elf_us: details.create_executor_load_elf_us.0,
+            verify_code_us: details.create_executor_verify_code_us.0,
+            jit_compile_us: details.create_executor_jit_compile_us.0,
+        }
+    }
+}
+
 /// Our footers kept for their banks' freeze, at most this many.
 const OWN_FOOTERS_KEPT: usize = 64;
 
@@ -195,6 +309,7 @@ const OWN_FOOTERS_KEPT: usize = 64;
 /// readers that take longer.
 pub(crate) struct FrozenOutput {
     pub(crate) publisher: Publisher<BankFrozenEvent>,
+    pub(crate) stats: Publisher<SlotStatsEvent>,
     pub(crate) blocks: Publisher<BlockEvent>,
     pub(crate) vote_account: Pubkey,
     pub(crate) readers: FrozenBankSender,
@@ -208,11 +323,31 @@ impl FrozenOutput {
     pub(crate) fn stub() -> Self {
         Self {
             publisher: Publisher::stub(),
+            stats: Publisher::stub(),
             blocks: Publisher::stub(),
             vote_account: Pubkey::default(),
             readers: FrozenBankSender::stub(),
             own_footers: crossbeam_channel::never(),
             own_held: Vec::new(),
+        }
+    }
+
+    /// A completed bank's replay timings, built only while the stream is on.
+    pub(crate) fn slot_stats(
+        &mut self,
+        bank: &Bank,
+        timing: &ConfirmationTiming,
+        counts: ReplayCounts,
+        unified_scheduler: bool,
+    ) {
+        if self.stats.is_enabled() {
+            let _ = self.stats.publish(&SlotStatsEvent::new(
+                bank.slot(),
+                bank.bank_id().into(),
+                timing,
+                counts,
+                unified_scheduler,
+            ));
         }
     }
 
@@ -272,6 +407,106 @@ mod tests {
         solana_runtime::genesis_utils::create_genesis_config_with_leader, solana_signer::Signer,
         solana_system_transaction as system_transaction,
     };
+
+    #[test]
+    fn test_slot_stats_event_carries_each_timing() {
+        use std::num::Saturating;
+        let mut timing = ConfirmationTiming {
+            confirmation_elapsed: 2,
+            replay_elapsed: 3,
+            poh_verify_elapsed: 5,
+            transaction_verify_elapsed: 7,
+            fetch_elapsed: 11,
+            fetch_fail_elapsed: 13,
+            num_bank_switches: 17,
+            ..ConfirmationTiming::default()
+        };
+        let totals = &mut timing.batch_execute.totals;
+        for (kind, value) in [
+            (ExecuteTimingType::CheckUs, 19),
+            (ExecuteTimingType::ValidateFeesUs, 23),
+            (ExecuteTimingType::FilterExecutableUs, 29),
+            (ExecuteTimingType::ProgramCacheUs, 31),
+            (ExecuteTimingType::LoadUs, 37),
+            (ExecuteTimingType::ExecuteUs, 41),
+            (ExecuteTimingType::CollectBalancesUs, 43),
+            (ExecuteTimingType::CollectLogsUs, 47),
+            (ExecuteTimingType::StoreUs, 53),
+            (ExecuteTimingType::UpdateStakesCacheUs, 59),
+            (ExecuteTimingType::UpdateTransactionStatuses, 61),
+            (ExecuteTimingType::CheckBlockLimitsUs, 67),
+        ] {
+            totals.saturating_add_in_place(kind, value);
+        }
+        totals.details.execute_us = Saturating(71);
+        totals.details.serialize_us = Saturating(73);
+        totals.details.deserialize_us = Saturating(79);
+        totals.details.create_executor_load_elf_us = Saturating(83);
+        totals.details.create_executor_verify_code_us = Saturating(89);
+        totals.details.create_executor_jit_compile_us = Saturating(97);
+        let counts = ReplayCounts {
+            transactions: 101,
+            entries: 103,
+            shreds: 107,
+            bank_complete_us: 109,
+        };
+        for unified in [false, true] {
+            let event = SlotStatsEvent::new(9, 4, &timing, counts, unified);
+            assert_eq!(
+                (event.slot, event.bank_id, event.unified_scheduler),
+                (9, 4, unified)
+            );
+            assert_eq!(
+                [
+                    event.confirmation_us,
+                    event.replay_us,
+                    event.poh_verify_us,
+                    event.transaction_verify_us,
+                    event.fetch_us,
+                    event.fetch_fail_us,
+                    event.bank_switches,
+                ],
+                [2, 3, 5, 7, 11, 13, 17]
+            );
+            assert_eq!(
+                [
+                    event.validate_transactions_us,
+                    event.validate_fees_us,
+                    event.filter_executable_us,
+                    event.program_cache_us,
+                    event.load_us,
+                    event.execute_us,
+                    event.collect_balances_us,
+                    event.collect_logs_us,
+                    event.store_us,
+                    event.update_stakes_cache_us,
+                    event.update_transaction_statuses_us,
+                    event.check_block_limits_us,
+                ],
+                [19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67]
+            );
+            assert_eq!(
+                [
+                    event.execute_inner_us,
+                    event.serialize_us,
+                    event.deserialize_us,
+                    event.load_elf_us,
+                    event.verify_code_us,
+                    event.jit_compile_us,
+                ],
+                [71, 73, 79, 83, 89, 97]
+            );
+            assert_eq!(
+                [
+                    event.transactions,
+                    event.entries,
+                    event.shreds,
+                    event.bank_complete_us
+                ],
+                [101, 103, 107, 109]
+            );
+        }
+    }
 
     #[test]
     fn test_bank_frozen_event_counts_only_its_own_block() {
