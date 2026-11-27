@@ -41,6 +41,26 @@ use {
 /// Shares the process with replay and banking; two is generous for socket writes.
 const RUNTIME_THREADS: usize = 2;
 
+/// Rows merged at a time, the lock let go between so `slot.range` is answered meanwhile.
+const MERGE_CHUNK: usize = 4096;
+
+/// Slots read back below rooted that the collector has the ledger judge, the newest first.
+const MAX_UNSETTLED: usize = 16_384;
+
+/// Merges the rows a recording read back as into the history in use, a chunk at a time.
+fn merge_slots(history: &RwLock<SlotHistory>, read_back: &SlotHistory) -> usize {
+    let capacity = read_back.capacity();
+    let mut taken = 0usize;
+    let mut from = 0usize;
+    while from < capacity {
+        if let Ok(mut history) = history.write() {
+            taken = taken.saturating_add(history.merge_read_back(read_back, from, MERGE_CHUNK));
+        }
+        from = from.saturating_add(MERGE_CHUNK);
+    }
+    taken
+}
+
 const BOOT_POLL: Duration = Duration::from_millis(250);
 
 /// Fast enough that a slot never passes between two samples, which the slot ring depends on.
@@ -124,6 +144,7 @@ impl DashboardService {
                 let rewind_log = rewind_log.clone();
                 let exit = exit.clone();
                 let host_history = host_history.clone();
+                let history = history.clone();
                 let (sender, receiver) = crossbeam_channel::bounded(1);
                 let filler = thread::Builder::new()
                     .name("solDashFill".to_string())
@@ -138,14 +159,26 @@ impl DashboardService {
                         {
                             history.merge(&read_back, timestamp());
                         }
+                        let (rows, entries) = match refilled.slots.take() {
+                            Some(fill) => (
+                                merge_slots(&history, fill.read_back.history()),
+                                fill.entries,
+                            ),
+                            None => (0, 0),
+                        };
+                        if let Ok(history) = history.read() {
+                            refilled.unsettled = history.unsettled(MAX_UNSETTLED);
+                        }
                         log::info!(
-                            "dashboard: read back {} blocks and {} turns from {} segments in \
-                             {:?}, {} lines unread",
+                            "dashboard: read back {} blocks, {} turns and {rows} slot rows from \
+                             {entries} slot entries in {} segments in {:?}, {} lines unread, {} \
+                             slots left for the ledger to judge",
                             refilled.blocks.len(),
                             refilled.turns.len(),
                             refilled.segments,
                             started.elapsed(),
                             refilled.unread,
+                            refilled.unsettled.len(),
                         );
                         let _ = sender.send(refilled);
                     })?;

@@ -618,6 +618,8 @@ pub struct Collector {
     produced_settled_to: Slot,
     /// What the rewind log held of ours, until it has been read and merged.
     refill: Option<crossbeam_channel::Receiver<Refilled>>,
+    /// Read-back slots the ledger has yet to judge, waiting for the root to pass them.
+    unsettled: Vec<Slot>,
     snapshots: SnapshotTracker,
     snapshots_read_at: Instant,
 }
@@ -757,6 +759,7 @@ impl Collector {
             produced_unsent: false,
             produced_settled_to: 0,
             refill: None,
+            unsettled: Vec::new(),
             snapshots: SnapshotTracker::default(),
             snapshots_read_at: now.checked_sub(SNAPSHOT_READ).unwrap_or(now),
         }
@@ -1657,6 +1660,7 @@ impl Collector {
         );
         self.produced_settled_to = root;
         let refilled = self.merge_refill(root);
+        self.settle_read_back(root);
         let retimed = self.retime(&became_full, &mut changed);
 
         // The loop above no longer covers slots that have fallen out of bank
@@ -1702,6 +1706,23 @@ impl Collector {
 
     /// Merges what the rewind log held of ours once read, and returns whether any block was added.
     /// Kept: blocks older than the ledger, rooted ones, and those above the root, checked later.
+    /// Read-back rows the recording left below rooted, judged by the ledger once the root passes
+    /// them.
+    fn settle_read_back(&mut self, root: Slot) {
+        if self.unsettled.is_empty() {
+            return;
+        }
+        let src = self.src.clone();
+        let mut history = self.history.write().unwrap();
+        self.unsettled = settle_slots(
+            &mut history,
+            std::mem::take(&mut self.unsettled),
+            root,
+            src.lowest_slot(),
+            |slot| src.is_root(slot),
+        );
+    }
+
     fn merge_refill(&mut self, root: Slot) -> bool {
         let refilled = match self.refill.as_ref().map(|receiver| receiver.try_recv()) {
             None | Some(Err(crossbeam_channel::TryRecvError::Empty)) => return false,
@@ -1718,8 +1739,10 @@ impl Collector {
             waterfalls,
             costs,
             fees,
+            unsettled,
             ..
         } = refilled;
+        self.unsettled = unsettled;
         let read = blocks.len();
         let src = self.src.clone();
         let lowest = src.lowest_slot();
@@ -2654,6 +2677,36 @@ pub(crate) fn system_time_nanos(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+/// Settles each of `slots` the root has passed, rooted or skipped by the ledger's word, and returns
+/// those still above it. Below what the ledger holds a slot stays as recorded.
+fn settle_slots(
+    history: &mut SlotHistory,
+    slots: Vec<Slot>,
+    root: Slot,
+    lowest: Slot,
+    is_root: impl Fn(Slot) -> bool,
+) -> Vec<Slot> {
+    let mut waiting = Vec::new();
+    for slot in slots {
+        if slot < lowest {
+            continue;
+        }
+        if slot > root {
+            waiting.push(slot);
+            continue;
+        }
+        history.settle(
+            slot,
+            if is_root(slot) {
+                SlotLevel::Rooted
+            } else {
+                SlotLevel::Skipped
+            },
+        );
+    }
+    waiting
 }
 
 #[cfg(test)]
@@ -4300,6 +4353,70 @@ mod tests {
             .published_key("summary", "produced_refilled")
             .unwrap();
         assert!(refilled.ends_with(r#""value":3}"#), "{refilled}");
+    }
+
+    #[test]
+    fn test_read_back_slots_are_settled_by_the_ledger_as_the_root_passes_them() {
+        use crate::{
+            history::ReadBack,
+            slots::{BlockDetail, SlotEntry},
+        };
+
+        let completed = |slot: Slot| SlotEntry {
+            slot,
+            level: SlotLevel::Completed,
+            mine: false,
+            block: Some(BlockDetail {
+                transactions: 10,
+                non_vote_transactions: 4,
+                failed_transactions: 0,
+                entries: 0,
+                block_cost: 1,
+                block_cost_limit: 1,
+                account_cost_limit: 1,
+                total_fees: 5000,
+                priority_fees: 0,
+                tips: None,
+                replay_micros: None,
+            }),
+            duration_nanos: None,
+            time_millis: None,
+            shreds: None,
+            replayed_millis: None,
+            reward: None,
+            left_out: None,
+        };
+        let mut history = SlotHistory::new(64);
+        let mut fill = ReadBack::new(64);
+        for slot in [2, 4, 5, 9] {
+            fill.apply(&completed(slot), 1, false);
+        }
+        assert_eq!(history.merge_read_back(fill.history(), 0, 64), 4);
+        let waiting = settle_slots(&mut history, vec![9, 5, 4, 2], 6, 3, |slot| slot == 4);
+        let level = |slot: Slot| history.get(slot).map(|row| row.level);
+        assert_eq!(level(4), Some(SlotLevel::Rooted as u8));
+        assert_eq!(level(5), Some(SlotLevel::Skipped as u8));
+        // Below the ledger it stays as recorded; above the root it waits.
+        assert_eq!(level(2), Some(SlotLevel::Completed as u8));
+        assert_eq!(level(9), Some(SlotLevel::Completed as u8));
+        assert_eq!(waiting, [9]);
+    }
+
+    #[test]
+    fn test_unsettled_read_back_slots_reach_the_collector_with_the_refill() {
+        let harness = fixture();
+        harness.advance_to(2);
+        let mut collector = harness.collector();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        sender
+            .send(Refilled {
+                unsettled: vec![9_000],
+                ..Refilled::default()
+            })
+            .unwrap();
+        collector.refill_from(receiver);
+        collector.tick();
+        assert_eq!(collector.unsettled, [9_000]);
     }
 
     #[test]
