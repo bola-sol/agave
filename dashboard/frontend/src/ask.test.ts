@@ -11,6 +11,7 @@ import {
   MAX_PAGES,
   MAX_SERIES,
   MAX_WINDOW_MILLIS,
+  onWholeSpans,
   MIN_WINDOW_MILLIS,
   namesSeries,
   NONE,
@@ -626,5 +627,33 @@ describe("paths", () => {
 
   it("is empty with no readings", () => {
     expect(paths([null, null], 100, 200, 100)).toEqual({ line: "", area: "" });
+  });
+});
+
+describe("onWholeSpans", () => {
+  const bins = (values: (number | null)[], first = 0) => ({
+    from: 0,
+    to: values.length * 10,
+    values,
+    min: 0,
+    max: 0,
+    mean: 0,
+    latest: 0,
+    binMillis: 10,
+    first,
+  });
+
+  it("leaves out a span beside a gap and one the history began well inside, and recomputes the figures", () => {
+    const view = onWholeSpans(bins([5, 9, 9, null, 9, 9, 9, null], 7));
+    expect(view?.values).toEqual([null, 9, null, null, null, 9, 9, null]);
+    expect(view).toMatchObject({ min: 9, max: 9, mean: 9, latest: 9 });
+  });
+
+  it("keeps a first span whose first block came a moment after it opened", () => {
+    expect(onWholeSpans(bins([5, 9, null], 0.5))?.values).toEqual([5, 9, null]);
+  });
+
+  it("is null when nothing whole is left", () => {
+    expect(onWholeSpans(bins([5, null, 5, null], 0))).toBeNull();
   });
 });

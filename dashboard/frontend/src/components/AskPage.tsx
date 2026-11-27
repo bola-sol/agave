@@ -15,6 +15,7 @@ import {
   leftOut,
   namesSeries,
   notDrawnNote,
+  onWholeSpans,
   paths,
   readWindow,
   recordedList,
@@ -27,7 +28,6 @@ import {
   type AskedWindow,
   type Bins,
   type Series,
-  type SlotSeries,
 } from "../ask";
 import {
   answerFigure,
@@ -150,8 +150,8 @@ export function AskPage(): ReactElement {
         settle({
           kind: "charts",
           charts: picked.series.map((series) => ({ series, closest: !namesSeries(request, series) })),
-          // The value compared against is no window, as "under 5 s" would read.
-          asked: windowOf(withoutThreshold(request, picked.series[0])),
+          // The values compared against are no window, as "under 5 s" would read.
+          asked: windowOf(picked.series.reduce((text, series) => withoutThreshold(text, series), request)),
           pickedMillis: performance.now() - began,
           note: notDrawnNote(leftOut(request, picked.series, SERIES), picked.unmatched),
           operation,
@@ -290,6 +290,8 @@ type Loaded =
   | { state: "failed" }
   | {
       state: "ready";
+      /** The window these readings were read for, which a figure names. */
+      millis: number;
       from: number;
       bins: readonly (Bins | null)[];
       /** What the slot history gave, or null for a request with no per-slot series. */
@@ -366,19 +368,19 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
         const bins = charts.map(({ series }, index) => {
           const compared = thresholds[index];
           const fits = compared && !("wrong" in compared) ? compared : null;
-          return series.source === "slots"
-            ? slotRows && bucket(slotRows.rows, series, from, to, BIN_COUNT, fits?.value, fits?.inclusive)
-            : readings && hostBins(readings, series);
+          if (series.source === "host") return readings && hostBins(readings, series);
+          const bins = slotRows && bucket(slotRows.rows, series, from, to, BIN_COUNT, fits?.value, fits?.inclusive);
+          // A rate's line and figures leave out spans that held blocks for part of their seconds.
+          return bins && series.rate ? onWholeSpans(bins) : bins;
         });
         const whole =
-          pair?.byRule && slotRows && pair.whole.source === "slots"
-            ? bucket(slotRows.rows, pair.whole as SlotSeries, from, to)
-            : null;
+          pair?.byRule && slotRows && pair.whole.source === "slots" ? bucket(slotRows.rows, pair.whole, from, to) : null;
         drawn.current = pick;
         setLoaded(
           bins.some((held) => held !== null)
             ? {
                 state: "ready",
+                millis: pick.millis,
                 from,
                 bins,
                 slots: slotRows && { count: slotRows.rows.length, reached: slotRows.reached },
@@ -400,7 +402,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
   const worked = useMemo(() => {
     if (loaded.state !== "ready" || read === null) return { panels: charts.map(() => null), share: null };
     const base: Omit<FigureContext, "threshold"> = {
-      window: windowLabel(millis),
+      window: windowLabel(loaded.millis),
       comparing: comparing(typed),
       clock: clockTime,
     };
@@ -421,7 +423,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
       share = shareFigure(pair, part, whole, { ...base, threshold: null });
     }
     return { panels, share };
-  }, [loaded, read, charts, thresholds, pair, millis, typed]);
+  }, [loaded, read, charts, thresholds, pair, typed]);
 
   const choose = (next: number): void => setPick((held) => ({ millis: next, turn: held.turn + 1 }));
   const own = WINDOWS.some((entry) => entry.millis === asked.millis);
@@ -448,6 +450,9 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
           {note}
         </p>
       )}
+      <p className="ask-announce" role="status">
+        {announcement(worked)}
+      </p>
       {worked.share && <FigureLine worked={worked.share} />}
       <div className="ask-charts">
         {charts.map((chart, index) => (
@@ -465,7 +470,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
       </div>
       <p className="ask-source">
         {[
-          ...(loaded.state === "ready" ? sources(loaded, millis) : []),
+          ...(loaded.state === "ready" ? sources(loaded, loaded.millis) : []),
           modelLine(pickedMillis, operation, operationMillis),
           ...(loaded.state === "ready" ? shortfalls(loaded) : []),
           ...(asked.clamped ? ["windows run from 5 minutes to 6 hours"] : []),
@@ -480,9 +485,16 @@ type Ready = Extract<Loaded, { state: "ready" }>;
 /** What the model read and how long it took, as the source line says it. */
 function modelLine(pickedMillis: number, operation: Operation | null | "pending", operationMillis: number | null): string {
   const seconds = (millis: number): string => `${(millis / 1000).toFixed(1)} s`;
-  if (operation === "pending") return `series chosen by Chrome's built-in model in ${seconds(pickedMillis)}`;
+  if (operation === "pending") return `series chosen by Chrome's built-in model in ${seconds(pickedMillis)} · reading the operation…`;
   if (operation === null) return `series chosen by Chrome's built-in model in ${seconds(pickedMillis)} · the operation was not read`;
   return `series and operation read by Chrome's built-in model in ${seconds(Math.max(pickedMillis, operationMillis ?? 0))}`;
+}
+
+/** The figures of a card as one line, for a screen reader to say when they arrive. */
+function announcement(worked: { panels: readonly Worked[]; share: Worked }): string {
+  const line = (one: Worked): string | null =>
+    one === null ? null : "unfit" in one ? one.unfit : [one.label, one.value].filter(Boolean).join(": ");
+  return [worked.share, ...worked.panels].map(line).filter(Boolean).join(". ");
 }
 
 /** A worked-out figure above a chart, or why there is none. */
@@ -563,10 +575,10 @@ function SeriesPanel({
         <>
           <div className="ask-figures">
             <Figure label="Latest" value={bins.latest} />
-            <Figure label="Mean" value={blocks ? blocks.mean : bins.mean} />
-            <Figure label="Lowest" value={blocks ? blocks.low.value : bins.min} />
+            <Figure label={blocks ? "Mean per block" : "Mean"} value={blocks ? blocks.mean : bins.mean} />
+            <Figure label={blocks ? "Lowest block" : "Lowest"} value={blocks ? blocks.low.value : bins.min} />
             {bins.peak === undefined ? (
-              <Figure label="Highest" value={blocks ? blocks.high.value : bins.max} />
+              <Figure label={blocks ? "Highest block" : "Highest"} value={blocks ? blocks.high.value : bins.max} />
             ) : (
               <Figure label="Peak, 1 s" value={bins.peak} />
             )}
@@ -615,14 +627,21 @@ const Chart = memo(function Chart({ bins, mark }: { bins: Bins; mark?: Mark }): 
           <line className="ask-grid" x1={0} x2={WIDTH} y1={HEIGHT / 2} y2={HEIGHT / 2} />
           <line className="ask-base" x1={0} x2={WIDTH} y1={HEIGHT - 0.5} y2={HEIGHT - 0.5} />
           {mark?.spans.map((span) => (
-            <rect key={span.start} className="ask-span" x={x(span.start)} y={0} width={Math.max(1, x(span.end) - x(span.start))} height={HEIGHT} />
+            <rect
+              key={span.start}
+              className="ask-span"
+              x={Math.min(x(span.start), WIDTH - 1)}
+              y={0}
+              width={Math.max(1, x(span.end) - x(span.start))}
+              height={HEIGHT}
+            />
           ))}
           <path className="ask-area" d={area} />
           <path className="ask-line" d={line} />
           {shown && <line className="ask-threshold" x1={0} x2={WIDTH} y1={y(shown.threshold)} y2={y(shown.threshold)} />}
         </svg>
         {shown && (
-          <span className="ask-threshold-label" style={{ top: `${(y(shown.threshold) / HEIGHT) * 100}%` }}>
+          <span className="ask-threshold-label" aria-hidden="true" style={{ top: `${(y(shown.threshold) / HEIGHT) * 100}%` }}>
             {figure(shown.threshold)}
           </span>
         )}

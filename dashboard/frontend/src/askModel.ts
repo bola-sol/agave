@@ -1,5 +1,6 @@
 /** The browser's built-in language model, as the Ask page uses it: whether it can be used here, and
- *  one question at a time put to it. Nothing typed leaves the browser. */
+ *  the series and the operation a request asks for, each from a session of its own. Nothing typed
+ *  leaves the browser. */
 
 import { useSyncExternalStore } from "react";
 import { parseReply, SERIES, seriesSchema, systemPrompt, type Series } from "./ask";

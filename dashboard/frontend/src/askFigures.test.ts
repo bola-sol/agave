@@ -207,6 +207,8 @@ describe("thresholdOf", () => {
     expect(threshold(thresholdOf("priority fees over 0.1 and fees over 1", series("fees"))).value).toBe(1);
     expect(threshold(thresholdOf("validator memory over 100 and memory over 200", series("memory"))).value).toBe(200);
     expect(threshold(thresholdOf("validator memory over 100 and memory over 200", series("validator_memory"))).value).toBe(100);
+    expect(threshold(thresholdOf("transactions over 3000 and vote transactions over 2000", series("votes"))).value).toBe(2000);
+    expect(threshold(thresholdOf("transactions over 3000 and vote transactions over 2000", series("transactions"))).value).toBe(3000);
   });
 
   it("takes a number before a span of time for the window, not a value", () => {
@@ -492,6 +494,15 @@ describe("answerFigure", () => {
     expect((answerFigure("when_above", series("replay"), inclusive, context({ threshold: atLeast })) as { detail: string }).detail).toContain(
       "360 of 360 blocks were at least 8 ms",
     );
+  });
+
+  it("keeps a rate's first span where the history covers the whole window", () => {
+    const rows: [number, WireRow, number][] = [];
+    for (let time = T + 200; time < T + 3_600_000; time += 10_000) rows.push([time, row(time, 1, 1, time < T + 30_000 ? 250 : 2500), 1]);
+    const bins = bucket(rows, slot("transactions"), T, T + 3_600_000, 120);
+    expect(answerFigure("lowest", series("transactions"), bins, context())).toMatchObject({ value: "25 per second" });
+    const under = threshold(thresholdOf("tps under 200", series("transactions")));
+    expect((answerFigure("when_below", series("transactions"), bins, context({ threshold: under })) as { label: string }).label).toMatch(/^Under 200 per second in 1 span/);
   });
 
   it("does not say the history began inside the window over a few skipped slots", () => {
