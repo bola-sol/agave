@@ -129,11 +129,14 @@ impl DashboardService {
                     .name("solDashFill".to_string())
                     .spawn(move || {
                         let started = Instant::now();
-                        let refilled =
+                        let mut refilled =
                             refill::read(&rewind_log, &segments, || exit.load(Ordering::Relaxed));
-                        // Behind whatever the meters have read while this ran.
-                        if let Ok(mut history) = host_history.write() {
-                            history.merge(&refilled.host);
+                        // Behind whatever the meters have read while this ran, and not kept
+                        // for the collector, which has no use for it.
+                        if let Some(read_back) = refilled.host.take()
+                            && let Ok(mut history) = host_history.write()
+                        {
+                            history.merge(&read_back);
                         }
                         log::info!(
                             "dashboard: read back {} blocks and {} turns from {} segments in \

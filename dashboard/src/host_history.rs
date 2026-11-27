@@ -18,8 +18,15 @@ pub const MAX_POINTS: usize = 240;
 /// The most series one request reads.
 pub const MAX_SERIES: usize = 3;
 
-/// Two readings of a counter further apart than this say nothing of the rate between them.
+/// Two live readings of a counter further apart than this say nothing of the rate between them.
 const MAX_COUNTER_GAP_MILLIS: u64 = 15_000;
+
+/// The recording holds a counter's line only when it changed, so the time since the last line was
+/// quiet. Past a segment's length and some slack it was a stop instead.
+const MAX_RECORDED_QUIET_MILLIS: u64 = 660_000;
+
+/// The meters read once a second, so a recorded change came within about that.
+const READING_SECONDS: f64 = 1.0;
 
 const SERIES: usize = 9;
 
@@ -175,12 +182,17 @@ struct Bin {
 
 impl Bin {
     fn add(&mut self, value: f32) {
+        self.add_counted(value, value);
+    }
+
+    /// A count over one reading's interval: the count joins the sum, its rate vies for the highest.
+    fn add_counted(&mut self, count: f32, rate: f32) {
         self.max = if self.count == 0 {
-            value
+            rate
         } else {
-            self.max.max(value)
+            self.max.max(rate)
         };
-        self.sum += value;
+        self.sum += count;
         self.count = self.count.saturating_add(1);
     }
 }
@@ -210,9 +222,11 @@ pub struct SeriesRange {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HostRange {
-    /// The window answered, in unix milliseconds, `to` moved back to a whole number of steps.
+    /// The window answered, in unix milliseconds: the one asked, widened to whole bins and held
+    /// to the two days before its end.
     pub from: u64,
     pub to: u64,
+    /// Every step but the last, which is shorter where the steps do not divide the window.
     pub step_ms: u64,
     /// When the readings held begin, or `None` with none held.
     pub held_from: Option<u64>,
@@ -221,9 +235,11 @@ pub struct HostRange {
 
 pub struct HostHistory {
     rows: Vec<Row>,
+    /// The bin of the latest reading, which sets how far back a row still counts.
+    newest: Option<u64>,
     /// Each port's drop total and when it was read, for the next reading's difference.
     drops: HashMap<u16, u64>,
-    drops_at: u64,
+    drops_at: Option<u64>,
 }
 
 impl Default for HostHistory {
@@ -236,8 +252,9 @@ impl HostHistory {
     pub fn new() -> Self {
         Self {
             rows: vec![Row::default(); BINS],
+            newest: None,
             drops: HashMap::new(),
-            drops_at: 0,
+            drops_at: None,
         }
     }
 
@@ -260,7 +277,8 @@ impl HostHistory {
                 ..Row::default()
             };
         }
-        Some(row)
+        self.newest = Some(self.newest.map_or(index, |newest| newest.max(index)));
+        self.rows.get_mut(Self::place(index))
     }
 
     fn add(&mut self, at_ms: u64, key: SeriesKey, value: Option<f64>) {
@@ -297,38 +315,95 @@ impl HostHistory {
         );
     }
 
-    /// Each port's running drop total. What was dropped since the last reading is counted, but not
-    /// across a long gap, nor for a port whose total went back, as it does when the socket is
-    /// bound again.
-    pub fn note_drops(&mut self, at_ms: u64, totals: impl IntoIterator<Item = (u16, u64)>) {
-        let recent =
-            at_ms.saturating_sub(self.drops_at) <= MAX_COUNTER_GAP_MILLIS && at_ms >= self.drops_at;
+    fn add_drops(&mut self, at_ms: u64, count: u64, seconds: f64) {
+        if let Some(bin) = self
+            .row(at_ms)
+            .and_then(|row| row.bins.get_mut(SeriesKey::UdpDrops as usize))
+        {
+            bin.add_counted(count as f32, (count as f64 / seconds) as f32);
+        }
+    }
+
+    /// Holds `totals` for the next reading and gives what was dropped since the last on the ports
+    /// both name. A port whose total went back counts nothing, as when its socket is bound again.
+    fn take_drops(
+        &mut self,
+        at_ms: u64,
+        totals: impl IntoIterator<Item = (u16, u64)>,
+    ) -> Option<u64> {
         let mut dropped: Option<u64> = None;
         let mut next = HashMap::new();
         for (port, total) in totals {
-            if recent
-                && let Some(since) = self
-                    .drops
-                    .get(&port)
-                    .and_then(|before| total.checked_sub(*before))
+            if let Some(since) = self
+                .drops
+                .get(&port)
+                .and_then(|before| total.checked_sub(*before))
             {
                 dropped = Some(dropped.unwrap_or_default().saturating_add(since));
             }
             next.insert(port, total);
         }
         self.drops = next;
-        self.drops_at = at_ms;
-        self.add(
-            at_ms,
-            SeriesKey::UdpDrops,
-            dropped.map(|count| count as f64),
-        );
+        self.drops_at = Some(at_ms);
+        dropped
+    }
+
+    /// Each port's running drop total, as the meters read it every second. What was dropped since
+    /// the last reading is counted as a rate over the time between, but not across a long gap.
+    pub fn note_drops(&mut self, at_ms: u64, totals: impl IntoIterator<Item = (u16, u64)>) {
+        let gap = self
+            .drops_at
+            .and_then(|at| at_ms.checked_sub(at))
+            .filter(|gap| (1..=MAX_COUNTER_GAP_MILLIS).contains(gap));
+        let dropped = self.take_drops(at_ms, totals);
+        if let (Some(gap), Some(count)) = (gap, dropped) {
+            self.add_drops(at_ms, count, gap as f64 / 1000.0);
+        }
+    }
+
+    /// A recorded line of drop totals. `opening` is a segment's own copy of the last line, which
+    /// carries on from the line before only if it repeats it; anything else is another run of the
+    /// process, whose totals count from elsewhere. Between two lines of one run nothing was
+    /// dropped, so those bins read nought.
+    pub fn note_recorded_drops(&mut self, at_ms: u64, totals: Vec<(u16, u64)>, opening: bool) {
+        let before = self.drops_at.filter(|at| {
+            at_ms
+                .checked_sub(*at)
+                .is_some_and(|gap| gap <= MAX_RECORDED_QUIET_MILLIS)
+        });
+        let repeats = totals.len() == self.drops.len()
+            && totals
+                .iter()
+                .all(|(port, total)| self.drops.get(port) == Some(total));
+        let dropped = self.take_drops(at_ms, totals);
+        let Some(before) = before.filter(|_| !opening || repeats) else {
+            return;
+        };
+        let quiet_from = before
+            .checked_div(BIN_MILLIS)
+            .unwrap_or_default()
+            .saturating_add(1);
+        let this = at_ms.checked_div(BIN_MILLIS).unwrap_or_default();
+        for index in quiet_from..this {
+            self.add_drops(index.saturating_mul(BIN_MILLIS), 0, READING_SECONDS);
+        }
+        if let Some(count) = dropped {
+            self.add_drops(at_ms, count, READING_SECONDS);
+        }
     }
 
     /// One recorded feed line's value, by its key. `None` for a key that is not a host reading,
-    /// otherwise whether it was read.
-    pub fn note_recorded(&mut self, at_ms: u64, key: &str, value: &str) -> Option<bool> {
+    /// otherwise whether it was read. A segment's `opening` copy of the last host or network value
+    /// is passed over, having been counted when it was first sent.
+    pub fn note_recorded(
+        &mut self,
+        at_ms: u64,
+        key: &str,
+        value: &str,
+        opening: bool,
+    ) -> Option<bool> {
         Some(match key {
+            "host" | "network" if opening => true,
             "host" => serde_json::from_str::<RecordedHost>(value)
                 .map(|host| self.note_host(at_ms, &host.into()))
                 .is_ok(),
@@ -345,26 +420,35 @@ impl HostHistory {
                 .is_ok(),
             "ingest_paths" => serde_json::from_str::<RecordedIngest>(value)
                 .map(|ingest| {
-                    self.note_drops(
-                        at_ms,
-                        ingest
-                            .paths
-                            .iter()
-                            .map(|path| (path.port, path.drops_total)),
-                    )
+                    let totals = ingest
+                        .paths
+                        .iter()
+                        .map(|path| (path.port, path.drops_total))
+                        .collect();
+                    self.note_recorded_drops(at_ms, totals, opening)
                 })
                 .is_ok(),
             _ => return None,
         })
     }
 
+    /// Whether a bin is within two days of the newest reading.
+    fn in_reach(&self, index: u64) -> bool {
+        self.newest
+            .is_some_and(|newest| index.saturating_add(BINS as u64) > newest)
+    }
+
     /// Takes every span `older` holds and this does not, so what was read back at startup fills in
     /// behind what has been read since.
     pub fn merge(&mut self, older: &HostHistory) {
-        for (row, theirs) in self.rows.iter_mut().zip(&older.rows) {
-            if theirs.is_empty() {
+        self.newest = self.newest.max(older.newest);
+        for (place, theirs) in older.rows.iter().enumerate() {
+            if theirs.is_empty() || !self.in_reach(theirs.index) {
                 continue;
             }
+            let Some(row) = self.rows.get_mut(place) else {
+                continue;
+            };
             if row.is_empty() || theirs.index > row.index {
                 *row = *theirs;
             }
@@ -374,39 +458,34 @@ impl HostHistory {
     fn held(&self, index: u64) -> Option<&Row> {
         self.rows
             .get(Self::place(index))
-            .filter(|row| row.index == index && !row.is_empty())
+            .filter(|row| row.index == index && !row.is_empty() && self.in_reach(index))
     }
 
     /// When the oldest reading within reach of the newest was taken.
     fn held_from(&self) -> Option<u64> {
-        let newest = self
-            .rows
-            .iter()
-            .filter(|row| !row.is_empty())
-            .map(|row| row.index)
-            .max()?;
-        let reach = newest.saturating_sub((BINS as u64).saturating_sub(1));
         self.rows
             .iter()
-            .filter(|row| !row.is_empty() && row.index >= reach)
+            .filter(|row| !row.is_empty() && self.in_reach(row.index))
             .map(|row| row.index)
             .min()
             .map(|index| index.saturating_mul(BIN_MILLIS))
     }
 
-    /// `keys` over `from..to` in at most `points` equal steps, none finer than a bin. A window
-    /// reaching past what is held answers with empty points there, not an error.
+    /// `keys` over `from..to` in at most `points` steps of whole bins. A window longer than two
+    /// days keeps its newest end, and one reaching past what is held answers with empty points
+    /// there, not an error.
     pub fn range(&self, keys: &[SeriesKey], from: u64, to: u64, points: usize) -> HostRange {
-        let first = from.checked_div(BIN_MILLIS).unwrap_or_default();
         let last = to
             .saturating_sub(1)
             .checked_div(BIN_MILLIS)
             .unwrap_or_default();
-        // A window of two days of bins at most, whatever was asked.
-        let bins = last
-            .saturating_sub(first)
-            .saturating_add(1)
-            .min(BINS as u64);
+        let first = from
+            .checked_div(BIN_MILLIS)
+            .unwrap_or_default()
+            .max(last.saturating_sub((BINS as u64).saturating_sub(1)))
+            .min(last);
+        let end = last.saturating_add(1);
+        let bins = end.saturating_sub(first);
         let points = (points.clamp(1, MAX_POINTS) as u64).min(bins);
         // Whole bins to a step, rounded up so the steps cover the window.
         let per_step = bins.div_ceil(points).max(1);
@@ -417,7 +496,7 @@ impl HostHistory {
                 let (mean, max) = (0..steps)
                     .map(|step| {
                         let start = first.saturating_add(step.saturating_mul(per_step));
-                        self.point(*key, start, per_step)
+                        self.point(*key, start, per_step.min(end.saturating_sub(start)))
                     })
                     .unzip();
                 SeriesRange {
@@ -427,12 +506,10 @@ impl HostHistory {
                 }
             })
             .collect();
-        let from = first.saturating_mul(BIN_MILLIS);
-        let step_ms = per_step.saturating_mul(BIN_MILLIS);
         HostRange {
-            from,
-            to: from.saturating_add(steps.saturating_mul(step_ms)),
-            step_ms,
+            from: first.saturating_mul(BIN_MILLIS),
+            to: end.saturating_mul(BIN_MILLIS),
+            step_ms: per_step.saturating_mul(BIN_MILLIS),
             held_from: self.held_from(),
             series,
         }
@@ -784,12 +861,13 @@ mod tests {
     fn test_recorded_lines_are_read_by_key() {
         let mut history = HostHistory::new();
         let host = serde_json::to_string(&host()).unwrap();
-        assert_eq!(history.note_recorded(T, "host", &host), Some(true));
+        assert_eq!(history.note_recorded(T, "host", &host, false), Some(true));
         assert_eq!(
             history.note_recorded(
                 T,
                 "network",
-                r#"{"received_per_second":600,"sent_per_second":400}"#
+                r#"{"received_per_second":600,"sent_per_second":400}"#,
+                false
             ),
             Some(true)
         );
@@ -799,15 +877,15 @@ mod tests {
             )
         };
         assert_eq!(
-            history.note_recorded(T, "ingest_paths", &ingest(40)),
+            history.note_recorded(T, "ingest_paths", &ingest(40), false),
             Some(true)
         );
         assert_eq!(
-            history.note_recorded(T.saturating_add(1000), "ingest_paths", &ingest(60)),
+            history.note_recorded(T.saturating_add(1000), "ingest_paths", &ingest(60), false),
             Some(true)
         );
-        assert_eq!(history.note_recorded(T, "host", "[1,2"), Some(false));
-        assert_eq!(history.note_recorded(T, "tps_sample", "{}"), None);
+        assert_eq!(history.note_recorded(T, "host", "[1,2", false), Some(false));
+        assert_eq!(history.note_recorded(T, "tps_sample", "{}", false), None);
 
         let range = history.range(
             &[SeriesKey::Cpu, SeriesKey::NetIn, SeriesKey::UdpDrops],
@@ -829,6 +907,194 @@ mod tests {
         live.merge(&older);
         let (mean, _) = cpu(&live, T, T.saturating_add(30_000), 3);
         assert_eq!(mean, [Some(0.2), None, Some(0.9)]);
+    }
+
+    #[test]
+    fn test_a_window_the_steps_do_not_divide_ends_where_it_was_asked_to() {
+        let mut history = HostHistory::new();
+        for bin in 0..9u64 {
+            level(
+                &mut history,
+                T.saturating_add(bin.saturating_mul(10_000)),
+                0.5,
+            );
+        }
+        let range = history.range(&[SeriesKey::Cpu], T, T.saturating_add(70_000), 3);
+        assert_eq!(
+            (range.from, range.to, range.step_ms),
+            (T, T.saturating_add(70_000), 30_000)
+        );
+        // Three bins, three bins, then the one left; nothing from past the window.
+        assert_eq!(range.series[0].mean, [Some(0.5), Some(0.5), Some(0.5)]);
+        let unaligned = history.range(
+            &[SeriesKey::Cpu],
+            T.saturating_add(4000),
+            T.saturating_add(16_000),
+            9,
+        );
+        assert_eq!(
+            (unaligned.from, unaligned.to),
+            (T, T.saturating_add(20_000))
+        );
+        assert_eq!(unaligned.series[0].mean.len(), 2);
+    }
+
+    #[test]
+    fn test_a_window_longer_than_two_days_keeps_its_newest_end() {
+        let history = HostHistory::new();
+        let two_days = (BINS as u64).saturating_mul(BIN_MILLIS);
+        let range = history.range(
+            &[SeriesKey::Cpu],
+            T.saturating_sub(two_days.saturating_mul(2)),
+            T,
+            240,
+        );
+        assert_eq!((range.from, range.to), (T.saturating_sub(two_days), T));
+        let all = history.range(&[SeriesKey::Cpu], 0, T, 240);
+        assert_eq!((all.from, all.to), (T.saturating_sub(two_days), T));
+    }
+
+    #[test]
+    fn test_a_row_more_than_two_days_behind_the_newest_no_longer_answers() {
+        let mut history = HostHistory::new();
+        let two_days = (BINS as u64).saturating_mul(BIN_MILLIS);
+        level(&mut history, T, 0.3);
+        // A place of its own, so the old row is still there.
+        let later = T.saturating_add(two_days).saturating_add(50_000);
+        level(&mut history, later, 0.8);
+        assert_eq!(cpu(&history, T, T.saturating_add(10_000), 1).0, [None]);
+        let range = history.range(&[SeriesKey::Cpu], later, later.saturating_add(10_000), 1);
+        assert_eq!(range.held_from, Some(later));
+        assert_eq!(range.series[0].mean, [Some(0.8)]);
+    }
+
+    #[test]
+    fn test_a_merge_keeps_the_newer_lap_of_a_place_whichever_side_holds_it() {
+        let two_days = (BINS as u64).saturating_mul(BIN_MILLIS);
+        let later = T.saturating_add(two_days);
+
+        let mut live = HostHistory::new();
+        level(&mut live, later, 0.9);
+        let mut older = HostHistory::new();
+        level(&mut older, T, 0.2);
+        live.merge(&older);
+        assert_eq!(
+            cpu(&live, later, later.saturating_add(10_000), 1).0,
+            [Some(0.9)]
+        );
+
+        let mut stale = HostHistory::new();
+        level(&mut stale, T, 0.2);
+        let mut read_back = HostHistory::new();
+        level(&mut read_back, later, 0.9);
+        stale.merge(&read_back);
+        assert_eq!(
+            cpu(&stale, later, later.saturating_add(10_000), 1).0,
+            [Some(0.9)]
+        );
+        assert_eq!(cpu(&stale, T, T.saturating_add(10_000), 1).0, [None]);
+    }
+
+    #[test]
+    fn test_a_live_count_is_a_rate_over_the_time_since_the_last_reading() {
+        let mut history = HostHistory::new();
+        history.note_drops(T, [(8001, 0)]);
+        history.note_drops(T.saturating_add(4000), [(8001, 1200)]);
+        let range = history.range(&[SeriesKey::UdpDrops], T, T.saturating_add(10_000), 1);
+        assert_eq!(range.series[0].mean, [Some(120.0)]);
+        assert_eq!(range.series[0].max, [Some(300.0)]);
+    }
+
+    fn recorded_drops(history: &HostHistory, from: u64, bins: u64) -> Vec<Option<f32>> {
+        history
+            .range(
+                &[SeriesKey::UdpDrops],
+                from,
+                from.saturating_add(bins.saturating_mul(BIN_MILLIS)),
+                bins as usize,
+            )
+            .series
+            .into_iter()
+            .next()
+            .unwrap()
+            .mean
+    }
+
+    #[test]
+    fn test_recorded_drops_count_across_a_quiet_stretch_which_reads_nought() {
+        let mut history = HostHistory::new();
+        history.note_recorded_drops(T, vec![(8001, 100)], false);
+        // Nothing changed for forty seconds, so no line was written; then five hundred at once.
+        history.note_recorded_drops(T.saturating_add(40_000), vec![(8001, 600)], false);
+        assert_eq!(
+            recorded_drops(&history, T, 5),
+            [None, Some(0.0), Some(0.0), Some(0.0), Some(50.0)]
+        );
+        let peak = history.range(&[SeriesKey::UdpDrops], T, T.saturating_add(50_000), 1);
+        assert_eq!(peak.series[0].max, [Some(500.0)]);
+    }
+
+    #[test]
+    fn test_a_segments_opening_copy_carries_on_only_where_it_repeats_the_last_line() {
+        let mut history = HostHistory::new();
+        history.note_recorded_drops(T, vec![(8001, 100)], false);
+        // The same process rolled over to a new segment: its copy repeats the last line.
+        history.note_recorded_drops(T.saturating_add(30_000), vec![(8001, 100)], true);
+        history.note_recorded_drops(T.saturating_add(31_000), vec![(8001, 130)], false);
+        assert_eq!(
+            recorded_drops(&history, T, 4),
+            [None, Some(0.0), Some(0.0), Some(3.0)]
+        );
+    }
+
+    #[test]
+    fn test_another_run_of_the_process_counts_from_its_own_totals() {
+        let mut history = HostHistory::new();
+        history.note_recorded_drops(T, vec![(8001, 40)], false);
+        // Started again ten seconds on, before its totals have a baseline taken off them.
+        let restarted = T.saturating_add(10_000);
+        history.note_recorded_drops(restarted, vec![(8001, 5_000_050)], true);
+        history.note_recorded_drops(
+            restarted.saturating_add(1000),
+            vec![(8001, 5_000_060)],
+            false,
+        );
+        assert_eq!(recorded_drops(&history, T, 2), [None, Some(1.0)]);
+    }
+
+    #[test]
+    fn test_recorded_drops_after_a_long_silence_count_nothing_of_it() {
+        let mut history = HostHistory::new();
+        history.note_recorded_drops(T, vec![(8001, 40)], false);
+        let later = T
+            .saturating_add(MAX_RECORDED_QUIET_MILLIS)
+            .saturating_add(10_000);
+        history.note_recorded_drops(later, vec![(8001, 900)], false);
+        let range = history.range(&[SeriesKey::UdpDrops], T, later.saturating_add(10_000), 240);
+        assert!(range.series[0].mean.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn test_a_segments_opening_copy_of_the_host_and_network_is_not_read_twice() {
+        let mut history = HostHistory::new();
+        let host = serde_json::to_string(&host()).unwrap();
+        let network = r#"{"received_per_second":600,"sent_per_second":400}"#;
+        assert_eq!(history.note_recorded(T, "host", &host, true), Some(true));
+        assert_eq!(
+            history.note_recorded(T, "network", network, true),
+            Some(true)
+        );
+        let range = history.range(
+            &[SeriesKey::Cpu, SeriesKey::NetIn],
+            T,
+            T.saturating_add(10_000),
+            1,
+        );
+        assert_eq!(range.held_from, None);
+        assert_eq!(
+            history.note_recorded(T, "ingest_paths", "[1,2", true),
+            Some(false)
+        );
     }
 
     #[test]

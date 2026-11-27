@@ -26,8 +26,9 @@ pub struct Refilled {
     pub waterfalls: BTreeMap<Slot, SlotWaterfall>,
     pub costs: BTreeMap<Slot, SlotCost>,
     pub fees: BTreeMap<Slot, BlockFees>,
-    /// The host's readings, binned by when each was recorded.
-    pub host: HostHistory,
+    /// The host's readings, binned by when each was recorded; `None` with none read, and once the
+    /// service has taken them.
+    pub host: Option<HostHistory>,
     pub segments: usize,
     /// Lines with one of our keys that did not parse.
     pub unread: usize,
@@ -47,7 +48,7 @@ pub fn read(log: &RewindLog, segments: &[(u64, u64, usize)], stop: impl Fn() -> 
                 break;
             };
             for line in block.text.lines() {
-                refilled.apply(line);
+                refilled.apply(line, block.keyframe);
             }
         }
         refilled.segments = refilled.segments.saturating_add(1);
@@ -68,14 +69,16 @@ fn parse<T: DeserializeOwned>(value: &str) -> Option<T> {
 }
 
 impl Refilled {
-    fn apply(&mut self, line: &str) {
+    /// `opening` for a line of a segment's own copy of what a joining page is sent.
+    fn apply(&mut self, line: &str, opening: bool) {
         let Some((at_ms, key, value)) = split(line) else {
             return;
         };
         let read = match key {
             "host" | "network" | "ingest_paths" => self
                 .host
-                .note_recorded(at_ms, key, value)
+                .get_or_insert_with(HostHistory::new)
+                .note_recorded(at_ms, key, value, opening)
                 .and_then(|read| read.then_some(())),
             "produced_block" => parse(value).map(|block: ProducedBlock| {
                 self.blocks.insert(block.slot, block);
@@ -449,6 +452,7 @@ mod tests {
         // The recorder's clock starts at a thousand seconds and moves a second a step.
         let range = refilled
             .host
+            .unwrap()
             .range(&[SeriesKey::NetIn], 1_000_000, 1_010_000, 1);
         assert_eq!(range.series[0].mean, [Some(200.0)]);
         assert_eq!(range.series[0].max, [Some(300.0)]);

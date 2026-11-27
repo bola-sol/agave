@@ -734,11 +734,14 @@ struct HandoffBinParams {
     to: Option<i32>,
 }
 
+/// The refusal below names the most series in words.
+const _: () = assert!(MAX_HOST_SERIES == 3);
+
 #[derive(serde::Deserialize)]
 struct HostRangeParams {
     /// A name outside the history's own fails the request as a whole.
     series: Vec<SeriesKey>,
-    /// In unix milliseconds; held to what the history keeps rather than refused.
+    /// In unix milliseconds; a window over two days keeps its newest end rather than being refused.
     from: u64,
     to: u64,
     points: usize,

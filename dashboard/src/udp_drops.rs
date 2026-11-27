@@ -33,7 +33,7 @@ impl PortWindow {
     }
 
     pub fn push(&mut self, now: Instant, totals: HashMap<u16, u64>) {
-        // A gap of a whole span, as while nobody watched, leaves no sample that belongs in it.
+        // A gap of a whole span, as across a stall, leaves no sample that belongs in it.
         if self
             .samples
             .back()
