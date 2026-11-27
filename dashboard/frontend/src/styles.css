@@ -12140,6 +12140,44 @@ body {
   font-size: 11px;
 }
 
+.ask-headline {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ask-headline-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.ask-headline.is-warn .ask-headline-label {
+  color: var(--warn);
+}
+
+.ask-headline-value {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.ask-headline-detail {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.ask-unfit {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
 .ask-figures {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -12219,6 +12257,31 @@ body {
 
 .ask-area {
   fill: color-mix(in srgb, var(--flow) 22%, var(--panel));
+}
+
+/* The spans a condition held: terracotta, as the accent means "now". */
+.ask-span {
+  fill: color-mix(in srgb, var(--warn) 16%, transparent);
+}
+
+.ask-threshold {
+  stroke: var(--text-dim);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.ask-threshold-label {
+  position: absolute;
+  right: 0;
+  transform: translateY(-100%);
+  padding: 0 2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 12px;
+  color: var(--text-dim);
+  background: var(--panel);
+  pointer-events: none;
 }
 
 .ask-x {

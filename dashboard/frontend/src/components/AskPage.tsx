@@ -1,7 +1,8 @@
 /** One box that takes a request in plain words and answers it with charts from the slot history and
- *  the host's readings. The browser's own model picks the series; nothing typed leaves the browser. */
+ *  the host's readings, and a figure where one is asked for. The browser's own model picks the series
+ *  and the operation; nothing typed leaves the browser. */
 
-import { memo, useEffect, useRef, useState, useSyncExternalStore, type FormEvent, type ReactElement } from "react";
+import { memo, useEffect, useMemo, useRef, useState, useSyncExternalStore, type FormEvent, type ReactElement } from "react";
 import {
   asksWhy,
   BIN_COUNT,
@@ -26,7 +27,22 @@ import {
   type AskedWindow,
   type Bins,
   type Series,
+  type SlotSeries,
 } from "../ask";
+import {
+  answerFigure,
+  comparing,
+  readAs,
+  shareFigure,
+  sharePair,
+  thresholdOf,
+  withoutThreshold,
+  type Answered as Worked,
+  type FigureContext,
+  type Mark,
+  type Operation,
+  type ThresholdRead,
+} from "../askFigures";
 import { askModel, useAskModel, type AskModelSnapshot } from "../askModel";
 import { clockTime, count } from "../format";
 import type { Store } from "../store";
@@ -41,6 +57,9 @@ type Answered =
       pickedMillis: number;
       /** What the request asked for and did not get, or null. */
       note: string | null;
+      /** What to work out beside the charts; null where it was not read. */
+      operation: Operation | null | "pending";
+      operationMillis: number | null;
     }
   | { kind: "why" }
   | { kind: "none" }
@@ -61,7 +80,7 @@ interface Item {
 const EXAMPLES: readonly string[] = [
   "Shreds per second over the past hour",
   "Replay time, last 15 minutes",
-  "Failed transactions over the past 6 hours",
+  "Total fees over the past 6 hours",
   "CPU use over the past hour",
 ];
 
@@ -77,11 +96,16 @@ export function AskPage(): ReactElement {
 
   const ready = model.state === "ready";
   useEffect(() => {
-    if (ready) askModel.warm();
+    if (!ready) return;
+    askModel.warm();
+    askModel.warmFigures();
   }, [ready]);
   useEffect(() => () => stop.current?.abort(), []);
 
-  const busy = items.some((item) => item.answer.kind === "asking");
+  // Until the operation is read too, so the two prompts of one request never queue behind another's.
+  const busy = items.some(
+    (item) => item.answer.kind === "asking" || (item.answer.kind === "charts" && item.answer.operation === "pending"),
+  );
   const open = ready && !busy;
 
   const ask = (text: string): void => {
@@ -106,16 +130,37 @@ export function AskPage(): ReactElement {
     const controller = new AbortController();
     stop.current = controller;
     const began = performance.now();
+    // Asked at once; whichever lands first waits for the other in these.
+    let operation: Operation | null | "pending" = "pending";
+    let operationMillis: number | null = null;
+    void askModel.pickOperation(request, controller.signal).then((read) => {
+      operation = read;
+      operationMillis = performance.now() - began;
+      setItems((held) =>
+        held.map((item) =>
+          item.id === id && item.answer.kind === "charts"
+            ? { ...item, answer: { ...item.answer, operation: read, operationMillis } }
+            : item,
+        ),
+      );
+    });
     void askModel.pickSeries(request, controller.signal).then((picked) => {
       if (picked.kind === "series") {
         settle({
           kind: "charts",
           charts: picked.series.map((series) => ({ series, closest: !namesSeries(request, series) })),
-          asked: windowOf(request),
+          // The value compared against is no window, as "under 5 s" would read.
+          asked: windowOf(withoutThreshold(request, picked.series[0])),
           pickedMillis: performance.now() - began,
           note: notDrawnNote(leftOut(request, picked.series, SERIES), picked.unmatched),
+          operation,
+          operationMillis,
         });
-      } else if (picked.kind === "none") settle({ kind: "none" });
+        return;
+      }
+      // Nothing to work a figure out for.
+      controller.abort();
+      if (picked.kind === "none") settle({ kind: "none" });
       else settle(picked.reason === "stopped" ? null : { kind: "failed", reason: picked.reason });
     });
   };
@@ -150,7 +195,7 @@ export function AskPage(): ReactElement {
             value={typed}
             disabled={!ready}
             onChange={(event) => setTyped(event.target.value)}
-            placeholder="Ask for a chart"
+            placeholder="Ask for a chart or a figure"
             aria-label="Request"
             maxLength={200}
           />
@@ -232,7 +277,7 @@ const RECORDED_HOST = recordedList(HOST_SERIES);
 
 const PLAIN: Record<"asking" | "why" | "none" | "timeout" | "model", string> = {
   asking: "Asking Chrome's model…",
-  why: "This version only draws charts.",
+  why: "This version draws charts and works out figures; it does not explain causes.",
   none: "Nothing this validator records matches that.",
   timeout: "Chrome's model took too long.",
   model: "Chrome's model did not answer.",
@@ -250,6 +295,8 @@ type Loaded =
       slots: { count: number; reached: boolean } | null;
       /** How the host's readings came, or null for a request with none. */
       host: { stepMillis: number; heldFrom: number | null } | null;
+      /** A share's whole where it came by rule and has no panel of its own. */
+      whole: Bins | null;
     };
 
 /** Whether the validator can be asked now, and for the slot history whether its tip is known; a
@@ -272,7 +319,7 @@ const WAITING: Record<"offline" | "loading" | "empty" | "failed", string> = {
 };
 
 function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answered, { kind: "charts" }> }): ReactElement {
-  const { charts, asked, pickedMillis, note } = answer;
+  const { charts, asked, pickedMillis, note, operation, operationMillis } = answer;
   // Always the live validator: a request for the past hour means the hour up to now.
   const live = useRequests();
   const perSlot = charts.some((chart) => chart.series.source === "slots");
@@ -282,6 +329,9 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
   const { millis } = pick;
   const [loaded, setLoaded] = useState<Loaded>({ state: "loading" });
   const drawn = useRef<typeof pick | null>(null);
+  // Read from the request alone, so the window's blocks can be counted against them as it loads.
+  const thresholds = useMemo(() => charts.map((chart) => thresholdOf(typed, chart.series)), [typed, charts]);
+  const pair = useMemo(() => sharePair(charts.map((chart) => chart.series)), [charts]);
 
   useEffect(() => {
     // A reconnect reads again only what is not yet drawn, and leaves a drawn chart at its own time.
@@ -312,11 +362,17 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
           setLoaded({ state: "failed" });
           return;
         }
-        const bins = charts.map(({ series }) =>
-          series.source === "slots"
-            ? slotRows && bucket(slotRows.rows, series, from, to)
-            : readings && hostBins(readings, series),
-        );
+        const bins = charts.map(({ series }, index) => {
+          const compared = thresholds[index];
+          const fits = compared && !("wrong" in compared) ? compared : null;
+          return series.source === "slots"
+            ? slotRows && bucket(slotRows.rows, series, from, to, BIN_COUNT, fits?.value, fits?.inclusive)
+            : readings && hostBins(readings, series);
+        });
+        const whole =
+          pair?.byRule && slotRows && pair.whole.source === "slots"
+            ? bucket(slotRows.rows, pair.whole as SlotSeries, from, to)
+            : null;
         drawn.current = pick;
         setLoaded(
           bins.some((held) => held !== null)
@@ -326,6 +382,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
                 bins,
                 slots: slotRows && { count: slotRows.rows.length, reached: slotRows.reached },
                 host: readings && { stepMillis: readings.step_ms, heldFrom: readings.held_from },
+                whole,
               }
             : { state: "empty" },
         );
@@ -336,7 +393,31 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
     return () => {
       stale = true;
     };
-  }, [canRead, live, pick, charts, perSlot]);
+  }, [canRead, live, pick, charts, perSlot, thresholds, pair]);
+
+  const read = operation === "pending" ? null : operation;
+  const worked = useMemo(() => {
+    if (loaded.state !== "ready" || read === null) return { panels: charts.map(() => null), share: null };
+    const base: Omit<FigureContext, "threshold"> = {
+      window: windowLabel(millis),
+      comparing: comparing(typed),
+      clock: clockTime,
+    };
+    const panels = charts.map((chart, index) =>
+      answerFigure(read, chart.series, loaded.bins[index] ?? null, { ...base, threshold: thresholds[index] }),
+    );
+    let share: Worked = null;
+    if (read === "share") {
+      const part = pair ? (loaded.bins[charts.findIndex((chart) => chart.series === pair.part)] ?? null) : null;
+      const whole = pair
+        ? pair.byRule
+          ? loaded.whole
+          : (loaded.bins[charts.findIndex((chart) => chart.series === pair.whole)] ?? null)
+        : null;
+      share = shareFigure(pair, part, whole, { ...base, threshold: null });
+    }
+    return { panels, share };
+  }, [loaded, read, charts, thresholds, pair, millis, typed]);
 
   const choose = (next: number): void => setPick((held) => ({ millis: next, turn: held.turn + 1 }));
   const own = WINDOWS.some((entry) => entry.millis === asked.millis);
@@ -363,6 +444,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
           {note}
         </p>
       )}
+      {worked.share && <FigureLine worked={worked.share} />}
       <div className="ask-charts">
         {charts.map((chart, index) => (
           <SeriesPanel
@@ -371,13 +453,16 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
             bins={loaded.state === "ready" ? loaded.bins[index] : null}
             waiting={WAITING[waiting]}
             announce={loaded.state === "ready" || index === 0}
+            operation={read}
+            threshold={thresholds[index]}
+            worked={worked.panels[index]}
           />
         ))}
       </div>
       <p className="ask-source">
         {[
           ...(loaded.state === "ready" ? sources(loaded, millis) : []),
-          `series chosen by Chrome's built-in model in ${(pickedMillis / 1000).toFixed(1)} s`,
+          modelLine(pickedMillis, operation, operationMillis),
           ...(loaded.state === "ready" ? shortfalls(loaded) : []),
           ...(asked.clamped ? ["windows run from 5 minutes to 6 hours"] : []),
         ].join(" · ")}
@@ -387,6 +472,27 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
 }
 
 type Ready = Extract<Loaded, { state: "ready" }>;
+
+/** What the model read and how long it took, as the source line says it. */
+function modelLine(pickedMillis: number, operation: Operation | null | "pending", operationMillis: number | null): string {
+  const seconds = (millis: number): string => `${(millis / 1000).toFixed(1)} s`;
+  if (operation === "pending") return `series chosen by Chrome's built-in model in ${seconds(pickedMillis)}`;
+  if (operation === null) return `series chosen by Chrome's built-in model in ${seconds(pickedMillis)} · the operation was not read`;
+  return `series and operation read by Chrome's built-in model in ${seconds(Math.max(pickedMillis, operationMillis ?? 0))}`;
+}
+
+/** A worked-out figure above a chart, or why there is none. */
+function FigureLine({ worked }: { worked: Worked }): ReactElement | null {
+  if (worked === null) return null;
+  if ("unfit" in worked) return <p className="ask-unfit">{worked.unfit}</p>;
+  return (
+    <div className={`ask-headline${worked.warn ? " is-warn" : ""}`}>
+      <span className="ask-headline-label">{worked.label}</span>
+      {worked.value && <span className="ask-headline-value">{worked.value}</span>}
+      {worked.detail && <span className="ask-headline-detail">{worked.detail}</span>}
+    </div>
+  );
+}
 
 /** A host step's length, in seconds below a minute. */
 function stepLabel(millis: number): string {
@@ -414,42 +520,54 @@ function shortfalls(loaded: Ready): string[] {
   return parts;
 }
 
-/** One series of a request: what it was read as, then its figures and chart, or why there are none. */
+/** One series of a request: what it was read as and worked out, then its figures and chart, or why
+ *  there are none. */
 function SeriesPanel({
   chart,
   bins,
   waiting,
   announce,
+  operation,
+  threshold,
+  worked,
 }: {
   chart: Charted;
   bins: Bins | null;
   waiting: string;
   /** False where a neighbouring panel already says the same of the whole answer. */
   announce: boolean;
+  operation: Operation | null;
+  threshold: ThresholdRead;
+  worked: Worked;
 }): ReactElement {
   const { series, closest } = chart;
+  const as = readAs(operation, series, threshold);
+  const mark = worked && !("unfit" in worked) ? worked.mark : undefined;
+  // A per-block series' tiles come from the blocks, so they agree with a figure above them.
+  const blocks = series.source === "slots" && !series.rate ? bins?.blocks : undefined;
   return (
     <div className="ask-series">
       <div className="ask-read">
         <span className="ask-read-label">Read as</span>
         <span className="ask-read-series">
-          {series.label} <span className="ask-read-unit">{series.unit}</span>
+          {as.head} {as.unit && <span className="ask-read-unit">{as.unit}</span>}
         </span>
         {closest && <span className="ask-closest">closest match</span>}
       </div>
+      {bins && <FigureLine worked={worked} />}
       {bins ? (
         <>
           <div className="ask-figures">
             <Figure label="Latest" value={bins.latest} />
-            <Figure label="Mean" value={bins.mean} />
-            <Figure label="Lowest" value={bins.min} />
+            <Figure label="Mean" value={blocks ? blocks.mean : bins.mean} />
+            <Figure label="Lowest" value={blocks ? blocks.low.value : bins.min} />
             {bins.peak === undefined ? (
-              <Figure label="Highest" value={bins.max} />
+              <Figure label="Highest" value={blocks ? blocks.high.value : bins.max} />
             ) : (
               <Figure label="Peak, 1 s" value={bins.peak} />
             )}
           </div>
-          <Chart bins={bins} />
+          <Chart bins={bins} mark={mark} />
         </>
       ) : (
         <p className="ask-plain ask-waiting" role={announce ? "status" : undefined}>
@@ -472,9 +590,14 @@ function Figure({ label, value }: { label: string; value: number }): ReactElemen
 const WIDTH = 600;
 const HEIGHT = 150;
 
-const Chart = memo(function Chart({ bins }: { bins: Bins }): ReactElement {
-  const top = ceiling(bins.max);
+const Chart = memo(function Chart({ bins, mark }: { bins: Bins; mark?: Mark }): ReactElement {
+  // A value far off the line is told in words, not drawn.
+  const shown = mark && mark.threshold > 0 && mark.threshold <= bins.max * 4 ? mark : undefined;
+  const top = ceiling(Math.max(bins.max, shown?.threshold ?? 0));
   const { line, area } = paths(bins.values, top, WIDTH, HEIGHT);
+  const step = bins.values.length > 1 ? WIDTH / (bins.values.length - 1) : 0;
+  const x = (time: number): number => Math.min(WIDTH, Math.max(0, ((time - bins.from) / bins.binMillis) * step));
+  const y = (value: number): number => HEIGHT - (value / top) * HEIGHT;
   return (
     <div className="ask-chart">
       <div className="ask-plot">
@@ -487,9 +610,18 @@ const Chart = memo(function Chart({ bins }: { bins: Bins }): ReactElement {
           <line className="ask-grid" x1={0} x2={WIDTH} y1={0.5} y2={0.5} />
           <line className="ask-grid" x1={0} x2={WIDTH} y1={HEIGHT / 2} y2={HEIGHT / 2} />
           <line className="ask-base" x1={0} x2={WIDTH} y1={HEIGHT - 0.5} y2={HEIGHT - 0.5} />
+          {mark?.spans.map((span) => (
+            <rect key={span.start} className="ask-span" x={x(span.start)} y={0} width={Math.max(1, x(span.end) - x(span.start))} height={HEIGHT} />
+          ))}
           <path className="ask-area" d={area} />
           <path className="ask-line" d={line} />
+          {shown && <line className="ask-threshold" x1={0} x2={WIDTH} y1={y(shown.threshold)} y2={y(shown.threshold)} />}
         </svg>
+        {shown && (
+          <span className="ask-threshold-label" style={{ top: `${(y(shown.threshold) / HEIGHT) * 100}%` }}>
+            {figure(shown.threshold)}
+          </span>
+        )}
       </div>
       <div className="ask-x" aria-hidden="true">
         <span>{clockTime(bins.from)}</span>
