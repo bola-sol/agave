@@ -11497,7 +11497,7 @@ body {
   }
 }
 
-/* Five tabs on a phone: the short label, then a narrower gap. */
+/* The tabs on a phone: the short label, then a narrower gap. */
 .nav-short {
   display: none;
 }
@@ -11893,4 +11893,317 @@ body {
 
 .cl-board .cl-continents {
   margin-bottom: 8px;
+}
+
+/* ---- Ask page ---- */
+
+.ask,
+.ask-answers {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-width: 0;
+}
+
+.ask {
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+}
+
+.ask-answers:empty {
+  display: none;
+}
+
+.ask-box .card-head {
+  flex-wrap: wrap;
+  gap: 2px 12px;
+}
+
+.ask-box .card-aside {
+  white-space: normal;
+}
+
+.ask-form {
+  display: flex;
+  gap: 8px;
+}
+
+.ask-input {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+}
+
+.ask-input::placeholder {
+  color: var(--text-faint);
+}
+
+.ask-input:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.ask-send {
+  flex: none;
+  margin: 0;
+  padding: 0 16px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-raised);
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.ask-send:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ask-example:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ask-send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ask-example:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ask-input:disabled {
+  opacity: 0.5;
+}
+
+.ask-examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ask-example {
+  margin: 0;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ask-example:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel-raised);
+}
+
+.ask-download {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.ask-download .ask-plain {
+  flex: 1 1 240px;
+}
+
+.ask-download .ask-send {
+  padding: 6px 16px;
+}
+
+.ask-progress {
+  flex: 1 1 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--panel-raised);
+  overflow: hidden;
+}
+
+.ask-progress span {
+  display: block;
+  height: 100%;
+  background: var(--good);
+}
+
+.ask-answer {
+  gap: 10px;
+}
+
+.ask-asked {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.ask-plain {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+/* As tall as the figures and chart that replace it, so the cards below do not move. */
+.ask-waiting {
+  min-height: 229px;
+}
+
+.ask-source {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+.ask-read {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  font-size: 12px;
+}
+
+.ask-read-label {
+  color: var(--text-faint);
+}
+
+.ask-read-series {
+  color: var(--text);
+}
+
+.ask-read-unit {
+  color: var(--text-dim);
+}
+
+.ask-closest {
+  padding: 1px 6px;
+  border: 1px solid var(--warn);
+  border-radius: 3px;
+  font-size: 11px;
+  color: var(--warn);
+  white-space: nowrap;
+}
+
+.ask-windows {
+  font-size: 11px;
+}
+
+.ask-figures {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px 16px;
+}
+
+.ask-figure {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ask-figure-label {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.ask-figure-value {
+  font-family: var(--mono);
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ask-chart {
+  min-width: 0;
+}
+
+.ask-plot {
+  position: relative;
+  margin-top: 6px;
+  padding-left: 44px;
+}
+
+.ask-plot svg {
+  display: block;
+  width: 100%;
+  height: 150px;
+  overflow: visible;
+}
+
+.ask-tick {
+  position: absolute;
+  left: 0;
+  width: 38px;
+  text-align: right;
+  transform: translateY(-50%);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 12px;
+  color: var(--text-faint);
+}
+
+.ask-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.ask-base {
+  stroke: var(--text-faint);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.ask-line {
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.ask-area {
+  fill: color-mix(in srgb, var(--flow) 22%, var(--panel));
+}
+
+.ask-x {
+  display: flex;
+  justify-content: space-between;
+  margin: 4px 0 0 44px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+@media (max-width: 700px) {
+  .ask-figures {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ask-windows {
+    margin-left: 0;
+  }
+
+  /* Two rows of figures there. */
+  .ask-waiting {
+    min-height: 297px;
+  }
 }
