@@ -62,6 +62,7 @@ describe("ownScope", () => {
       "our priority fees",
       "what are searchers paying us",
       "transactions per block when we lead",
+      "How many skips did we have last epoch",
     ]) {
       expect(ownScope(typed), typed).toBe(true);
     }
@@ -94,6 +95,8 @@ describe("ownScope", () => {
     expect(asksProduction("how many of our leader slots did we produce")).toBe(true);
     expect(asksProduction("blocks we skipped this epoch")).toBe(true);
     expect(asksProduction("skip rate last 12 hours")).toBe(false);
+    expect(asksProduction("How many skips did we have last epoch")).toBe(true);
+    expect(asksProduction("ow many did we skip last epoch")).toBe(true);
   });
 });
 

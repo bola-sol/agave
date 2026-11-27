@@ -12038,6 +12038,49 @@ body {
   gap: 10px;
 }
 
+/* An answer with its close button over the card's top right corner. */
+.ask-item {
+  position: relative;
+  min-width: 0;
+}
+
+.ask-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.ask-close:hover,
+.ask-close:focus-visible {
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+.ask-close svg {
+  width: 12px;
+  height: 12px;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  fill: none;
+}
+
+/* The request and its toggles keep clear of the close button. */
+.ask-item .ask-head,
+.ask-item .ask-answer > .ask-asked {
+  padding-right: 32px;
+}
+
 .ask-head {
   display: flex;
   flex-wrap: wrap;
