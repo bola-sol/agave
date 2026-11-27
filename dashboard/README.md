@@ -107,12 +107,15 @@ the domain in the site block is the name to allow, and nothing else is needed.
 ### What it costs the validator
 
 The expensive sampling only runs while at least one viewer is connected: on the
-collector, the cluster-wide validator list; on the meters, the `/proc` walks
-behind the host, thread and socket panels. With nobody watching, the collector
-does slot bookkeeping, the meters keep the clock, throughput, network counters
-and the totals lifted from metrics points, and little else runs. A viewer
-connecting finds the throughput and network charts whole; the host, thread and
-socket panels fill from that moment.
+collector, the cluster-wide validator list; on the meters, the walk over every
+thread behind the thread panel. With nobody watching, the collector does slot
+bookkeeping, and the meters keep the clock, throughput, network counters and
+the totals lifted from metrics points. They also read the host and the sockets
+once a second, viewer or not: `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`,
+a `statvfs` on each data path and `/proc/net/udp`. That keeps two days of the
+host's readings without holes for `host.range`. A viewer connecting finds the
+throughput, network, host and socket figures current; the thread panel fills
+from that moment.
 
 What runs whatever the audience, beyond that: a metrics tap that observes the
 datapoints the validator already emits, a listing of the snapshot archive
