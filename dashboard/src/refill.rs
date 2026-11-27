@@ -54,13 +54,21 @@ pub fn read(log: &RewindLog, segments: &[(u64, u64, usize)], stop: impl Fn() -> 
         if let Some(host) = &mut refilled.host {
             host.begin_segment();
         }
+        // The opening copy can take several blocks, held until the first that is not one.
+        let mut opening = Vec::new();
         for block in 0..*blocks {
             // A segment pruned since it was listed reads as nothing.
             let Some(block) = log.read(*start, block) else {
                 break;
             };
-            refilled.apply_block(&block.text, block.keyframe);
+            if block.keyframe {
+                opening.push(block.text);
+                continue;
+            }
+            refilled.apply_opening(&mut opening);
+            refilled.apply_block(&block.text, false);
         }
+        refilled.apply_opening(&mut opening);
         refilled.segments = refilled.segments.saturating_add(1);
     }
     refilled.finish();
@@ -138,17 +146,23 @@ fn parse<T: DeserializeOwned>(value: &str) -> Option<T> {
 impl Refilled {
     /// A segment's opening copy is in key order, so its start time is taken first: a run's state
     /// read from that copy is the run's, not the one before.
-    fn apply_block(&mut self, text: &str, keyframe: bool) {
-        if keyframe {
-            for line in text
-                .lines()
-                .filter(|line| split(line).is_some_and(|(_, key, _)| key == "startup_time_nanos"))
-            {
-                self.apply(line, true);
-            }
+    fn apply_opening(&mut self, blocks: &mut Vec<String>) {
+        let starts: Vec<&str> = blocks
+            .iter()
+            .flat_map(|text| text.lines())
+            .filter(|line| split(line).is_some_and(|(_, key, _)| key == "startup_time_nanos"))
+            .collect();
+        for line in starts {
+            self.apply(line, true);
         }
+        for text in blocks.drain(..) {
+            self.apply_block(&text, true);
+        }
+    }
+
+    fn apply_block(&mut self, text: &str, opening: bool) {
         for line in text.lines() {
-            self.apply(line, keyframe);
+            self.apply(line, opening);
         }
     }
 
@@ -736,13 +750,16 @@ mod tests {
     fn test_a_segment_opening_copy_takes_its_start_time_before_the_run_state() {
         let summary = |key: &str, text: &str| format!("1 {PREFIX}{key}{VALUE}{text}}}");
         let mut refilled = Refilled::default();
-        let opening = [
-            summary("behind_cluster", "0"),
-            summary("caught_up_time_nanos", "1"),
+        // As a large copy is written: the start time in the second of its blocks.
+        let mut opening = vec![
+            [
+                summary("behind_cluster", "0"),
+                summary("caught_up_time_nanos", "1"),
+            ]
+            .join("\n"),
             summary("startup_time_nanos", "1"),
-        ]
-        .join("\n");
-        refilled.apply_block(&opening, true);
+        ];
+        refilled.apply_opening(&mut opening);
         refilled.apply_block(&summary("behind_cluster", "5"), false);
         let fill = refilled.slots.as_ref().unwrap();
         assert!(fill.caught);
