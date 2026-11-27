@@ -2,7 +2,7 @@
  *  one question at a time put to it. Nothing typed leaves the browser. */
 
 import { useSyncExternalStore } from "react";
-import { NONE, parseReply, SERIES, seriesSchema, systemPrompt, type Series } from "./ask";
+import { parseReply, SERIES, seriesSchema, systemPrompt, type Series } from "./ask";
 
 interface PromptOptions {
   responseConstraint?: object;
@@ -66,7 +66,7 @@ export function tabShown(state: AskState): boolean {
 }
 
 export type Picked =
-  | { kind: "series"; series: Series }
+  | { kind: "series"; series: Series[]; unmatched: boolean }
   | { kind: "none" }
   | { kind: "failed"; reason: "timeout" | "model" | "stopped" };
 
@@ -191,7 +191,7 @@ export function createAskModel(api: () => LanguageModelApi | undefined, secure: 
       prompted = true;
       const parsed = parseReply(reply, SERIES);
       if (parsed === null) return { kind: "failed", reason: "model" };
-      return parsed === NONE ? { kind: "none" } : { kind: "series", series: parsed };
+      return parsed.series.length === 0 ? { kind: "none" } : { kind: "series", ...parsed };
     } catch {
       // A session that never opened would hold up every later request.
       if (late && !opened) drop();

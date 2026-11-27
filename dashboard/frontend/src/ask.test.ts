@@ -4,12 +4,15 @@ import {
   bucket,
   ceiling,
   figure,
+  leftOut,
   MAX_EMPTY_PAGES,
   MAX_PAGES,
+  MAX_SERIES,
   MAX_WINDOW_MILLIS,
   MIN_WINDOW_MILLIS,
   namesSeries,
   NONE,
+  notDrawnNote,
   parseReply,
   paths,
   readWindow,
@@ -189,10 +192,17 @@ describe("namesSeries", () => {
 });
 
 describe("seriesSchema", () => {
-  it("allows each key and the word for no match, and nothing open", () => {
+  it("allows a short list of the keys and the word for no match, and nothing open", () => {
     expect(seriesSchema(SERIES)).toEqual({
       type: "object",
-      properties: { series: { type: "string", enum: [...SERIES.map((entry) => entry.key), NONE] } },
+      properties: {
+        series: {
+          type: "array",
+          items: { type: "string", enum: [...SERIES.map((entry) => entry.key), NONE] },
+          minItems: 1,
+          maxItems: MAX_SERIES,
+        },
+      },
       required: ["series"],
       additionalProperties: false,
     });
@@ -209,22 +219,110 @@ describe("systemPrompt", () => {
 });
 
 describe("parseReply", () => {
-  it("returns the series the model named", () => {
-    expect(parseReply('{"series":"replay"}', SERIES)).toBe(series("replay"));
-    expect(parseReply(' {"series": "shreds"}\n', SERIES)).toBe(series("shreds"));
+  it("returns the series the model named, in its order", () => {
+    expect(parseReply('{"series":["replay"]}', SERIES)).toEqual({ series: [series("replay")], unmatched: false });
+    expect(parseReply(' {"series": ["shreds", "replay"]}\n', SERIES)).toEqual({
+      series: [series("shreds"), series("replay")],
+      unmatched: false,
+    });
   });
 
-  it("returns the word for no match as it is", () => {
-    expect(parseReply('{"series":"none"}', SERIES)).toBe(NONE);
+  it("keeps each series once and no more than a request draws", () => {
+    expect(parseReply('{"series":["fees","tips","fees"]}', SERIES)?.series).toEqual([series("fees"), series("tips")]);
+    const many = parseReply('{"series":["shreds","replay","fees","tips","votes"]}', SERIES);
+    expect(many?.series).toEqual([series("shreds"), series("replay"), series("fees")]);
+    expect(many?.series).toHaveLength(MAX_SERIES);
+  });
+
+  it("is empty when the model found nothing recorded", () => {
+    expect(parseReply('{"series":["none"]}', SERIES)).toEqual({ series: [], unmatched: false });
+    expect(parseReply('{"series":[]}', SERIES)).toEqual({ series: [], unmatched: false });
+  });
+
+  it("says when the model found one thing and not another", () => {
+    expect(parseReply('{"series":["shreds","none"]}', SERIES)).toEqual({ series: [series("shreds")], unmatched: true });
+    expect(parseReply('{"series":["none","replay"]}', SERIES)).toEqual({ series: [series("replay")], unmatched: true });
   });
 
   it("returns null for anything outside the schema", () => {
-    expect(parseReply('{"series":"cpu"}', SERIES)).toBeNull();
-    expect(parseReply('{"chart":"shreds"}', SERIES)).toBeNull();
+    expect(parseReply('{"series":"shreds"}', SERIES)).toBeNull();
+    expect(parseReply('{"series":["cpu"]}', SERIES)).toBeNull();
+    expect(parseReply('{"series":["shreds","cpu"]}', SERIES)).toBeNull();
+    expect(parseReply('{"series":[7]}', SERIES)).toBeNull();
+    expect(parseReply('{"chart":["shreds"]}', SERIES)).toBeNull();
     expect(parseReply("shreds", SERIES)).toBeNull();
-    expect(parseReply('The series is {"series":"shreds"}', SERIES)).toBeNull();
+    expect(parseReply('The series is {"series":["shreds"]}', SERIES)).toBeNull();
     expect(parseReply("null", SERIES)).toBeNull();
     expect(parseReply("", SERIES)).toBeNull();
+  });
+});
+
+describe("leftOut", () => {
+  const keys = (typed: string, ...picked: string[]): string[] =>
+    leftOut(typed, picked.map(series), SERIES).map((entry) => entry.key);
+
+  it("names a series the request asks for and the answer lacks", () => {
+    expect(keys("Shreds per second over the past hour and replay time over the past hour seperate charts", "shreds")).toEqual([
+      "replay",
+    ]);
+    expect(keys("shreds, replay, fees, tips and votes", "shreds", "replay", "fees")).toEqual(["tips", "votes"]);
+    expect(keys("fees and priority fees", "fees")).toEqual(["priority_fees"]);
+  });
+
+  it("is empty when everything named was drawn", () => {
+    expect(keys("shreds and replay time", "shreds", "replay")).toEqual([]);
+    expect(keys("How busy is the network", "shreds")).toEqual([]);
+  });
+
+  it("does not count a word the drawn series itself goes by", () => {
+    expect(keys("Are we getting many shreds through repair?", "repaired")).toEqual([]);
+    expect(keys("shreds rebuilt from coding shreds", "recovered")).toEqual([]);
+    expect(keys("Failed transactions over the past 6 hours", "failed")).toEqual([]);
+    expect(keys("Show vote transactions for the last hour", "votes")).toEqual([]);
+    expect(keys("non-vote transaction rate", "transactions")).toEqual([]);
+    expect(keys("Priority fees per block", "priority_fees")).toEqual([]);
+    expect(keys("How much are we earning in transaction fees", "fees")).toEqual([]);
+    expect(keys("How long does a block take to fill once its first shred arrives?", "fill")).toEqual([]);
+    expect(keys("How full are blocks", "compute")).toEqual([]);
+  });
+
+  it("is empty for a request that joins nothing, whatever other words it holds", () => {
+    expect(keys("Shreds arriving per second over the past hour", "shreds")).toEqual([]);
+    expect(keys("Tips per transaction", "tips")).toEqual([]);
+    expect(keys("Compute units per transaction, last hour", "compute")).toEqual([]);
+    expect(keys("How long does it take to replay a full block", "replay")).toEqual([]);
+    expect(keys("Transactions per second for the full six hours", "transactions")).toEqual([]);
+    expect(keys("Priority fees", "fees")).toEqual([]);
+  });
+
+  it("does not count a unit after per, or a looser word for a series, in a joined request", () => {
+    expect(keys("Tips per transaction and fees", "tips", "fees")).toEqual([]);
+    expect(keys("shreds arriving and replay time for the full hour", "shreds", "replay")).toEqual([]);
+    expect(keys("Replay time, last 15 minutes", "replay")).toEqual([]);
+  });
+
+  it("never fires on a series asked for by its own label", () => {
+    for (const entry of SERIES) expect(leftOut(entry.label, [entry], SERIES)).toEqual([]);
+  });
+});
+
+describe("notDrawnNote", () => {
+  it("is null when the whole request was drawn", () => {
+    expect(notDrawnNote([], false)).toBeNull();
+  });
+
+  it("names what was left out and how to get it", () => {
+    expect(notDrawnNote([series("replay")], false)).toBe("Not drawn: replay time. Ask for it on its own.");
+    expect(notDrawnNote([series("tips"), series("votes")], false)).toBe(
+      "Not drawn: tips, vote transactions. Ask for them on their own.",
+    );
+  });
+
+  it("says when part of the request is not recorded, beside anything left out", () => {
+    expect(notDrawnNote([], true)).toBe("Part of this request matches nothing recorded.");
+    expect(notDrawnNote([series("replay")], true)).toBe(
+      "Not drawn: replay time. Ask for it on its own. Part of this request matches nothing recorded.",
+    );
   });
 });
 

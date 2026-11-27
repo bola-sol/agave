@@ -48,7 +48,7 @@ function fake(availability: string, replies: Reply[] = []) {
   const copy = (): ModelSession => ({
     prompt: (text, options) => {
       counts.prompts.push(text);
-      const reply = replies.shift() ?? '{"series":"shreds"}';
+      const reply = replies.shift() ?? '{"series":["shreds"]}';
       if (reply instanceof Error) return Promise.reject(reply);
       if (reply !== "hang") return Promise.resolve(reply);
       return new Promise((_, reject) => {
@@ -139,11 +139,11 @@ describe("createAskModel", () => {
   });
 
   it("returns the series the model names, on a copy closed afterwards", async () => {
-    const { api, counts } = fake("available", ['{"series":"replay"}']);
+    const { api, counts } = fake("available", ['{"series":["replay"]}']);
     const model = createAskModel(() => api, () => true);
     await settled(model);
     const picked = await model.pickSeries("replay time, last hour");
-    expect(picked).toMatchObject({ kind: "series", series: { key: "replay" } });
+    expect(picked).toMatchObject({ kind: "series", series: [{ key: "replay" }], unmatched: false });
     expect(counts).toMatchObject({ created: 1, cloned: 1, destroyed: 1, prompts: ["replay time, last hour"] });
   });
 
@@ -157,15 +157,31 @@ describe("createAskModel", () => {
     expect(counts).toMatchObject({ created: 1, cloned: 2, destroyed: 2 });
   });
 
+  it("returns several series in the model's order, and whether part was not recorded", async () => {
+    const { api } = fake("available", ['{"series":["shreds","replay"]}', '{"series":["fees","none"]}']);
+    const model = createAskModel(() => api, () => true);
+    await settled(model);
+    expect(await model.pickSeries("shreds and replay time")).toMatchObject({
+      kind: "series",
+      series: [{ key: "shreds" }, { key: "replay" }],
+      unmatched: false,
+    });
+    expect(await model.pickSeries("fees and the price of SOL")).toMatchObject({
+      kind: "series",
+      series: [{ key: "fees" }],
+      unmatched: true,
+    });
+  });
+
   it("says so when nothing recorded matches", async () => {
-    const { api } = fake("available", ['{"series":"none"}']);
+    const { api } = fake("available", ['{"series":["none"]}']);
     const model = createAskModel(() => api, () => true);
     await settled(model);
     expect(await model.pickSeries("the price of SOL")).toEqual({ kind: "none" });
   });
 
   it("fails without a second try on an answer outside the schema", async () => {
-    const { api, counts } = fake("available", ['{"series":"cpu"}']);
+    const { api, counts } = fake("available", ['{"series":["cpu"]}']);
     const model = createAskModel(() => api, () => true);
     await settled(model);
     expect(await model.pickSeries("cpu")).toEqual({ kind: "failed", reason: "model" });
@@ -173,10 +189,10 @@ describe("createAskModel", () => {
   });
 
   it("opens a new session once after an error, then gives up", async () => {
-    const once = fake("available", [new Error("session destroyed"), '{"series":"fees"}']);
+    const once = fake("available", [new Error("session destroyed"), '{"series":["fees"]}']);
     const recovered = createAskModel(() => once.api, () => true);
     await settled(recovered);
-    expect(await recovered.pickSeries("fees")).toMatchObject({ kind: "series", series: { key: "fees" } });
+    expect(await recovered.pickSeries("fees")).toMatchObject({ kind: "series", series: [{ key: "fees" }] });
     expect(once.counts).toMatchObject({ created: 2, cloned: 2, destroyed: 2, closed: 1 });
 
     const twice = fake("available", [new Error("gone"), new Error("gone")]);
@@ -202,7 +218,7 @@ describe("createAskModel", () => {
   });
 
   it("gives a session opened after an error the first prompt's longer wait", async () => {
-    const { api, answers, counts } = fake("available", ['{"series":"shreds"}', new Error("session closed")]);
+    const { api, answers, counts } = fake("available", ['{"series":["shreds"]}', new Error("session closed")]);
     const model = createAskModel(() => api, () => true);
     await settled(model);
     expect(await model.pickSeries("shreds")).toMatchObject({ kind: "series" });
@@ -241,7 +257,7 @@ describe("createAskModel", () => {
   });
 
   it("gives up on a prompt that outlasts its wait, the first given longer", async () => {
-    const { api, counts } = fake("available", ["hang", '{"series":"shreds"}', "hang"]);
+    const { api, counts } = fake("available", ["hang", '{"series":["shreds"]}', "hang"]);
     const model = createAskModel(() => api, () => true);
     await settled(model);
     vi.useFakeTimers();

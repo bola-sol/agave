@@ -7,7 +7,9 @@ import {
   bucket,
   ceiling,
   figure,
+  leftOut,
   namesSeries,
+  notDrawnNote,
   paths,
   readWindow,
   recordedList,
@@ -27,10 +29,23 @@ import { useRequests } from "../useStore";
 
 type Answered =
   | { kind: "asking" }
-  | { kind: "chart"; series: Series; asked: AskedWindow; closest: boolean; pickedMillis: number }
+  | {
+      kind: "charts";
+      charts: readonly Charted[];
+      asked: AskedWindow;
+      pickedMillis: number;
+      /** What the request asked for and did not get, or null. */
+      note: string | null;
+    }
   | { kind: "why" }
   | { kind: "none" }
   | { kind: "failed"; reason: "timeout" | "model" };
+
+/** One series of an answer; `closest` when the request names none of its words. */
+interface Charted {
+  series: Series;
+  closest: boolean;
+}
 
 interface Item {
   id: number;
@@ -88,11 +103,11 @@ export function AskPage(): ReactElement {
     void askModel.pickSeries(request, controller.signal).then((picked) => {
       if (picked.kind === "series") {
         settle({
-          kind: "chart",
-          series: picked.series,
+          kind: "charts",
+          charts: picked.series.map((series) => ({ series, closest: !namesSeries(request, series) })),
           asked: windowOf(request),
-          closest: !namesSeries(request, picked.series),
           pickedMillis: performance.now() - began,
+          note: notDrawnNote(leftOut(request, picked.series, SERIES), picked.unmatched),
         });
       } else if (picked.kind === "none") settle({ kind: "none" });
       else settle(picked.reason === "stopped" ? null : { kind: "failed", reason: picked.reason });
@@ -190,7 +205,7 @@ function AskDownload({ model }: { model: AskModelSnapshot }): ReactElement | nul
 
 function Answer({ item }: { item: Item }): ReactElement {
   const { answer, typed } = item;
-  if (answer.kind === "chart") return <ChartAnswer typed={typed} answer={answer} />;
+  if (answer.kind === "charts") return <ChartsAnswer typed={typed} answer={answer} />;
   return (
     <section className="card ask-answer">
       <p className="ask-asked">{typed}</p>
@@ -216,7 +231,7 @@ type Loaded =
   | { state: "loading" }
   | { state: "empty" }
   | { state: "failed" }
-  | { state: "ready"; bins: Bins; slots: number; reached: boolean };
+  | { state: "ready"; bins: readonly (Bins | null)[]; slots: number; reached: boolean };
 
 /** Whether the validator can be asked now; a boolean, so a card redraws only when it flips. */
 function useCanRead(live: Store): boolean {
@@ -231,8 +246,8 @@ const WAITING: Record<"offline" | "loading" | "empty" | "failed", string> = {
   failed: "The validator did not answer.",
 };
 
-function ChartAnswer({ typed, answer }: { typed: string; answer: Extract<Answered, { kind: "chart" }> }): ReactElement {
-  const { series, asked, closest, pickedMillis } = answer;
+function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answered, { kind: "charts" }> }): ReactElement {
+  const { charts, asked, pickedMillis, note } = answer;
   // Always the live validator: a request for the past hour means the hour up to now.
   const live = useRequests();
   const canRead = useCanRead(live);
@@ -251,12 +266,13 @@ function ChartAnswer({ typed, answer }: { typed: string; answer: Extract<Answere
     // Row times are the validator's clock.
     const to = Date.now() - (live.getClockOffset() ?? 0);
     setLoaded({ state: "loading" });
-    readWindow((first, size) => live.request("slot.range", { first_slot: first, count: size }), tip, to - millis)
+    // One read for every chart of the request, so they share a time axis.
+    readWindow((first, size) => live.request("slot.range", { first_slot: first, count: size }), tip, to - pick.millis)
       .then(({ rows, reached }) => {
         if (stale) return;
-        const bins = bucket(rows, series, to - millis, to);
+        const bins = charts.map((chart) => bucket(rows, chart.series, to - pick.millis, to));
         drawn.current = pick;
-        setLoaded(bins ? { state: "ready", bins, slots: rows.length, reached } : { state: "empty" });
+        setLoaded(bins.some((held) => held !== null) ? { state: "ready", bins, slots: rows.length, reached } : { state: "empty" });
       })
       .catch(() => {
         if (!stale) setLoaded({ state: "failed" });
@@ -264,19 +280,15 @@ function ChartAnswer({ typed, answer }: { typed: string; answer: Extract<Answere
     return () => {
       stale = true;
     };
-  }, [canRead, live, pick, series]);
+  }, [canRead, live, pick, charts]);
 
   const choose = (next: number): void => setPick((held) => ({ millis: next, turn: held.turn + 1 }));
   const own = WINDOWS.some((entry) => entry.millis === asked.millis);
+  const waiting = loaded.state === "ready" ? "empty" : loaded.state === "loading" && !canRead ? "offline" : loaded.state;
   return (
     <section className="card ask-answer">
-      <p className="ask-asked">{typed}</p>
-      <div className="ask-read">
-        <span className="ask-read-label">Read as</span>
-        <span className="ask-read-series">
-          {series.label} <span className="ask-read-unit">{series.unit}</span>
-        </span>
-        {closest && <span className="ask-closest">closest match</span>}
+      <div className="ask-head">
+        <p className="ask-asked">{typed}</p>
         <div className="toggle-group ask-windows" role="group" aria-label="Window">
           {!own && (
             <button type="button" aria-pressed={asked.millis === millis} onClick={() => choose(asked.millis)}>
@@ -290,21 +302,22 @@ function ChartAnswer({ typed, answer }: { typed: string; answer: Extract<Answere
           ))}
         </div>
       </div>
-      {loaded.state === "ready" ? (
-        <>
-          <div className="ask-figures">
-            <Figure label="Latest" value={loaded.bins.latest} />
-            <Figure label="Mean" value={loaded.bins.mean} />
-            <Figure label="Lowest" value={loaded.bins.min} />
-            <Figure label="Highest" value={loaded.bins.max} />
-          </div>
-          <Chart bins={loaded.bins} />
-        </>
-      ) : (
-        <p className="ask-plain ask-waiting" role="status">
-          {WAITING[loaded.state === "loading" && !canRead ? "offline" : loaded.state]}
+      {note !== null && (
+        <p className="ask-note" role="status">
+          {note}
         </p>
       )}
+      <div className="ask-charts">
+        {charts.map((chart, index) => (
+          <SeriesPanel
+            key={chart.series.key}
+            chart={chart}
+            bins={loaded.state === "ready" ? loaded.bins[index] : null}
+            waiting={WAITING[waiting]}
+            announce={loaded.state === "ready" || index === 0}
+          />
+        ))}
+      </div>
       <p className="ask-source">
         {loaded.state === "ready" && `${count(loaded.slots)} slots from the slot history, ${windowLabel(millis)} · `}
         series chosen by Chrome's built-in model in {(pickedMillis / 1000).toFixed(1)} s
@@ -312,6 +325,48 @@ function ChartAnswer({ typed, answer }: { typed: string; answer: Extract<Answere
         {asked.clamped && " · windows run from 5 minutes to 6 hours"}
       </p>
     </section>
+  );
+}
+
+/** One series of a request: what it was read as, then its figures and chart, or why there are none. */
+function SeriesPanel({
+  chart,
+  bins,
+  waiting,
+  announce,
+}: {
+  chart: Charted;
+  bins: Bins | null;
+  waiting: string;
+  /** False where a neighbouring panel already says the same of the whole answer. */
+  announce: boolean;
+}): ReactElement {
+  const { series, closest } = chart;
+  return (
+    <div className="ask-series">
+      <div className="ask-read">
+        <span className="ask-read-label">Read as</span>
+        <span className="ask-read-series">
+          {series.label} <span className="ask-read-unit">{series.unit}</span>
+        </span>
+        {closest && <span className="ask-closest">closest match</span>}
+      </div>
+      {bins ? (
+        <>
+          <div className="ask-figures">
+            <Figure label="Latest" value={bins.latest} />
+            <Figure label="Mean" value={bins.mean} />
+            <Figure label="Lowest" value={bins.min} />
+            <Figure label="Highest" value={bins.max} />
+          </div>
+          <Chart bins={bins} />
+        </>
+      ) : (
+        <p className="ask-plain ask-waiting" role={announce ? "status" : undefined}>
+          {waiting}
+        </p>
+      )}
+    </div>
   );
 }
 

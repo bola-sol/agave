@@ -11,7 +11,7 @@ export interface Series {
   rate: boolean;
   /** What the model is told the series is. */
   hint: string;
-  /** Word stems a request for this series usually holds. */
+  /** Word stems a request for this series usually holds, its own name first. */
   stems: readonly string[];
   read: (row: WireRow) => number | null;
 }
@@ -243,11 +243,22 @@ export function namesSeries(typed: string, series: Series): boolean {
   return new RegExp(`\\b(?:${series.stems.join("|")})`, "i").test(typed);
 }
 
-/** Enums only: an open string field lets the model run on. */
+/** The most charts one request draws. */
+export const MAX_SERIES = 3;
+
+/** Enums only: an open string field lets the model run on. The browser refuses `uniqueItems`, so
+ *  a repeated key is dropped on reading the reply. */
 export function seriesSchema(series: readonly Series[]): object {
   return {
     type: "object",
-    properties: { series: { type: "string", enum: [...series.map((entry) => entry.key), NONE] } },
+    properties: {
+      series: {
+        type: "array",
+        items: { type: "string", enum: [...series.map((entry) => entry.key), NONE] },
+        minItems: 1,
+        maxItems: MAX_SERIES,
+      },
+    },
     required: ["series"],
     additionalProperties: false,
   };
@@ -255,25 +266,73 @@ export function seriesSchema(series: readonly Series[]): object {
 
 export function systemPrompt(series: readonly Series[]): string {
   return [
-    "A request asks to see a chart of something a Solana validator records. Answer with the key of the one series it asks for.",
-    `Answer ${NONE} when the request asks for anything not listed. Do not pick the nearest.`,
+    "A request asks to see charts of things a Solana validator records. Answer with the key of each series it asks for, in the order asked. Most requests ask for one; never add a series the request does not ask for.",
+    `Answer ${NONE} for anything asked for that is not listed. Do not pick the nearest.`,
     "Series:",
     ...series.map((entry) => `${entry.key}: ${entry.hint}`),
   ].join("\n");
 }
 
-/** The series the model named, `NONE`, or null for an answer outside the schema. */
-export function parseReply(text: string, series: readonly Series[]): Series | typeof NONE | null {
+export interface Reply {
+  /** In the order the model gave them, each once, `MAX_SERIES` at most; empty when nothing matched. */
+  series: Series[];
+  /** The model marked part of the request as not recorded, beside a series it did find. */
+  unmatched: boolean;
+}
+
+/** What the model named, or null for an answer outside the schema. */
+export function parseReply(text: string, series: readonly Series[]): Reply | null {
   let reply: unknown;
   try {
     reply = JSON.parse(text);
   } catch {
     return null;
   }
-  if (typeof reply !== "object" || reply === null || !("series" in reply)) return null;
-  const key = reply.series;
-  if (key === NONE) return NONE;
-  return series.find((entry) => entry.key === key) ?? null;
+  if (typeof reply !== "object" || reply === null || !("series" in reply) || !Array.isArray(reply.series)) return null;
+  const found: Series[] = [];
+  let none = false;
+  for (const key of reply.series as unknown[]) {
+    if (key === NONE) {
+      none = true;
+      continue;
+    }
+    const named = series.find((entry) => entry.key === key);
+    if (!named) return null;
+    if (!found.includes(named)) found.push(named);
+  }
+  return { series: found.slice(0, MAX_SERIES), unmatched: none && found.length > 0 };
+}
+
+/** A request for more than one thing joins them with one of these. */
+const JOINER = /[,&]|\b(?:and|plus|vs|versus|separate|both)\b/;
+
+/** The series a request asked for and did not get, in the order asked. Only a request that joins
+ *  several things has any, and a series counts by its first stem alone, outside a "per" unit and
+ *  outside the words a picked series' own label and hint hold. */
+export function leftOut(typed: string, picked: readonly Series[], all: readonly Series[]): Series[] {
+  const text = typed.toLowerCase().replace(/\bper\s+\w+/g, " ");
+  if (!JOINER.test(text)) return [];
+  return all
+    .map((entry) => ({ entry, at: text.search(new RegExp(`\\b${entry.stems[0]}`)) }))
+    .filter(
+      ({ entry, at }) =>
+        at !== -1 &&
+        !picked.includes(entry) &&
+        !picked.some((drawn) => namesSeries(`${drawn.label} ${drawn.hint}`, entry)),
+    )
+    .sort((first, second) => first.at - second.at)
+    .map(({ entry }) => entry);
+}
+
+/** The line under a request part of which was not drawn, or null when all of it was. */
+export function notDrawnNote(left: readonly Series[], unmatched: boolean): string | null {
+  const parts: string[] = [];
+  if (left.length > 0) {
+    const names = left.map((entry) => entry.label.toLowerCase()).join(", ");
+    parts.push(`Not drawn: ${names}. Ask for ${left.length === 1 ? "it on its own" : "them on their own"}.`);
+  }
+  if (unmatched) parts.push("Part of this request matches nothing recorded.");
+  return parts.length > 0 ? parts.join(" ") : null;
 }
 
 /** What a refusal lists as recorded. */

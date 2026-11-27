@@ -12038,11 +12038,54 @@ body {
   gap: 10px;
 }
 
+.ask-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 16px;
+}
+
 .ask-asked {
+  min-width: 0;
   margin: 0;
   font-size: 15px;
   color: var(--text);
   overflow-wrap: anywhere;
+}
+
+/* Beside the window toggle, the request takes the room; on a narrow card the toggle wraps under it. */
+.ask-head .ask-asked {
+  flex: 1 1 240px;
+}
+
+.ask-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--warn);
+}
+
+/* One chart takes the card's width; two or three sit side by side where each has room. */
+.ask-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+  gap: 10px;
+}
+
+.ask-series {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+/* Alone, it is the card's own content, with no frame of its own. */
+.ask-series:only-child {
+  padding: 0;
+  border: 0;
 }
 
 .ask-plain {
@@ -12054,7 +12097,7 @@ body {
 
 /* As tall as the figures and chart that replace it, so the cards below do not move. */
 .ask-waiting {
-  min-height: 229px;
+  min-height: 228px;
 }
 
 .ask-source {
