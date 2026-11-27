@@ -1,5 +1,5 @@
 /** The Ask page's own logic: what can be charted, how a typed request is read, and how the slot
- *  history becomes a chart. The browser's model only picks a series; the window is parsed here. */
+ *  history and the host's readings become charts. The browser's model only picks the series. */
 
 import { HAS_BLOCK, HAS_CLOCK, HAS_REPLAY, HAS_SHREDS, HAS_TIPS, type SlotRange, type WireRow } from "./slotHistory";
 
@@ -175,7 +175,7 @@ export const HOST_SERIES: readonly HostSeries[] = [
     label: "Load",
     unit: "one-minute average",
     hint: "the machine's load average",
-    stems: ["load"],
+    stems: ["load average", "system load", "loadavg", "load\\b"],
     scale: 1,
   },
   {
@@ -202,7 +202,7 @@ export const HOST_SERIES: readonly HostSeries[] = [
     label: "Network in",
     unit: "MB per second",
     hint: "network traffic the machine receives; ingress, inbound, download",
-    stems: ["network in", "ingress", "inbound", "receiv", "download"],
+    stems: ["(?:network in\\b(?! (?:the|a|this|that)\\b)|ingress|inbound)", "download"],
     scale: 1e-6,
   },
   {
@@ -211,7 +211,7 @@ export const HOST_SERIES: readonly HostSeries[] = [
     label: "Network out",
     unit: "MB per second",
     hint: "network traffic the machine sends; egress, outbound, upload",
-    stems: ["network out", "egress", "outbound", "sent\\b", "upload"],
+    stems: ["(?:network out\\b|egress|outbound)", "upload"],
     scale: 1e-6,
   },
   {
@@ -220,7 +220,7 @@ export const HOST_SERIES: readonly HostSeries[] = [
     label: "Disk used",
     unit: "percent of the fullest filesystem",
     hint: "how full the disks are, the fullest one; disk space, storage",
-    stems: ["disk (?:us|space|full)", "storage", "filesystem"],
+    stems: ["disk (?:us|space|full)", "full (?:are|is) the disks?", "disks? (?:are|is) full", "storage", "filesystem"],
     scale: 100,
   },
   {
@@ -229,7 +229,7 @@ export const HOST_SERIES: readonly HostSeries[] = [
     label: "Disk busy",
     unit: "percent of the busiest disk",
     hint: "how busy the disks are, the busiest one; disk I/O, utilisation",
-    stems: ["disk (?:bus|i/?o|util|activ|load)", "iops\\b", "i/o"],
+    stems: ["disk (?:bus|i/?o|util|activ|load)", "busy (?:are|is) the disks?", "iops\\b"],
     scale: 100,
   },
   {
@@ -238,7 +238,7 @@ export const HOST_SERIES: readonly HostSeries[] = [
     label: "UDP drops",
     unit: "per second",
     hint: "packets the kernel dropped on the validator's UDP ports",
-    stems: ["udp", "drop"],
+    stems: ["udp", "dropp?(?:ed|ing)? packets", "packet drops?", "kernel drops?"],
     scale: 1,
   },
 ];
@@ -518,6 +518,8 @@ export interface Bins {
   max: number;
   mean: number;
   latest: number;
+  /** The highest single reading, where the values drawn are means of several. */
+  peak?: number;
 }
 
 export const BIN_COUNT = 120;
@@ -567,11 +569,11 @@ export interface HostRange {
   series: { key: string; mean: (number | null)[]; max: (number | null)[] }[];
 }
 
-/** How far apart the server keeps host readings, which a window is lined up to. */
+/** The span of one bin of host readings on the server, which a window is lined up to. */
 export const HOST_STEP_MILLIS = 10_000;
 
 /** One host series of a reply as a chart's readings, or null when the window holds none. The line
- *  is each step's mean; the highest is the highest single reading, which the line may not reach. */
+ *  and its figures are each step's mean; the peak is the highest single reading. */
 export function hostBins(range: HostRange, series: HostSeries): Bins | null {
   const held = range.series.find((entry) => entry.key === series.key);
   if (!held) return null;
@@ -579,14 +581,16 @@ export function hostBins(range: HostRange, series: HostSeries): Bins | null {
   const real = values.filter((value): value is number => value !== null);
   if (real.length === 0) return null;
   const peaks = held.max.filter((value): value is number => value !== null).map((value) => value * series.scale);
+  const max = Math.max(...real);
   return {
     from: range.from,
     to: range.to,
     values,
     min: Math.min(...real),
-    max: Math.max(...real, ...peaks),
+    max,
     mean: real.reduce((sum, value) => sum + value, 0) / real.length,
     latest: real[real.length - 1],
+    peak: Math.max(max, ...peaks),
   };
 }
 

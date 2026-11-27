@@ -221,12 +221,19 @@ describe("HOST_SERIES", () => {
     expect(namesSeries("disk space left", host("disk_used"))).toBe(true);
     expect(namesSeries("disk I/O", host("disk_busy"))).toBe(true);
     expect(namesSeries("kernel drops", host("udp_drops"))).toBe(true);
+    expect(namesSeries("are we dropping packets", host("udp_drops"))).toBe(true);
+    expect(namesSeries("how full are the disks", host("disk_used"))).toBe(true);
+    expect(namesSeries("how busy are the disks", host("disk_busy"))).toBe(true);
+    expect(namesSeries("system load", host("load"))).toBe(true);
   });
 
   it("is not found in a word that only holds one of them", () => {
     expect(namesSeries("program cache", host("memory"))).toBe(false);
     expect(namesSeries("downloads", host("load"))).toBe(false);
-    expect(namesSeries("shreds sent per second", host("net_in"))).toBe(false);
+    expect(namesSeries("shreds sent per second", host("net_out"))).toBe(false);
+    expect(namesSeries("votes received", host("net_in"))).toBe(false);
+    expect(namesSeries("dropped transactions", host("udp_drops"))).toBe(false);
+    expect(namesSeries("network I/O", host("disk_busy"))).toBe(false);
   });
 });
 
@@ -249,8 +256,12 @@ describe("hostBins", () => {
     expect(bins?.mean).toBeCloseTo(30);
   });
 
-  it("gives the highest single reading, which the line of means may not reach", () => {
-    expect(hostBins(range([0.2, 0.4, null, 0.3], [0.5, 0.9, null, 0.3]), host("cpu"))?.max).toBe(90);
+  it("keeps the line's own highest apart from the highest single reading", () => {
+    const bins = hostBins(range([0.2, 0.4, null, 0.3], [0.5, 0.9, null, 0.3]), host("cpu"));
+    expect(bins?.max).toBe(40);
+    expect(bins?.peak).toBe(90);
+    // With no peaks sent, the line's own highest stands in.
+    expect(hostBins(range([0.2, 0.4], [null, null]), host("cpu"))?.peak).toBe(40);
   });
 
   it("is null for a series the reply lacks or a window with no reading", () => {
@@ -400,6 +411,13 @@ describe("leftOut", () => {
     expect(keys("Host network ingress against tps", "transactions")).toEqual(["net_in"]);
     expect(keys("network in and network out", "net_in")).toEqual(["net_out"]);
     expect(keys("shreds and CPU usage over the past hour", "shreds")).toEqual(["cpu"]);
+  });
+
+  it("does not take the load of a named thing for the load average", () => {
+    expect(keys("CPU and disk load over the past hour", "cpu", "disk_busy")).toEqual([]);
+    expect(keys("CPU load and memory", "cpu", "memory")).toEqual([]);
+    expect(keys("CPU and load average", "cpu")).toEqual(["load"]);
+    expect(keys("CPU and network in the past hour", "cpu")).toEqual([]);
   });
 
   it("never fires on a series asked for by its own label", () => {

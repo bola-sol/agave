@@ -1,5 +1,5 @@
-/** One box that takes a request in plain words and answers it with a chart from the slot history.
- *  The browser's own model picks the series; nothing typed is sent to the validator. */
+/** One box that takes a request in plain words and answers it with charts from the slot history and
+ *  the host's readings. The browser's own model picks the series; nothing typed leaves the browser. */
 
 import { memo, useEffect, useRef, useState, useSyncExternalStore, type FormEvent, type ReactElement } from "react";
 import {
@@ -255,14 +255,18 @@ type Loaded =
 /** Whether the validator can be asked now, and for the slot history whether its tip is known; a
  *  boolean, so a card redraws only when it flips. */
 function useCanRead(live: Store, needsTip: boolean): boolean {
+  // The clock offset comes with the first message after a connection opens; without it a window
+  // would be laid on the viewer's clock, not the validator's.
   const read = (): boolean =>
-    live.getConnection() === "open" && (!needsTip || live.get("summary", "completed_slot") !== undefined);
+    live.getConnection() === "open" &&
+    live.getClockOffset() !== null &&
+    (!needsTip || live.get("summary", "completed_slot") !== undefined);
   return useSyncExternalStore(live.subscribe, read, read);
 }
 
 const WAITING: Record<"offline" | "loading" | "empty" | "failed", string> = {
   offline: "Waiting for the validator…",
-  loading: "Reading the slot history…",
+  loading: "Reading the history…",
   empty: "No readings in that window.",
   failed: "The validator did not answer.",
 };
@@ -271,7 +275,8 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
   const { charts, asked, pickedMillis, note } = answer;
   // Always the live validator: a request for the past hour means the hour up to now.
   const live = useRequests();
-  const canRead = useCanRead(live, charts.some((chart) => chart.series.source === "slots"));
+  const perSlot = charts.some((chart) => chart.series.source === "slots");
+  const canRead = useCanRead(live, perSlot);
   // A window and how often it was picked: picking the one shown reads it again.
   const [pick, setPick] = useState({ millis: asked.millis, turn: 0 });
   const { millis } = pick;
@@ -281,16 +286,15 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
   useEffect(() => {
     // A reconnect reads again only what is not yet drawn, and leaves a drawn chart at its own time.
     if (!canRead || drawn.current === pick) return;
-    const perSlot = charts.some((chart) => chart.series.source === "slots");
     const hostKeys = charts.filter((chart) => chart.series.source === "host").map((chart) => chart.series.key);
     const tip = live.get("summary", "completed_slot");
     if (perSlot && tip === undefined) return;
     let stale = false;
-    // Row times are the validator's clock. The end is a whole host step, so every chart of the
+    // Row times are the validator's clock. Both ends are whole host steps, so every chart of the
     // request covers the same span.
     const now = Date.now() - (live.getClockOffset() ?? 0);
     const to = Math.floor(now / HOST_STEP_MILLIS) * HOST_STEP_MILLIS;
-    const from = to - pick.millis;
+    const from = Math.floor((to - pick.millis) / HOST_STEP_MILLIS) * HOST_STEP_MILLIS;
     setLoaded({ state: "loading" });
     // One read of each source for every chart of the request.
     const rows =
@@ -300,7 +304,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
     const host =
       hostKeys.length > 0 ? live.request("host.range", { series: hostKeys, from, to, points: BIN_COUNT }) : null;
     Promise.all([rows, host])
-      .then(([window, range]) => {
+      .then(([slotRows, range]) => {
         if (stale) return;
         // A refusal comes back as a value too, without the series.
         const readings = range && Array.isArray(range.series) ? range : null;
@@ -310,7 +314,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
         }
         const bins = charts.map(({ series }) =>
           series.source === "slots"
-            ? window && bucket(window.rows, series, from, to)
+            ? slotRows && bucket(slotRows.rows, series, from, to)
             : readings && hostBins(readings, series),
         );
         drawn.current = pick;
@@ -320,7 +324,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
                 state: "ready",
                 from,
                 bins,
-                slots: window && { count: window.rows.length, reached: window.reached },
+                slots: slotRows && { count: slotRows.rows.length, reached: slotRows.reached },
                 host: readings && { stepMillis: readings.step_ms, heldFrom: readings.held_from },
               }
             : { state: "empty" },
@@ -332,7 +336,7 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
     return () => {
       stale = true;
     };
-  }, [canRead, live, pick, charts]);
+  }, [canRead, live, pick, charts, perSlot]);
 
   const choose = (next: number): void => setPick((held) => ({ millis: next, turn: held.turn + 1 }));
   const own = WINDOWS.some((entry) => entry.millis === asked.millis);
@@ -384,11 +388,17 @@ function ChartsAnswer({ typed, answer }: { typed: string; answer: Extract<Answer
 
 type Ready = Extract<Loaded, { state: "ready" }>;
 
+/** A host step's length, in seconds below a minute. */
+function stepLabel(millis: number): string {
+  const seconds = Math.round(millis / 1000);
+  return seconds < 60 ? `${seconds} s` : `${figure(seconds / 60)} min`;
+}
+
 /** Where a drawn answer's readings came from, as the source line opens. */
 function sources(loaded: Ready, millis: number): string[] {
   const parts: string[] = [];
   if (loaded.slots) parts.push(`${count(loaded.slots.count)} slots from the slot history`);
-  if (loaded.host) parts.push(`host readings every ${Math.round(loaded.host.stepMillis / 1000)} s`);
+  if (loaded.host) parts.push(`host readings in ${stepLabel(loaded.host.stepMillis)} steps`);
   return [`${parts.join(" and ")}, ${windowLabel(millis)}`];
 }
 
@@ -433,7 +443,11 @@ function SeriesPanel({
             <Figure label="Latest" value={bins.latest} />
             <Figure label="Mean" value={bins.mean} />
             <Figure label="Lowest" value={bins.min} />
-            <Figure label="Highest" value={bins.max} />
+            {bins.peak === undefined ? (
+              <Figure label="Highest" value={bins.max} />
+            ) : (
+              <Figure label="Peak, 1 s" value={bins.peak} />
+            )}
           </div>
           <Chart bins={bins} />
         </>
