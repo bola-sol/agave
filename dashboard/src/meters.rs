@@ -49,7 +49,7 @@ const SLOT_LISTS_SENT: usize = 500;
 
 const THREADS_HISTORY: usize = 60;
 
-/// The host and thread readings stop while nobody watches; one older than this spans such a gap.
+/// A reading older than this spans a gap, as the thread readings have while nobody watches.
 const WATCH_GAP: Duration = Duration::from_secs(5);
 
 const THREAD_ROWS: usize = 8;
@@ -1066,28 +1066,24 @@ impl Meters {
         // Read whether or not anyone watches, so the route peak covers the whole day.
         self.interfaces.tick(&self.publisher, interface_rates);
         self.tpu.collect_xdp(&self.metrics_tap, &self.publisher);
-        // The `/proc` walks run only while somebody is watching. The rest is
-        // cheap and keeps the charts whole for a viewer connecting.
-        let watched = self.publisher.subscriber_count() > 0;
-        if watched {
-            self.host
-                .tick(self.src.as_ref(), &self.metrics_tap, &self.publisher);
+        // The host and the sockets are read whether or not anyone watches, so their history has
+        // no holes. The walk over every thread is the costly one and waits for a viewer.
+        self.host
+            .tick(self.src.as_ref(), &self.metrics_tap, &self.publisher);
+        if self.publisher.subscriber_count() > 0 {
             self.threads.tick(&self.publisher);
         }
-        // Until startup ends whether or not anyone watches, so the totals begin there.
-        if watched || self.sockets.drops_baseline.is_none() {
-            let running = matches!(
-                *self.startup_progress.read().unwrap(),
-                ValidatorStartProgress::Running
-            );
-            self.sockets.tick(
-                self.src.as_ref(),
-                &self.metrics_tap.counters(),
-                running,
-                alpenglow,
-                &self.publisher,
-            );
-        }
+        let running = matches!(
+            *self.startup_progress.read().unwrap(),
+            ValidatorStartProgress::Running
+        );
+        self.sockets.tick(
+            self.src.as_ref(),
+            &self.metrics_tap.counters(),
+            running,
+            alpenglow,
+            &self.publisher,
+        );
         self.note_host_history();
         self.collect_from_metrics();
     }
@@ -2359,7 +2355,7 @@ fn push_history<T: Serialize>(
 mod tests {
     use {
         super::*,
-        crate::fixture::fixture,
+        crate::{fixture::fixture, host_history::SeriesKey},
         solana_metrics::datapoint::DataPoint,
         solana_pubkey::Pubkey,
         solana_rpc::optimistically_confirmed_bank_tracker::BankNotification,
@@ -3451,9 +3447,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_the_proc_walks_wait_for_a_viewer() {
+    fn test_the_thread_walk_waits_for_a_viewer_and_the_host_does_not() {
         let harness = fixture();
         let mut meters = harness.meters();
+        let history = Arc::new(RwLock::new(HostHistory::new()));
+        meters.keep_host_history(history.clone());
         meters.tick();
         sleep(Duration::from_millis(20));
         meters.tick();
@@ -3463,6 +3461,20 @@ mod tests {
                 .is_none(),
             "the thread walk ran with nobody watching"
         );
+        assert!(
+            harness.published_key("summary", "host").is_some(),
+            "the host was not read with nobody watching"
+        );
+        {
+            // Let go before the next tick writes.
+            let history = history.read().unwrap();
+            let from = history
+                .range(&[SeriesKey::Load], 0, 1, 1)
+                .held_from
+                .expect("the host's history holds nothing");
+            let held = history.range(&[SeriesKey::Load], from, from.saturating_add(1), 1);
+            assert!(held.series[0].mean[0].is_some());
+        }
 
         let _viewer = harness.publisher.subscribe();
         meters.tick();

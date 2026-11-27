@@ -191,6 +191,8 @@ The validator does not own these inputs. The dashboard reads them directly:
 
 The kernel counts socket drops but not deliveries. The delivered counts come from the datapoints above.
 
+The threads are read only while a page is open. Everything else here is read once a second whether or not one is, so the two days of readings `host.range` answers from have no holes.
+
 ## Built in
 
 - `geoip/country-ipv4.bin.gz`: DB-IP's IP to Country Lite, IPv4 rows, November 2026, packed by `geoip/generate.py`. Each peer's gossip address is looked up in it for the country code on the Schedule and Gossip pages and on Leader Handoff, and for the finalization share in our country. Unpacked once, on first use.
