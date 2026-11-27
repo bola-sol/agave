@@ -42,6 +42,9 @@ pub fn read(log: &RewindLog, segments: &[(u64, u64, usize)], stop: impl Fn() -> 
         if stop() {
             break;
         }
+        if let Some(host) = &mut refilled.host {
+            host.begin_segment();
+        }
         for block in 0..*blocks {
             // A segment pruned since it was listed reads as nothing.
             let Some(block) = log.read(*start, block) else {
@@ -182,9 +185,18 @@ mod tests {
 
     /// Records what `publish` sends, a step at a time, then reads it all back.
     fn record(dir: &Path, publish: impl FnOnce(&Publisher, &mut dyn FnMut())) -> Refilled {
+        record_from(dir, 1_000_000, publish)
+    }
+
+    /// One run of the process recording into `dir` from `start`, then everything `dir` holds.
+    fn record_from(
+        dir: &Path,
+        start: u64,
+        publish: impl FnOnce(&Publisher, &mut dyn FnMut()),
+    ) -> Refilled {
         let log = Arc::new(RewindLog::open(dir).unwrap());
         let publisher = Arc::new(Publisher::new());
-        let now = Arc::new(AtomicU64::new(1_000_000));
+        let now = Arc::new(AtomicU64::new(start));
         let clock = now.clone();
         let mut recorder = Recorder::new(
             log,
@@ -458,6 +470,41 @@ mod tests {
         assert_eq!(range.series[0].max, [Some(300.0)]);
         assert_eq!(range.held_from, Some(1_000_000));
         assert_eq!(refilled.unread, 1);
+    }
+
+    #[test]
+    fn test_drops_recorded_by_two_runs_are_not_counted_from_one_to_the_other() {
+        use crate::host_history::SeriesKey;
+
+        let ingest = |total: u64| serde_json::json!({ "window_seconds": 60.0, "paths": [{ "port": 8001, "drops_total": total }] });
+        let dir = tempfile::tempdir().unwrap();
+        record_from(dir.path(), 1_000_000, |publisher, step| {
+            publisher.publish(TOPIC_SUMMARY, "ingest_paths", &ingest(30));
+            step();
+            publisher.publish(TOPIC_SUMMARY, "ingest_paths", &ingest(40));
+            step();
+        });
+        // The next run opens its segment before its meters have read a socket, and its first
+        // totals have no baseline taken off them yet.
+        let refilled = record_from(dir.path(), 1_100_000, |publisher, step| {
+            publisher.publish(TOPIC_SUMMARY, "ingest_paths", &ingest(5_000_050));
+            step();
+            publisher.publish(TOPIC_SUMMARY, "ingest_paths", &ingest(5_000_060));
+            step();
+        });
+        let host = refilled.host.unwrap();
+        let first = host.range(&[SeriesKey::UdpDrops], 1_000_000, 1_010_000, 1);
+        assert_eq!(first.series[0].mean, [Some(1.0)]);
+        // Ten dropped in the second run, and nothing of the time between the two.
+        let rest = host.range(&[SeriesKey::UdpDrops], 1_010_000, 1_110_000, 10);
+        let mut expected = vec![None; 10];
+        expected[9] = Some(1.0);
+        assert_eq!(rest.series[0].mean, expected);
+        assert_eq!(rest.series[0].max, {
+            let mut max = vec![None; 10];
+            max[9] = Some(10.0);
+            max
+        });
     }
 
     #[test]

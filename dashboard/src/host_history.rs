@@ -240,6 +240,8 @@ pub struct HostHistory {
     /// Each port's drop total and when it was read, for the next reading's difference.
     drops: HashMap<u16, u64>,
     drops_at: Option<u64>,
+    /// No recorded drop line of the segment being read has come yet.
+    segment_opens: bool,
 }
 
 impl Default for HostHistory {
@@ -255,6 +257,7 @@ impl HostHistory {
             newest: None,
             drops: HashMap::new(),
             drops_at: None,
+            segment_opens: true,
         }
     }
 
@@ -361,11 +364,16 @@ impl HostHistory {
         }
     }
 
-    /// A recorded line of drop totals. `opening` is a segment's own copy of the last line, which
-    /// carries on from the line before only if it repeats it; anything else is another run of the
-    /// process, whose totals count from elsewhere. Between two lines of one run nothing was
-    /// dropped, so those bins read nought.
+    /// Marks the start of a recorded segment, across which a run of the process may have ended.
+    pub fn begin_segment(&mut self) {
+        self.segment_opens = true;
+    }
+
+    /// A recorded line of drop totals. Within a segment each line carries on from the last and the
+    /// bins between read nought; a segment's first line does so only as an `opening` copy that
+    /// repeats the last, and otherwise starts another run whose totals count from elsewhere.
     pub fn note_recorded_drops(&mut self, at_ms: u64, totals: Vec<(u16, u64)>, opening: bool) {
+        let first = std::mem::take(&mut self.segment_opens);
         let before = self.drops_at.filter(|at| {
             at_ms
                 .checked_sub(*at)
@@ -376,7 +384,7 @@ impl HostHistory {
                 .iter()
                 .all(|(port, total)| self.drops.get(port) == Some(total));
         let dropped = self.take_drops(at_ms, totals);
-        let Some(before) = before.filter(|_| !opening || repeats) else {
+        let Some(before) = before.filter(|_| !first || (opening && repeats)) else {
             return;
         };
         let quiet_from = before
@@ -392,9 +400,9 @@ impl HostHistory {
         }
     }
 
-    /// One recorded feed line's value, by its key. `None` for a key that is not a host reading,
-    /// otherwise whether it was read. A segment's `opening` copy of the last host or network value
-    /// is passed over, having been counted when it was first sent.
+    /// One recorded feed line's value by its key: `None` for a key that is not a host reading,
+    /// otherwise whether it was read. A segment's `opening` copy of the host or network value was
+    /// counted when first sent and is passed over.
     pub fn note_recorded(
         &mut self,
         at_ms: u64,
@@ -439,11 +447,20 @@ impl HostHistory {
     }
 
     /// Takes every span `older` holds and this does not, so what was read back at startup fills in
-    /// behind what has been read since.
-    pub fn merge(&mut self, older: &HostHistory) {
-        self.newest = self.newest.max(older.newest);
-        for (place, theirs) in older.rows.iter().enumerate() {
-            if theirs.is_empty() || !self.in_reach(theirs.index) {
+    /// behind what has been read since. A span stamped after `now_ms` came off a clock that ran
+    /// ahead and is left out, or it would put every true reading out of reach.
+    pub fn merge(&mut self, older: &HostHistory, now_ms: u64) {
+        let now = now_ms.checked_div(BIN_MILLIS).unwrap_or_default();
+        let theirs = || {
+            older
+                .rows
+                .iter()
+                .enumerate()
+                .filter(move |(_, row)| !row.is_empty() && row.index <= now)
+        };
+        self.newest = self.newest.max(theirs().map(|(_, row)| row.index).max());
+        for (place, theirs) in theirs() {
+            if !self.in_reach(theirs.index) {
                 continue;
             }
             let Some(row) = self.rows.get_mut(place) else {
@@ -904,7 +921,7 @@ mod tests {
         let mut older = HostHistory::new();
         level(&mut older, T, 0.2);
         level(&mut older, T.saturating_add(20_000), 0.1);
-        live.merge(&older);
+        live.merge(&older, u64::MAX);
         let (mean, _) = cpu(&live, T, T.saturating_add(30_000), 3);
         assert_eq!(mean, [Some(0.2), None, Some(0.9)]);
     }
@@ -977,7 +994,7 @@ mod tests {
         level(&mut live, later, 0.9);
         let mut older = HostHistory::new();
         level(&mut older, T, 0.2);
-        live.merge(&older);
+        live.merge(&older, u64::MAX);
         assert_eq!(
             cpu(&live, later, later.saturating_add(10_000), 1).0,
             [Some(0.9)]
@@ -987,7 +1004,7 @@ mod tests {
         level(&mut stale, T, 0.2);
         let mut read_back = HostHistory::new();
         level(&mut read_back, later, 0.9);
-        stale.merge(&read_back);
+        stale.merge(&read_back, u64::MAX);
         assert_eq!(
             cpu(&stale, later, later.saturating_add(10_000), 1).0,
             [Some(0.9)]
@@ -1039,6 +1056,7 @@ mod tests {
         let mut history = HostHistory::new();
         history.note_recorded_drops(T, vec![(8001, 100)], false);
         // The same process rolled over to a new segment: its copy repeats the last line.
+        history.begin_segment();
         history.note_recorded_drops(T.saturating_add(30_000), vec![(8001, 100)], true);
         history.note_recorded_drops(T.saturating_add(31_000), vec![(8001, 130)], false);
         assert_eq!(
@@ -1051,15 +1069,50 @@ mod tests {
     fn test_another_run_of_the_process_counts_from_its_own_totals() {
         let mut history = HostHistory::new();
         history.note_recorded_drops(T, vec![(8001, 40)], false);
-        // Started again ten seconds on, before its totals have a baseline taken off them.
+        // Started again ten seconds on, before its totals have a baseline taken off them. Its
+        // segment opens with no copy of the line, the meters not having started yet.
         let restarted = T.saturating_add(10_000);
-        history.note_recorded_drops(restarted, vec![(8001, 5_000_050)], true);
+        history.begin_segment();
+        history.note_recorded_drops(restarted, vec![(8001, 5_000_050)], false);
         history.note_recorded_drops(
             restarted.saturating_add(1000),
             vec![(8001, 5_000_060)],
             false,
         );
         assert_eq!(recorded_drops(&history, T, 2), [None, Some(1.0)]);
+    }
+
+    #[test]
+    fn test_a_restart_whose_totals_carry_on_reads_no_noughts_for_the_time_it_was_down() {
+        let mut history = HostHistory::new();
+        history.note_recorded_drops(T, vec![(8001, 0)], false);
+        history.begin_segment();
+        // Down for forty seconds, then nought again: nothing was measured in between.
+        history.note_recorded_drops(T.saturating_add(40_000), vec![(8001, 0)], false);
+        history.note_recorded_drops(T.saturating_add(41_000), vec![(8001, 20)], false);
+        assert_eq!(
+            recorded_drops(&history, T, 5),
+            [None, None, None, None, Some(2.0)]
+        );
+    }
+
+    #[test]
+    fn test_a_merge_leaves_out_what_a_clock_running_ahead_stamped() {
+        let two_days = (BINS as u64).saturating_mul(BIN_MILLIS);
+        let mut read_back = HostHistory::new();
+        level(&mut read_back, T, 0.4);
+        // Six days on, in a place of its own.
+        level(
+            &mut read_back,
+            T.saturating_add(two_days.saturating_mul(3))
+                .saturating_add(50_000),
+            0.9,
+        );
+        let mut live = HostHistory::new();
+        live.merge(&read_back, T.saturating_add(60_000));
+        let range = live.range(&[SeriesKey::Cpu], T, T.saturating_add(10_000), 1);
+        assert_eq!(range.series[0].mean, [Some(0.4)]);
+        assert_eq!(range.held_from, Some(T));
     }
 
     #[test]
