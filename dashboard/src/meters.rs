@@ -6,6 +6,7 @@ use {
     crate::{
         collect::{CATCH_UP_SLOTS_PER_SECOND, FAILED_UNREAD, system_time_nanos},
         context::{DashboardContext, StartProgress},
+        host_history::{HostHistory, HostReading},
         host_stats::{self, CpuUse, HostSnapshot, ResidentKinds},
         metrics_tap::{
             AccountsFiles, AccountsTotals, BundleTotals, ExecutedTotals, GOSSIP_ENTRY_TYPES,
@@ -32,7 +33,7 @@ use {
         net::SocketAddr,
         path::{Path, PathBuf},
         sync::{
-            Arc,
+            Arc, RwLock,
             atomic::{AtomicU64, Ordering},
         },
         time::{Duration, Instant, SystemTime},
@@ -967,6 +968,7 @@ pub struct Meters {
     tpu: TpuMeter,
     threads: ThreadMeter,
     gossip: GossipMeter,
+    host_history: Arc<RwLock<HostHistory>>,
 }
 
 impl Meters {
@@ -1016,6 +1018,37 @@ impl Meters {
             tpu: TpuMeter::new(),
             threads: ThreadMeter::default(),
             gossip: GossipMeter::new(),
+            host_history: Arc::new(RwLock::new(HostHistory::new())),
+        }
+    }
+
+    /// Keeps the host readings where the server answers from, in place of a store of its own.
+    pub fn keep_host_history(&mut self, history: Arc<RwLock<HostHistory>>) {
+        self.host_history = history;
+    }
+
+    /// What this tick read of the host goes into the history, each part only if it was read.
+    fn note_host_history(&mut self) {
+        let network = self.network.read.take();
+        let host = self.host.read.take();
+        let drops = self.sockets.drop_totals.take();
+        if network.is_none() && host.is_none() && drops.is_none() {
+            return;
+        }
+        let Some(at_ms) = system_time_nanos(SystemTime::now()).checked_div(1_000_000) else {
+            return;
+        };
+        let Ok(mut history) = self.host_history.write() else {
+            return;
+        };
+        if let Some(network) = network {
+            history.note_network(at_ms, &network);
+        }
+        if let Some(host) = host {
+            history.note_host(at_ms, &host);
+        }
+        if let Some(drops) = drops {
+            history.note_drops(at_ms, drops);
         }
     }
 
@@ -1055,6 +1088,7 @@ impl Meters {
                 &self.publisher,
             );
         }
+        self.note_host_history();
         self.collect_from_metrics();
     }
 
@@ -1175,6 +1209,8 @@ impl Throughput {
 
 #[derive(Default)]
 struct NetworkMeter {
+    /// The rates of the latest tick, until the history takes them.
+    read: Option<Network>,
     last: Option<(NetReading, Instant)>,
     history: Vec<NetworkSample>,
     /// Each interface's bytes a second over the same interval as the host total.
@@ -1227,6 +1263,7 @@ impl NetworkMeter {
 
     fn publish(&mut self, publisher: &Publisher, rates: Network) {
         publisher.publish(TOPIC_SUMMARY, "network", &rates);
+        self.read = Some(rates.clone());
 
         let sample = NetworkSample {
             timestamp_nanos: system_time_nanos(SystemTime::now()),
@@ -1410,6 +1447,8 @@ fn interface_shown(
 
 #[derive(Default)]
 struct HostMeter {
+    /// The latest tick's figures, until the history takes them.
+    read: Option<HostReading>,
     last: Option<(HostSnapshot, Instant)>,
     unavailable: bool,
     paths: Option<Vec<HostPath>>,
@@ -1537,6 +1576,7 @@ impl HostMeter {
             devices: device_loads(paths, &current, &previous, interval_ms, seconds),
         };
         self.last = Some((current, now));
+        self.read = Some(HostReading::from(&host));
         publisher.publish(TOPIC_SUMMARY, "host", &host);
     }
 }
@@ -1656,6 +1696,8 @@ struct SocketMeter {
     /// Set once the table has been read, so an empty table before then does not say the TPU port is
     /// bound elsewhere.
     sampled: bool,
+    /// Each port's drop total at the latest tick, until the history takes them.
+    drop_totals: Option<Vec<(u16, u64)>>,
     published: Debounced<IngestSummary>,
 }
 
@@ -1671,6 +1713,7 @@ impl SocketMeter {
             known_sockets: HashMap::new(),
             unavailable: false,
             sampled: false,
+            drop_totals: None,
             published: Debounced::new(TOPIC_SUMMARY, "ingest_paths"),
         }
     }
@@ -1765,6 +1808,12 @@ impl SocketMeter {
         if paths.is_empty() {
             return;
         }
+        self.drop_totals = Some(
+            paths
+                .iter()
+                .map(|path| (path.port, path.drops_total))
+                .collect(),
+        );
         let summary = IngestSummary {
             window_seconds: self
                 .drops_window

@@ -175,7 +175,9 @@ touched. The recorder listens as a page does, so the work done only while
 somebody watches runs all the time. A page reaches further back than its own
 fifteen minutes by fetching the blocks it needs, and restarts show as gaps.
 At startup the dashboard reads the recording back for our blocks, turns,
-waterfalls, costs and fee tables, so the Slots page keeps them across a restart.
+waterfalls, costs and fee tables, so the Slots page keeps them across a restart,
+and for the host's readings, which `host.range` answers from; without the flag
+those begin again at each start.
 Without the flag nothing is written and a page rewinds no further back than
 when it was opened. Replies to requests are not recorded, so schedule searches,
 the Gossip peer table and certificate lists and the Cluster charts are not
@@ -229,7 +231,9 @@ that `id` alone: `summary.ping`, `summary.displays` for the whole name table,
 for what this node's own certificates left out per validator, both rebuilt
 every five seconds while either is asked for and once a minute otherwise,
 `epoch.query` for a held epoch's schedule, `slot.range` for a run of slots
-out of the packed history, which holds an epoch, `slot.search` for a page of
+out of the packed history, which holds an epoch, `host.range` for up to three
+of the host's readings over a window, out of two days kept in ten-second
+bins, `slot.search` for a page of
 the turns in it that match a leader's name or key, a slot number, this
 validator or a condition on their slots or leaders, down or up from a given
 slot or time, `slot.summary` for the same matches summed up overall and by
