@@ -1012,6 +1012,10 @@ impl Validator {
             exit.clone(),
         )
         .map_err(ValidatorError::Other)?;
+        // Before TVU starts, so the subscriber is attached when catch-up repairs its first burst.
+        blockstore.set_slot_observer(Box::new(
+            LedgerSlotObserver::new(&event_system).map_err(ValidatorError::Other)?,
+        ));
         // Made before the wait, so a subscriber is there for its first check.
         let mut supermajority_wait_events = config.wait_for_supermajority.and_then(|_| {
             SupermajorityWaitEvents::new(&event_system)
@@ -1925,9 +1929,6 @@ impl Validator {
             exit.clone(),
         )
         .map_err(ValidatorError::Other)?;
-        blockstore.set_slot_observer(Box::new(
-            LedgerSlotObserver::new(&event_system).map_err(ValidatorError::Other)?,
-        ));
         let set_events = SetEvents::new(
             &event_system,
             cluster_info.clone(),
