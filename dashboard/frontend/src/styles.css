@@ -11905,12 +11905,6 @@ body {
   min-width: 0;
 }
 
-.ask {
-  width: 100%;
-  max-width: 920px;
-  margin: 0 auto;
-}
-
 .ask-answers:empty {
   display: none;
 }
